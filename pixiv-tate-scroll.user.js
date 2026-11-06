@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      2.4.0
+// @version      2.5.0
 // @description  今開いているpixivのページに並んでいる作品を、1枚ずつ大きい画像でTikTok風に縦スクロールして眺めるビューアです。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -24,6 +24,7 @@
   let resolving = false;
   let pageLoadBusy = false;
   let pageLoadMisses = 0;
+  let mode = 'page'; // 'page' | 'related'
 
   /* ---------- ページ内スキャン（3段構え） ---------- */
 
@@ -197,7 +198,46 @@
     link.textContent = 'pixivで開く';
     sec.appendChild(link);
 
+    const rel = document.createElement('button');
+    rel.className = 'pts-related';
+    rel.textContent = 'この作品の関連へ';
+    rel.addEventListener('click', () => switchToRelated(s, rel));
+    sec.appendChild(rel);
+
     feedEl.appendChild(sec);
+  }
+
+  /* ---------- 関連作品への切り替え ---------- */
+
+  async function switchToRelated(slide, btn) {
+    if (btn) { btn.textContent = '読み込み中…'; btn.disabled = true; }
+    try {
+      const res = await fetch(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`, { credentials: 'same-origin' });
+      const json = await res.json();
+      if (json.error || !json.body || !json.body.illusts) throw new Error('recommend failed');
+      const items = json.body.illusts.map((it) => ({
+        id: String(it.id),
+        thumb: it.url || '',
+        full: null,
+        title: it.title || '',
+        author: it.userName || '',
+        page: `https://www.pixiv.net/artworks/${it.id}`,
+        imgEl: null, titleEl: null, authorEl: null,
+      })).filter((it) => it.id !== slide.id);
+      if (items.length === 0) throw new Error('no related');
+
+      // 今見ているスライドより後ろを捨てて、関連作品を続ける
+      const idx = slides.indexOf(slide);
+      slides = slides.slice(0, idx + 1);
+      while (feedEl.children.length > idx + 1) {
+        feedEl.removeChild(feedEl.lastChild);
+      }
+      mode = 'related';
+      addItems(items);
+      if (btn) btn.textContent = '関連に切替済み';
+    } catch (e) {
+      if (btn) { btn.textContent = '関連が取れませんでした'; btn.disabled = false; }
+    }
   }
 
   function updateCounter() {
@@ -205,7 +245,7 @@
     if (slides.length === 0) {
       c.textContent = 'このページに作品が見つかりませんでした';
     } else {
-      c.textContent = `${slides.length} 件`;
+      c.textContent = mode === 'related' ? `${slides.length} 件（関連モード）` : `${slides.length} 件`;
     }
   }
 
@@ -221,6 +261,8 @@
 
   function buildFeed() {
     slides = [];
+    mode = 'page';
+    pageLoadMisses = 0;
     feedEl.innerHTML = '';
     addItems(scanPage());
   }
@@ -233,6 +275,7 @@
   /* ---------- 背後ページの無限読み込みと連動 ---------- */
 
   function pageLoadMore() {
+    if (mode !== 'page') return;
     if (pageLoadBusy || pageLoadMisses >= 4) return;
     pageLoadBusy = true;
     const before = slides.length;
@@ -302,6 +345,9 @@
       .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
       .pts-open{position:absolute;right:14px;bottom:64px;background:rgba(255,255,255,.16);color:#fff;
         text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
+      .pts-related{position:absolute;right:14px;bottom:112px;background:#0096fa;color:#fff;border:0;
+        font-size:12px;font-weight:700;padding:9px 13px;border-radius:999px;cursor:pointer;}
+      .pts-related:disabled{opacity:.6;}
     `;
     document.head.appendChild(style);
     document.body.appendChild(overlay);

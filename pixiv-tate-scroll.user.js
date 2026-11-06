@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      2.2.0
-// @description  今開いているpixivのページに並んでいる作品を、TikTok風の縦スクロール（全画面スナップ）で眺めるビューアです。ブックマーク連携なし・ページ内スキャン方式。
+// @version      2.3.0
+// @description  今開いているpixivのページに並んでいる作品を、1枚ずつ大きい画像でTikTok風に縦スクロールして眺めるビューアです。
 // @match        https://www.pixiv.net/*
 // @grant        none
 // @run-at       document-idle
@@ -20,14 +20,17 @@
 
   let overlay = null;
   let feedEl = null;
-  let slides = [];
+  let slides = []; // {id, thumb, title, page, full, imgEl}
+  let resolving = false;
+  let pageLoadBusy = false;
+  let pageLoadMisses = 0;
 
-  // ページ内から作品を集める（a[href*="/artworks/"] とその中の画像）
+  /* ---------- ページ内スキャン ---------- */
+
   function scanPage() {
-    const seen = new Set();
+    const seen = new Set(slides.map((s) => s.id));
     const items = [];
-    const anchors = document.querySelectorAll('a[href*="/artworks/"]');
-    anchors.forEach((a) => {
+    document.querySelectorAll('a[href*="/artworks/"]').forEach((a) => {
       if (overlay && overlay.contains(a)) return;
       const m = (a.getAttribute('href') || '').match(/\/artworks\/(\d+)/);
       if (!m) return;
@@ -38,15 +41,13 @@
       const thumb = pickBestSrc(img);
       if (!thumb || !thumb.includes('i.pximg.net')) return;
       seen.add(id);
-      // タイトル・作者は近くのテキストから拾える範囲で
-      const card = a.closest('li, div');
-      const title = (img.alt || '').trim();
       items.push({
         id,
         thumb,
-        full: upgradeUrl(thumb),
-        title,
+        full: null,
+        title: (img.alt || '').trim(),
         page: `https://www.pixiv.net/artworks/${id}`,
+        imgEl: null,
       });
     });
     return items;
@@ -54,7 +55,6 @@
 
   function pickBestSrc(img) {
     const candidates = [];
-    // 遅延読み込みでは data-src に本命が入っていることが多い
     const ds = img.getAttribute('data-src');
     if (ds) candidates.push(ds);
     const ss = img.getAttribute('srcset');
@@ -65,28 +65,54 @@
     }
     if (img.currentSrc) candidates.push(img.currentSrc);
     if (img.src) candidates.push(img.src);
-    // プレースホルダ（data: 等）を避け、pximg のものを優先
     for (const c of candidates) {
       if (c && c.includes('i.pximg.net')) return c;
     }
     return candidates[0] || '';
   }
 
-  // サムネイルURL → 大きい画像（master1200）に変換する。
-  // /c/<サイズ指定>/ を取り除くと原寸系のパスになる。square/custom サムネは末尾も差し替える。
+  // サムネイルURLから大きい画像の候補を作る（/c/サイズ指定/ を外し、square/custom は master に）
   function upgradeUrl(url) {
     let u = url.replace(/^https:\/\/i\.pximg\.net\/c\/[^/]+\//, 'https://i.pximg.net/');
     u = u.replace(/_(square1200|custom1200)\.(\w+)$/, '_p0_master1200.jpg');
     return u;
   }
 
-  // 先読み：次の数枚を裏で読み込んでおき、スクロールで待たせない
-  function preload(urls) {
-    urls.forEach((u) => {
-      const im = new Image();
-      im.src = u;
-    });
+  /* ---------- 大きい画像の解決（pixiv内部APIで正確なURLを取る） ---------- */
+
+  async function resolveFull(slide) {
+    try {
+      const res = await fetch(`/ajax/illust/${slide.id}`, { credentials: 'same-origin' });
+      const json = await res.json();
+      if (!json.error && json.body && json.body.urls) {
+        return json.body.urls.regular || json.body.urls.original || upgradeUrl(slide.thumb);
+      }
+    } catch (e) { /* fall through */ }
+    return upgradeUrl(slide.thumb);
   }
+
+  // 未解決のスライドを順番に解決して、表示中の画像を差し替える
+  async function resolveQueue() {
+    if (resolving) return;
+    resolving = true;
+    try {
+      for (const s of slides) {
+        if (s.full) continue;
+        s.full = await resolveFull(s);
+        if (s.imgEl && s.imgEl.dataset.thumb === '1') {
+          s.imgEl.src = s.full;
+          s.imgEl.dataset.thumb = '';
+        }
+        // 先読み：解決済みの画像はブラウザキャッシュに載せる
+        const pre = new Image();
+        pre.src = s.full;
+      }
+    } finally {
+      resolving = false;
+    }
+  }
+
+  /* ---------- 表示 ---------- */
 
   function renderSlide(s, idx) {
     const sec = document.createElement('section');
@@ -94,12 +120,15 @@
 
     const img = document.createElement('img');
     img.className = 'pts-img';
-    img.src = s.full;
+    // まずサムネ由来の大きい候補を出し、正確なURLが分かり次第差し替える
+    img.src = s.full || upgradeUrl(s.thumb);
+    img.dataset.thumb = s.full ? '' : '1';
     img.alt = s.title || '';
     img.loading = idx < 2 ? 'eager' : 'lazy';
     img.addEventListener('error', () => {
-      if (img.src !== s.thumb) img.src = s.thumb;
+      if (!img.src.includes(s.thumb)) img.src = s.thumb;
     });
+    s.imgEl = img;
     sec.appendChild(img);
 
     if (s.title) {
@@ -123,25 +152,39 @@
     feedEl.appendChild(sec);
   }
 
-  function buildFeed() {
-    slides = scanPage();
-    feedEl.innerHTML = '';
-    slides.forEach((s, i) => renderSlide(s, i));
-    preload(slides.slice(0, 6).map((s) => s.full));
+  function updateCounter() {
     const c = overlay.querySelector('.pts-counter');
     if (slides.length === 0) {
-      c.textContent = 'このページに作品が見つかりませんでした。検索結果・ランキング・作品ページ等で開いてください';
+      c.textContent = 'このページに作品が見つかりませんでした。検索結果・ランキング・ディスカバリー等で開いてください';
     } else {
       c.textContent = `${slides.length} 件`;
     }
   }
 
-  let pageLoadBusy = false;
-  let pageLoadMisses = 0;
+  function addItems(items) {
+    items.forEach((s) => {
+      slides.push(s);
+      renderSlide(s, slides.length - 1);
+    });
+    updateCounter();
+    resolveQueue();
+  }
 
-  // 背後のページをスクロールしてpixiv側の無限読み込みを進め、増えた分をフィードに足す
+  function buildFeed() {
+    slides = [];
+    feedEl.innerHTML = '';
+    addItems(scanPage());
+  }
+
+  function appendNew() {
+    if (!overlay || overlay.style.display === 'none') return;
+    addItems(scanPage());
+  }
+
+  /* ---------- 背後ページの無限読み込みと連動 ---------- */
+
   function pageLoadMore() {
-    if (pageLoadBusy || pageLoadMisses >= 3) return;
+    if (pageLoadBusy || pageLoadMisses >= 4) return;
     pageLoadBusy = true;
     const before = slides.length;
     window.scrollBy(0, Math.max(2000, window.innerHeight * 3));
@@ -152,27 +195,14 @@
     }, 1300);
   }
 
+  /* ---------- オーバーレイ ---------- */
+
   function openViewer() {
     buildOverlay();
     overlay.style.display = 'block';
     buildFeed();
-    // 開いた直後も背後ページを少し進めて取り込み量を増やす
     setTimeout(() => pageLoadMore(), 800);
     setTimeout(() => pageLoadMore(), 2500);
-  }
-
-  function appendNew() {
-    if (!overlay || overlay.style.display === 'none') return;
-    const known = new Set(slides.map((s) => s.id));
-    const items = scanPage().filter((it) => !known.has(it.id));
-    if (items.length === 0) return;
-    items.forEach((s) => {
-      slides.push(s);
-      renderSlide(s, slides.length - 1);
-    });
-    preload(items.slice(0, 6).map((s) => s.full));
-    const c = overlay.querySelector('.pts-counter');
-    c.textContent = `${slides.length} 件`;
   }
 
   function closeViewer() {
@@ -194,7 +224,6 @@
     feedEl = overlay.querySelector('.pts-feed');
     overlay.querySelector('.pts-close').addEventListener('click', closeViewer);
     overlay.querySelector('.pts-rescan').addEventListener('click', buildFeed);
-    // フィードの終わりが近づいたら背後ページから続きを取り込む
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
       if (remain < feedEl.clientHeight * 2) pageLoadMore();

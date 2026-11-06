@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.3.1
+// @version      3.3.2
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -204,8 +204,18 @@
         const cur = s.mainImg.getAttribute('src') || '';
         if (!cur.includes(target)) s.mainImg.src = target;
       }
-      if (s.kind === 'ugoira' && s.isCurrent) prepareUgoira(s);
+      if (s.kind === 'ugoira') prepareUgoira(s);
     }
+  }
+
+  // うごイラの状態をスライド下部に出す（切り分け用）
+  function debugUgoira(s) {
+    if (!s.debugEl) return;
+    if (s.kind !== 'ugoira' && !s.ugoiraError) { s.debugEl.textContent = ''; return; }
+    s.debugEl.textContent =
+      `ugoira: kind=${s.kind} cur=${s.isCurrent ? 1 : 0} zip=${s.zipUrl ? 'あり' : 'なし'} ` +
+      `frames=${s.frames ? s.frames.length : '-'} urls=${s.frameUrls ? s.frameUrls.filter(Boolean).length : '-'} ` +
+      `anim=${s.animTimer ? '再生中' : '停止'} err=${s.ugoiraError || ''}`;
   }
 
   /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
@@ -412,8 +422,10 @@
       throw new Error('再生手段なし');
     } catch (e) {
       if (s.isCurrent) setChip(s, 'うごイラ: ' + (e && e.message ? e.message : e));
+      s.ugoiraError = (e && e.message) ? e.message : String(e);
     } finally {
       s.preparingUgoira = false;
+      debugUgoira(s);
     }
   }
 
@@ -495,6 +507,10 @@
     au.textContent = s.author || '';
     meta.appendChild(t);
     meta.appendChild(au);
+    const dbg = document.createElement('div');
+    dbg.className = 'pts-debug';
+    meta.appendChild(dbg);
+    s.debugEl = dbg;
     s.titleEl = t;
     s.authorEl = au;
     sec.appendChild(meta);
@@ -618,8 +634,9 @@
           s.isCurrent = false;
           stopUgoira(s);
         }
+        debugUgoira(s);
       });
-    }, { root: null, threshold: 0.7 });
+    }, { root: null, threshold: 0.5 });
   }
 
   function openViewer() {
@@ -695,6 +712,7 @@
         background:linear-gradient(transparent,rgba(0,0,0,.7));}
       .pts-title{font-size:15px;font-weight:700;line-height:1.4;}
       .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
+      .pts-debug{font-size:10px;opacity:.75;margin-top:3px;word-break:break-all;}
       .pts-open{position:absolute;right:14px;bottom:64px;z-index:2;background:rgba(255,255,255,.16);color:#fff;
         text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
       .pts-related{position:absolute;right:14px;bottom:112px;z-index:2;background:#0096fa;color:#fff;border:0;

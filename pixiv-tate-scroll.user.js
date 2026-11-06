@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.6.0
+// @version      3.7.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -156,6 +156,8 @@
     try {
       const body = await fetchJson(`/ajax/illust/${s.id}`, signal);
       s.rawType = body.illustType;
+      s.bookmarked = !!body.bookmarkData;
+      paintBookmarkBtn(s);
       if (body.title && !s.title) { s.title = body.title; if (s.titleEl) s.titleEl.textContent = s.title; }
       if (body.userName) { s.author = body.userName; if (s.authorEl) s.authorEl.textContent = s.author; }
       const pageCount = body.pageCount || 1;
@@ -767,6 +769,31 @@
     rel.addEventListener('click', () => switchToRelated(s, rel));
     sec.appendChild(rel);
 
+    const bm = document.createElement('button');
+    bm.className = 'pts-bookmark';
+    bm.textContent = '🔖 保存';
+    bm.addEventListener('click', () => toggleBookmark(s, bm));
+    sec.appendChild(bm);
+    s.bookmarkBtn = bm;
+
+    // タップ送り（単一・うごイラのみ。左1/3=前、右=次）。スクロールや横スライドと誤認しないよう移動量で判定
+    let tapDown = null;
+    holder.addEventListener('pointerdown', (e) => {
+      tapDown = { x: e.clientX, y: e.clientY, t: Date.now() };
+    });
+    holder.addEventListener('pointerup', (e) => {
+      if (!tapDown) return;
+      const dx = e.clientX - tapDown.x;
+      const dy = e.clientY - tapDown.y;
+      const dt = Date.now() - tapDown.t;
+      tapDown = null;
+      if (s.kind === 'multi' || s.seekDragging) return;
+      if (Math.abs(dx) > 12 || Math.abs(dy) > 12 || dt > 350) return;
+      const r = holder.getBoundingClientRect();
+      const ratio = (e.clientX - r.left) / r.width;
+      gotoSlide(currentIndex() + (ratio < 0.33 ? -1 : 1));
+    });
+
     feedEl.appendChild(sec);
     if (nearObs) nearObs.observe(sec);
   }
@@ -906,6 +933,99 @@
         pre2.src = n2.pairs[0].r;
       }
     }
+    scheduleAutoAdvance(idx);
+  }
+
+  /* ---------- 片手・ハンズフリー向け機能 ---------- */
+
+  let autoSec = 0;
+  let autoTimer = null;
+  let wakeLock = null;
+  let csrfToken = null;
+
+  function gotoSlide(i) {
+    if (!feedEl || i < 0 || i >= slides.length) return;
+    feedEl.scrollTo({ top: i * feedEl.clientHeight, behavior: 'smooth' });
+  }
+
+  function currentIndex() {
+    if (!feedEl) return 0;
+    return Math.round(feedEl.scrollTop / Math.max(1, feedEl.clientHeight));
+  }
+
+  // 自動送り：表示が落ち着いたらタイマーを張り直す。うごイラは1ループ分は最低待つ
+  function scheduleAutoAdvance(idx) {
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    if (!autoSec || !overlay || overlay.style.display === 'none') return;
+    const s = slides[idx];
+    let delay = autoSec * 1000;
+    if (s && s.kind === 'ugoira' && s.animTotal) delay = Math.max(delay, Math.min(s.animTotal, 60000));
+    autoTimer = setTimeout(() => {
+      if (idx + 1 < slides.length) gotoSlide(idx + 1);
+    }, delay);
+  }
+
+  // 画面が消えないようにする（対応ブラウザのみ）
+  async function keepAwake(on) {
+    try {
+      if (on && navigator.wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+      } else if (wakeLock) {
+        await wakeLock.release();
+        wakeLock = null;
+      }
+    } catch (e) { /* 非対応なら何もしない */ }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && overlay && overlay.style.display !== 'none') keepAwake(true);
+  });
+
+  async function getCsrfToken() {
+    if (csrfToken) return csrfToken;
+    const find = (html) => {
+      const m = html.match(/"token":"([0-9a-zA-Z]{10,})"/);
+      return m ? m[1] : null;
+    };
+    let t = null;
+    try { t = find(document.documentElement.innerHTML); } catch (e) {}
+    if (!t) {
+      const res = await fetch('https://www.pixiv.net/', { credentials: 'same-origin' });
+      t = find(await res.text());
+    }
+    csrfToken = t;
+    return t;
+  }
+
+  function paintBookmarkBtn(s) {
+    if (!s.bookmarkBtn) return;
+    if (s.bookmarked) {
+      s.bookmarkBtn.textContent = '✓ 保存済み';
+      s.bookmarkBtn.classList.add('pts-bookmarked');
+      s.bookmarkBtn.disabled = false;
+    }
+  }
+
+  async function toggleBookmark(s, btn) {
+    if (s.bookmarked) { paintBookmarkBtn(s); return; }
+    btn.disabled = true;
+    btn.textContent = '保存中…';
+    try {
+      const token = await getCsrfToken();
+      if (!token) throw new Error('token取得失敗');
+      const res = await fetch('/ajax/illusts/bookmarks/add', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'x-csrf-token': token },
+        body: JSON.stringify({ illust_id: String(s.id), restrict: 0, comment: '', tags: [] }),
+      });
+      const json = await res.json();
+      if (json.error) throw new Error(json.message || 'api error');
+      s.bookmarked = true;
+      paintBookmarkBtn(s);
+    } catch (e) {
+      btn.textContent = '保存失敗 もう一度タップ';
+      btn.disabled = false;
+    }
   }
 
   // スライドの後片付け（タイマー・通信・Blobを残さない。長時間閲覧でのメモリ圧迫対策）
@@ -981,6 +1101,7 @@
   function openViewer() {
     buildOverlay();
     overlay.style.display = 'block';
+    keepAwake(true);
     buildFeed();
     setTimeout(() => pageLoadMore(), 800);
     setTimeout(() => pageLoadMore(), 2500);
@@ -988,6 +1109,8 @@
 
   function closeViewer() {
     overlay.style.display = 'none';
+    keepAwake(false);
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
     slides.forEach(cleanupSlide);
     slides = [];
     if (feedEl) feedEl.innerHTML = '';
@@ -1005,6 +1128,13 @@
           <option value="fast">速い</option>
           <option value="orig" selected>元画像</option>
         </select>
+        <select class="pts-auto">
+          <option value="0" selected>自動なし</option>
+          <option value="5">自動5秒</option>
+          <option value="10">自動10秒</option>
+          <option value="15">自動15秒</option>
+          <option value="30">自動30秒</option>
+        </select>
         <button class="pts-rescan">再スキャン</button>
         <button class="pts-close" title="閉じる">✕</button>
       </div>
@@ -1017,6 +1147,10 @@
       quality = e.target.value;
       // 画質を変えたら、解決済みスライドの表示レベルだけ付け替える（取り直しはしない）
       slides.forEach((s) => { if (s.resolved) upgradeSlide(s, true); });
+    });
+    overlay.querySelector('.pts-auto').addEventListener('change', (e) => {
+      autoSec = parseInt(e.target.value, 10) || 0;
+      markCurrentFromScroll();
     });
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
@@ -1042,6 +1176,11 @@
         padding:7px 12px;cursor:pointer;font-size:12px;}
       .pts-quality{margin-left:auto;background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:8px;padding:6px 8px;font-size:12px;}
       .pts-quality option{color:#000;}
+      .pts-auto{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:8px;padding:6px 8px;font-size:12px;}
+      .pts-auto option{color:#000;}
+      .pts-bookmark{position:absolute;right:14px;bottom:160px;z-index:2;background:rgba(255,255,255,.16);color:#fff;border:0;
+        border-radius:999px;padding:10px 14px;font-size:13px;}
+      .pts-bookmark.pts-bookmarked{background:#1e9e6a;}
       .pts-close{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;width:32px;height:32px;cursor:pointer;font-size:15px;}
       .pts-feed{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;overscroll-behavior:contain;}
       .pts-feed::-webkit-scrollbar{display:none;}

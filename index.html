@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>pixiv縦スクロール インストール</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background: #0b1220; color: #e8edf5; line-height: 1.7; }
+  main { max-width: 640px; margin: 0 auto; padding: 24px 18px 56px; }
+  h1 { font-size: 1.45rem; margin: 8px 0 4px; }
+  h2 { font-size: 1.1rem; margin: 34px 0 8px; padding-left: 10px; border-left: 4px solid #2f81f7; }
+  p, li { font-size: .95rem; }
+  .sub { color: #9fb0c7; font-size: .9rem; margin-top: 0; }
+  .ver { display: inline-block; background: #16263f; color: #8db8f8; border-radius: 999px; padding: 2px 12px; font-size: .8rem; }
+  .install { display: block; text-align: center; background: #2f81f7; color: #fff; font-weight: 700; font-size: 1.1rem; text-decoration: none; border-radius: 14px; padding: 16px; margin: 22px 0 6px; }
+  .install:active { background: #1f6ae0; }
+  ol { padding-left: 1.3em; }
+  li { margin: 6px 0; }
+  .note { background: #111c2e; border-radius: 12px; padding: 12px 16px; margin-top: 14px; }
+  .note p { margin: 6px 0; font-size: .88rem; color: #c4d2e6; }
+  a { color: #8db8f8; }
+  .small { font-size: .82rem; color: #9fb0c7; }
+</style>
+</head>
+<body>
+<main>
+  <span class="ver">v3.12.0</span>
+  <h1>pixiv縦スクロール</h1>
+  <p class="sub">pixivをTikTokみたいな縦スクロールで見るためのユーザースクリプトです。自分のpixivアカウントでログインして使います。</p>
+
+  <a class="install" href="https://cdn.jsdelivr.net/gh/Mamimami33/pixiv-tate-scroll@718d7a6/pixiv-tate-scroll.user.js">インストールする</a>
+  <p class="small">ボタンは下の手順を先に済ませてから押してください。スクリプト本体が開きます。</p>
+
+  <h2>iPhone（Safari）</h2>
+  <ol>
+    <li>App Storeで無料アプリ「Userscripts」をインストールする</li>
+    <li>アプリを一度開いてから、設定アプリ → Safari → 拡張機能 で「Userscripts」を有効にする</li>
+    <li>このページに戻って、上の「インストールする」ボタンをタップする</li>
+    <li>Userscriptsの確認が出たら「インストール」する</li>
+    <li>Safariでpixivに自分のアカウントでログインして、作品ページを開くと使えます</li>
+  </ol>
+
+  <h2>Android（Firefox）</h2>
+  <ol>
+    <li>Firefoxブラウザをインストールする（Android版Chromeは拡張機能が使えないのでFirefoxを使います）</li>
+    <li>Firefoxのメニュー → アドオン から「Tampermonkey」を追加する</li>
+    <li>Firefoxでこのページを開いて、上の「インストールする」ボタンをタップする</li>
+    <li>Tampermonkeyの確認画面で「インストール」する</li>
+    <li>Firefoxでpixivに自分のアカウントでログインして、作品ページを開くと使えます</li>
+  </ol>
+
+  <h2>使い方</h2>
+  <p>作品ページを開くと縦スクロール表示になります。上下スワイプで次の作品へ。気に入った作品はダブルタップでブックマーク（❤️）できます。見る作品に合わせて、おすすめの並びは自動で学習していきます。</p>
+
+  <div class="note">
+    <p>・使うのは各自のpixivアカウントです。他人のアカウント情報は不要です。</p>
+    <p>・おすすめ学習のデータは、この端末の中だけに保存されます。外部に送信されることはありません。</p>
+    <p>・アカウントの判別は自動で行われるので、IDなどの設定は要りません。</p>
+  </div>
+</main>
+</body>
+</html>

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.2
+// @version      3.13.3
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -786,7 +786,6 @@
     if (!img) return;
 
     if (img.complete && img.naturalWidth > 0) {
-      moodOnComplete(s);
       applyPositive(s, 'complete', 1.0);
 
     } else if (s.completeWaitImg !== img) {
@@ -795,7 +794,6 @@
       img.addEventListener('load', () => {
         if (s.isCurrent &&
             s.pageIdx === s.pairs?.length - 1) {
-          moodOnComplete(s);
           applyPositive(s, 'complete', 1.0);
         }
       }, { once: true });
@@ -2547,287 +2545,6 @@
   let lastTap = null;
   let singleTapTimer = null;
 
-  /* ---------- v3.13.2: セッション内HUD（非永続） ---------- */
-  const mood = {
-  installed: false, enabled: true, value: 0, visibleMs: 0,
-  likes: 0, views: new Set(), completes: new Set(), loops: new Map(),
-  lastDecay: performance.now(), lastPaint: 0,
-  hud: null, timer: null, resizeObserver: null
-  };
-
-  function resetMoodSession() {
-  mood.enabled = true;
-  mood.value = 0;
-  mood.visibleMs = 0;
-  mood.likes = 0;
-  mood.views.clear();
-  mood.completes.clear();
-  mood.loops.clear();
-  mood.lastDecay = performance.now();
-  mood.lastPaint = 0;
-  const button = overlay?.querySelector('.pts-mood-toggle');
-  if (button) button.textContent = '演出 OFF';
-  moodPaint(true);
-  moodScheduleLayout();
-  }
-
-  function moodDecay(now = performance.now()) {
-  const elapsed = Math.max(0, now - mood.lastDecay);
-  mood.lastDecay = now;
-  mood.value *= Math.pow(0.5, elapsed / 300000);
-  }
-
-  function moodAdd(points) {
-  moodDecay();
-  mood.value = Math.min(100, Math.max(0, mood.value + points));
-  moodPaint(true);
-  }
-
-  function moodTick(dt) {
-  mood.visibleMs += dt;
-  mood.value = Math.min(100, mood.value + dt * 0.00008);
-  moodPaint();
-  }
-
-  function moodOnView(s) {
-  if (!s?.id) return;
-  mood.views.add(String(s.id));
-  moodPaint(true);
-  }
-
-  function moodOnLike(s) {
-  if (!s?.id || overlay?.style.display === 'none') return;
-  mood.likes++;
-  moodAdd(15);
-  }
-
-  function moodOnLoop(s) {
-  if (!s?.id ||!s.isCurrent || document.hidden) return;
-  const id = String(s.id), now = performance.now();
-  const old = mood.loops.get(id) || { count: 0, at: -Infinity};
-  if (old.count >= 3 || now - old.at < 12000) return;
-  mood.loops.set(id, { count: old.count + 1, at: now});
-  moodAdd(old.count === 0? 4: 1);
-  }
-
-  function moodOnComplete(s) {
-  if (!s?.id ||!s.isCurrent || document.hidden) return;
-  const id = String(s.id);
-  if (mood.completes.has(id)) return;
-  mood.completes.add(id);
-  moodAdd(8);
-  }
-
-  function moodPaint(force = false) {
-  const hud = mood.hud;
-  if (!hud) return;
-  const now = performance.now();
-  if (!force && now - mood.lastPaint < 900) return;
-  mood.lastPaint = now;
-  const n = Math.max(0, Math.min(100, Math.round(mood.value)));
-  const rgb = n >= 75? '255,95,108'
-  : n >= 40? '255,154,103': '92,189,255';
-  hud.style.setProperty('--pts-mood-rgb', rgb);
-  hud.style.setProperty('--pts-mood-fill', n + '%');
-  hud.style.setProperty('--pts-mood-beat', n >= 75? '1.25s': '2.8s');
-  hud.classList.toggle('pts-mood-beat', n >= 40);
-  hud.classList.toggle('pts-mood-reduced', effectsReduced ||
-  !!navigator.connection?.saveData ||
-  !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
-  const value = hud.querySelector('.pts-mood-value');
-  const bar = hud.querySelector('[role="progressbar"]');
-  const stats = hud.querySelector('.pts-mood-stats');
-  if (value) value.textContent = `${n}%`;
-  if (bar) bar.setAttribute('aria-valuenow', String(n));
-  const secs = Math.floor(mood.visibleMs / 1000);
-  const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
-  if (stats) stats.textContent = hud.classList.contains('pts-mood-side')
-  ? `作品 ${mood.views.size}\n❤️ ${mood.likes}\n${clock}`
-  : `作品 ${mood.views.size} · ❤️ ${mood.likes} · ${clock}`;
-  }
-
-  function moodScheduleLayout(delay = 100) {
-  if (!mood.installed || mood.timer) return;
-  mood.timer = setTimeout(() => {
-  mood.timer = null;
-  moodLayout();
-  }, delay);
-  }
-
-  function moodLayout() {
-  const hud = mood.hud;
-  if (!hud) return;
-  hud.hidden = true;
-  if (!mood.enabled ||!overlay || overlay.style.display === 'none') return;
-  const s = slides[currentIndex()];
-  if (!s?.isCurrent ||!s.resolved ||!s.sectionEl) return;
-  let img = s.mainImg;
-  if (s.kind === 'multi') {
-  const pager = s.sectionEl.querySelector('.pts-pager');
-  if (!pager ||!pager.clientWidth) return;
-  const pos = pager.scrollLeft / pager.clientWidth;
-  if (Math.abs(pos - Math.round(pos)) > 0.04) return;
-  img = pager.querySelectorAll('.pts-page img')[Math.round(pos)];
-  }
-  if (!img?.naturalWidth ||!img?.naturalHeight) return;
-  const ir = img.getBoundingClientRect();
-  const vr = overlay.getBoundingClientRect();
-  const sr = s.sectionEl.getBoundingClientRect();
-  if (Math.abs(sr.top - vr.top) > Math.max(10, vr.height * 0.05)) return;
-  if (!ir.width ||!ir.height ||!vr.width ||!vr.height) return;
-  const scale = Math.min(ir.width / img.naturalWidth,
-  ir.height / img.naturalHeight);
-  const w = img.naturalWidth * scale, h = img.naturalHeight * scale;
-  const media = {
-  left: ir.left - vr.left + (ir.width - w) / 2,
-  top: ir.top - vr.top + (ir.height - h) / 2
-  };
-  media.right = media.left + w;
-  media.bottom = media.top + h;
-  const top = media.top, bottom = vr.height - media.bottom;
-  const left = media.left, right = vr.width - media.right;
-  let x, y, width, height, side = false;
-  if (top >= 112) {
-  width = Math.min(280, vr.width - 26);
-  height = 54;
-  x = (vr.width - width) / 2;
-  y = top - 65;
-  } else if (bottom >= (s.kind === 'ugoira'? 183: 149)) {
-  width = Math.min(280, vr.width - 26);
-  height = 54;
-  x = (vr.width - width) / 2;
-  y = media.bottom + 9;
-  } else if (Math.max(left, right) >= 74 && vr.height >= 260) {
-  side = true;
-  const gap = Math.max(left, right);
-  width = Math.min(64, gap - 12);
-  height = 216;
-  x = left >= right? (left - width) / 2
-  : media.right + (right - width) / 2;
-  y = (vr.height - height) / 2;
-  } else {
-  return; // 十分な黒帯がない場合は画像を優先
-  }
-  if ([x, y, width, height].some(v =>!Number.isFinite(v))) return;
-  hud.classList.toggle('pts-mood-side', side);
-  Object.assign(hud.style, {
-  left: `${x}px`, top: `${y}px`,
-  width: `${width}px`, height: `${height}px`
-  });
-  hud.hidden = false;
-  moodPaint(true);
-  }
-
-  function installMoodUI() {
-  if (mood.installed ||!overlay ||!feedEl) return;
-  mood.installed = true;
-  const tools = overlay.querySelector('.pts-tools');
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'pts-mood-toggle';
-  button.textContent = '演出 OFF';
-  button.addEventListener('click', () => {
-  mood.enabled =!mood.enabled;
-  button.textContent = mood.enabled? '演出 OFF': '演出 ON';
-  mood.hud.hidden =!mood.enabled;
-  moodScheduleLayout();
-  });
-  tools?.appendChild(button);
-  const hud = document.createElement('aside');
-  hud.className = 'pts-mood';
-  hud.setAttribute('aria-label', 'セッション演出メーター');
-  hud.hidden = true;
-  hud.innerHTML = `<div class="pts-mood-head"><span>高まり</span><b class="pts-mood-value">0%</b></div>
-  <div class="pts-mood-track" role="progressbar" aria-label="演出レベル"
-  aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-  <div class="pts-mood-fill"></div></div>
-  <div class="pts-mood-stats">作品 0 · ❤️ 0 · 0:00</div>`;
-  mood.hud = hud;
-  overlay.appendChild(hud);
-  feedEl.addEventListener('load', e => {
-  const img = e.target, s = slides[currentIndex()];
-  if (img?.tagName!== 'IMG' ||!s?.sectionEl?.contains(img)) return;
-  const size = `${img.naturalWidth}x${img.naturalHeight}`;
-  if (s.moodImageSize!== size) {
-  s.moodImageSize = size;
-  moodScheduleLayout();
-  }
-  }, true);
-  feedEl.addEventListener('scroll', () => {
-  hud.hidden = true; // 移動中は写真に重なる可能性があるため即時非表示
-  moodScheduleLayout();
-  }, true);
-  window.addEventListener('resize', () => moodScheduleLayout(), { passive: true});
-  if (window.ResizeObserver) {
-  mood.resizeObserver = new ResizeObserver(() => moodScheduleLayout());
-  mood.resizeObserver.observe(feedEl);
-  }
-  installMoodCSS();
-  }
-
-  function installMoodCSS() {
-    const style = document.createElement('style');
-    style.textContent = `
-      #pts-overlay .pts-mood[hidden]{display:none!important}
-      #pts-overlay .pts-mood{
-        position:absolute;z-index:16;box-sizing:border-box;
-        padding:6px 10px;pointer-events:none;overflow:hidden;
-        border:1px solid rgba(255,255,255,.18);border-radius:12px;
-        color:#f7f7f7;background:
-          radial-gradient(ellipse at 50% 120%,rgba(var(--pts-mood-rgb),.26),transparent 75%),
-          rgba(10,10,14,.85);
-        box-shadow:inset 0 0 14px rgba(var(--pts-mood-rgb),.12)
-      }
-      #pts-overlay .pts-mood-head{
-        display:flex;align-items:center;justify-content:space-between;
-        font-size:11px;line-height:14px;white-space:nowrap
-      }
-      #pts-overlay .pts-mood-value{color:rgb(var(--pts-mood-rgb));font-size:14px}
-      #pts-overlay .pts-mood-track{
-        height:5px;position:relative;margin:5px 0;
-        border-radius:5px;background:#ffffff28;overflow:hidden
-      }
-      #pts-overlay .pts-mood-fill{
-        position:absolute;left:0;top:0;height:100%;width:var(--pts-mood-fill);
-        border-radius:5px;background:rgb(var(--pts-mood-rgb))
-      }
-      #pts-overlay .pts-mood-stats{
-        font-size:10px;line-height:12px;opacity:.8;
-        text-align:center;white-space:nowrap
-      }
-      #pts-overlay .pts-mood-side{
-        padding:8px 4px;display:flex;flex-direction:column;
-        justify-content:space-around;align-items:center
-      }
-      #pts-overlay .pts-mood-side .pts-mood-head{
-        flex-direction:column;gap:3px
-      }
-      #pts-overlay .pts-mood-side .pts-mood-track{
-        height:92px;width:6px;margin:5px 0
-      }
-      #pts-overlay .pts-mood-side .pts-mood-fill{
-        width:100%;height:var(--pts-mood-fill);
-        top:auto;bottom:0
-      }
-      #pts-overlay .pts-mood-side .pts-mood-stats{
-        white-space:pre-line;font-size:9px;line-height:1.4
-      }
-      #pts-overlay .pts-mood-beat:not(.pts-mood-reduced) .pts-mood-track{
-        animation:ptsMoodPulse var(--pts-mood-beat) ease-in-out infinite
-      }
-      @keyframes ptsMoodPulse{
-        0%,100%{box-shadow:0 0 1px rgba(var(--pts-mood-rgb),.15)}
-        50%{box-shadow:0 0 11px rgba(var(--pts-mood-rgb),.7)}
-      }
-      #pts-overlay.pts-low-effects .pts-mood-track{animation:none!important}
-      @media(prefers-reduced-motion:reduce){
-        #pts-overlay .pts-mood-track{animation:none!important}
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-
   function loadSeenTimes() {
     if (!getMyUserId()) return;
 
@@ -2962,7 +2679,6 @@
     };
 
     syncDock();
-    moodScheduleLayout();
   }
   function applyPositive(s, kind, weight) {
     if (!s) return;
@@ -3014,8 +2730,6 @@
 
     const v = activeView;
     const now = performance.now();
-    moodDecay(now);
-    moodPaint();
     const dt = Math.max(0, Math.min(1000, now - v.last));
 
     v.last = now;
@@ -3031,13 +2745,11 @@
 
     v.readySeen = true;
     v.elapsed += dt;
-    moodTick(dt);
 
     if (!v.recorded && v.elapsed >= 1000) {
       v.recorded = true;
       markSeen(s.id);
       noteSessionVisit(s);
-      moodOnView(s);
     }
 
     if (!v.long && v.elapsed >= 20000) {
@@ -3057,7 +2769,6 @@
   function onUgoiraLoop(s) {
     if (activeView?.slide === s) {
       activeView.loopCompleted = true;
-      moodOnLoop(s);
     }
   }
 
@@ -3114,7 +2825,6 @@
 
   async function likeArtwork(s, x, y) {
     showLikeHeart(s, x, y);
-    moodOnLike(s);
     s.likedThisSession = true;
 
     const generation = feedGeneration;
@@ -5631,7 +5341,6 @@
     buildOverlay();
     installDiagnosticUI();
     installExperienceUI();
-    installMoodUI();
     bindSkipNavigation();
 
     skippedThisSession.clear();
@@ -5641,7 +5350,6 @@
 
     sessionTrail.length = 0;
     activeView = null;
-    resetMoodSession();
 
     searchConfig = getSearchPageConfig();
     mode = searchConfig ? 'search' : 'custom';
@@ -5680,9 +5388,6 @@
     if (feedEl) feedEl.replaceChildren();
 
     activeView = null;
-    clearTimeout(mood.timer);
-    mood.timer = null;
-    if (mood.hud) mood.hud.hidden = true;
     overlay.style.display = 'none';
 
     keepAwake(false);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.0.0
+// @version      3.1.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -26,6 +26,14 @@
   let pageLoadMisses = 0;
   let mode = 'page'; // 'page' | 'related'
   let observer = null;
+  let quality = 'fast'; // 'fast' = 最大1200pxで軽く / 'orig' = 元画像
+
+  function pickUrl(urls) {
+    if (!urls) return '';
+    return quality === 'orig'
+      ? (urls.original || urls.regular || '')
+      : (urls.regular || urls.original || '');
+  }
 
   /* ---------- ページ内スキャン（3段構え） ---------- */
 
@@ -141,14 +149,14 @@
         s.kind = 'multi';
         try {
           const pages = await fetchJson(`/ajax/illust/${s.id}/pages`);
-          s.pages = pages.map((p) => p.urls.original || p.urls.regular);
+          s.pages = pages.map((p) => pickUrl(p.urls));
         } catch (e) {
-          s.pages = [body.urls.original || upgradeUrl(s.thumb)];
+          s.pages = [pickUrl(body.urls) || upgradeUrl(s.thumb)];
           s.kind = 'single';
         }
       } else {
         s.kind = 'single';
-        s.pages = [body.urls.original || body.urls.regular || upgradeUrl(s.thumb)];
+        s.pages = [pickUrl(body.urls) || upgradeUrl(s.thumb)];
       }
     } catch (e) {
       s.kind = 'single';
@@ -249,6 +257,7 @@
     const holder = s.sectionEl.querySelector('.pts-holder');
     if (!holder) return;
     holder.innerHTML = '';
+    const visible = s.sectionEl.dataset.visible === '1';
     if (s.kind === 'multi' && s.pages && s.pages.length > 1) {
       const pager = document.createElement('div');
       pager.className = 'pts-pager';
@@ -257,7 +266,13 @@
         pg.className = 'pts-page';
         const im = document.createElement('img');
         im.className = 'pts-img';
-        im.src = u;
+        if (i === 0 && !visible) {
+          // 1枚目も見える位置に来るまで本番URLを待たせる
+          im.src = s.thumb;
+          im.dataset.pendingSrc = u;
+        } else {
+          im.src = u;
+        }
         im.loading = i === 0 ? 'eager' : 'lazy';
         im.alt = s.title || '';
         pg.appendChild(im);
@@ -276,14 +291,20 @@
     } else {
       const im = document.createElement('img');
       im.className = 'pts-img';
-      im.src = (s.pages && s.pages[0]) || s.thumb;
+      const full = (s.pages && s.pages[0]) || s.thumb;
+      if (visible) {
+        im.src = full;
+      } else {
+        im.src = s.thumb || full;
+        im.dataset.pendingSrc = full;
+      }
       im.alt = s.title || '';
       im.addEventListener('error', () => {
         if (s.thumb && !im.src.includes(s.thumb)) im.src = s.thumb;
       });
       holder.appendChild(im);
       s.mainImg = im;
-      if (s.kind === 'ugoira') prepareUgoira(s);
+      if (s.kind === 'ugoira' && visible) prepareUgoira(s);
     }
   }
 
@@ -296,7 +317,8 @@
     holder.className = 'pts-holder';
     const ph = document.createElement('img');
     ph.className = 'pts-img';
-    ph.src = upgradeUrl(s.thumb) || s.thumb;
+    // 仮表示は軽いサムネイル。本番画像は見える位置に来てから読み込む
+    ph.src = s.thumb || upgradeUrl(s.thumb);
     ph.alt = s.title || '';
     ph.loading = idx < 2 ? 'eager' : 'lazy';
     holder.appendChild(ph);
@@ -423,6 +445,11 @@
         const s = slides.find((x) => x.sectionEl === sec);
         if (!s) return;
         if (en.isIntersecting) {
+          // 見える位置に来たら本番画像を読み込む
+          if (s.mainImg && s.mainImg.dataset.pendingSrc) {
+            s.mainImg.src = s.mainImg.dataset.pendingSrc;
+            delete s.mainImg.dataset.pendingSrc;
+          }
           if (s.kind === 'ugoira') {
             if (s.frameUrls) startUgoira(s);
             else if (s.resolved) prepareUgoira(s);
@@ -455,6 +482,10 @@
     overlay.innerHTML = `
       <div class="pts-bar">
         <span class="pts-counter">…</span>
+        <select class="pts-quality">
+          <option value="fast">速い</option>
+          <option value="orig">元画像</option>
+        </select>
         <button class="pts-rescan">再スキャン</button>
         <button class="pts-close" title="閉じる">✕</button>
       </div>
@@ -463,6 +494,12 @@
     feedEl = overlay.querySelector('.pts-feed');
     overlay.querySelector('.pts-close').addEventListener('click', closeViewer);
     overlay.querySelector('.pts-rescan').addEventListener('click', buildFeed);
+    overlay.querySelector('.pts-quality').addEventListener('change', (e) => {
+      quality = e.target.value;
+      // 画質を変えたら全スライドを取り直す
+      slides.forEach((s) => { s.resolved = false; s.pages = null; s.kind = 'single'; });
+      resolveQueue();
+    });
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
       if (remain < feedEl.clientHeight * 2) pageLoadMore();
@@ -478,8 +515,10 @@
       .pts-bar{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;gap:10px;
         padding:10px 14px;color:#fff;background:linear-gradient(rgba(0,0,0,.65),transparent);font-size:13px;}
       .pts-counter{opacity:.9}
-      .pts-rescan{margin-left:auto;background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;
+      .pts-rescan{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;
         padding:7px 12px;cursor:pointer;font-size:12px;}
+      .pts-quality{margin-left:auto;background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:8px;padding:6px 8px;font-size:12px;}
+      .pts-quality option{color:#000;}
       .pts-close{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;width:32px;height:32px;cursor:pointer;font-size:15px;}
       .pts-feed{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;}
       .pts-feed::-webkit-scrollbar{display:none;}

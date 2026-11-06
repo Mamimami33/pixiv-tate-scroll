@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      2.5.0
-// @description  今開いているpixivのページに並んでいる作品を、1枚ずつ大きい画像でTikTok風に縦スクロールして眺めるビューアです。
+// @version      3.0.0
+// @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
 // @run-at       document-idle
@@ -20,15 +20,15 @@
 
   let overlay = null;
   let feedEl = null;
-  let slides = []; // {id, thumb, title, author, page, full, imgEl, titleEl, authorEl}
+  let slides = [];
   let resolving = false;
   let pageLoadBusy = false;
   let pageLoadMisses = 0;
   let mode = 'page'; // 'page' | 'related'
+  let observer = null;
 
   /* ---------- ページ内スキャン（3段構え） ---------- */
 
-  // 画像URLから作品IDを抜く： .../<ID>_p0_square1200.jpg のような形
   function idFromImgUrl(u) {
     if (!u) return null;
     const m = u.match(/\/(\d{5,})_(?:p\d+_|square1200|custom1200|master1200|ugoira)/);
@@ -53,24 +53,26 @@
     return '';
   }
 
+  function newSlide(id, thumb, title, author) {
+    return {
+      id, thumb: thumb || '', title: title || '', author: author || '',
+      page: `https://www.pixiv.net/artworks/${id}`,
+      resolved: false, kind: 'single', // 'single' | 'multi' | 'ugoira'
+      pages: null, frames: null, zipUrl: null,
+      sectionEl: null, mainImg: null, titleEl: null, authorEl: null, pageChip: null,
+      animTimer: null, animIdx: 0, frameUrls: null,
+    };
+  }
+
   function scanPage() {
     const seen = new Set(slides.map((s) => s.id));
     const items = [];
     const push = (id, thumb, title) => {
       if (!id || seen.has(id)) return;
       seen.add(id);
-      items.push({
-        id,
-        thumb: thumb || '',
-        full: null,
-        title: title || '',
-        author: '',
-        page: `https://www.pixiv.net/artworks/${id}`,
-        imgEl: null, titleEl: null, authorEl: null,
-      });
+      items.push(newSlide(id, thumb, title, ''));
     };
 
-    // 第1段：ページ内の全画像から、URLに含まれる作品IDで拾う（カードの構造に依存しない）
     document.querySelectorAll('img').forEach((img) => {
       if (overlay && overlay.contains(img)) return;
       const src = pickBestSrc(img);
@@ -78,7 +80,6 @@
       if (id) push(id, src, (img.alt || '').trim());
     });
 
-    // 第2段：作品リンクから拾う（画像と別構造のカード用）
     document.querySelectorAll('a[href*="/artworks/"]').forEach((a) => {
       if (overlay && overlay.contains(a)) return;
       const m = (a.getAttribute('href') || '').match(/\/artworks\/(\d+)/);
@@ -94,7 +95,6 @@
       push(m[1], img ? pickBestSrc(img) : '', img ? (img.alt || '').trim() : '');
     });
 
-    // 第3段：どちらの方法でもほとんど拾えない場合は、ページ内の埋め込みデータからIDだけ拾う
     if (items.length < 3) {
       const html = document.documentElement.innerHTML;
       const re = /artworks\/(\d{5,})/g;
@@ -106,7 +106,7 @@
     return items;
   }
 
-  /* ---------- 大きい画像とタイトルの解決 ---------- */
+  /* ---------- 作品情報の解決（元画像・複数枚・うごイラ） ---------- */
 
   function upgradeUrl(url) {
     if (!url) return '';
@@ -115,25 +115,47 @@
     return u;
   }
 
-  async function resolveFull(s) {
+  async function fetchJson(url) {
+    const res = await fetch(url, { credentials: 'same-origin' });
+    const json = await res.json();
+    if (json.error) throw new Error(json.message || 'api error');
+    return json.body;
+  }
+
+  async function resolveSlide(s) {
     try {
-      const res = await fetch(`/ajax/illust/${s.id}`, { credentials: 'same-origin' });
-      const json = await res.json();
-      if (!json.error && json.body) {
-        if (!s.title && json.body.title) {
-          s.title = json.body.title;
-          if (s.titleEl) s.titleEl.textContent = s.title;
+      const body = await fetchJson(`/ajax/illust/${s.id}`);
+      if (body.title && !s.title) { s.title = body.title; if (s.titleEl) s.titleEl.textContent = s.title; }
+      if (body.userName) { s.author = body.userName; if (s.authorEl) s.authorEl.textContent = s.author; }
+      const pageCount = body.pageCount || 1;
+      if (body.illustType === 1) {
+        // うごイラ
+        s.kind = 'ugoira';
+        try {
+          const meta = await fetchJson(`/ajax/illust/${s.id}/ugoira_meta`);
+          s.zipUrl = meta.src;
+          s.frames = meta.frames;
+        } catch (e) { /* 静止画フォールバック */ }
+        s.pages = [body.urls.original || body.urls.regular || upgradeUrl(s.thumb)];
+      } else if (pageCount > 1) {
+        s.kind = 'multi';
+        try {
+          const pages = await fetchJson(`/ajax/illust/${s.id}/pages`);
+          s.pages = pages.map((p) => p.urls.original || p.urls.regular);
+        } catch (e) {
+          s.pages = [body.urls.original || upgradeUrl(s.thumb)];
+          s.kind = 'single';
         }
-        if (json.body.userName) {
-          s.author = json.body.userName;
-          if (s.authorEl) s.authorEl.textContent = s.author;
-        }
-        if (json.body.urls) {
-          return json.body.urls.regular || json.body.urls.original || upgradeUrl(s.thumb);
-        }
+      } else {
+        s.kind = 'single';
+        s.pages = [body.urls.original || body.urls.regular || upgradeUrl(s.thumb)];
       }
-    } catch (e) { /* fall through */ }
-    return upgradeUrl(s.thumb);
+    } catch (e) {
+      s.kind = 'single';
+      s.pages = [upgradeUrl(s.thumb) || s.thumb];
+    }
+    s.resolved = true;
+    applyResolved(s);
   }
 
   async function resolveQueue() {
@@ -141,40 +163,151 @@
     resolving = true;
     try {
       for (const s of slides) {
-        if (s.full) continue;
-        s.full = await resolveFull(s);
-        if (s.imgEl && s.full) {
-          if (s.imgEl.dataset.thumb === '1') {
-            s.imgEl.src = s.full;
-            s.imgEl.dataset.thumb = '';
-          }
-          const pre = new Image();
-          pre.src = s.full;
-        }
+        if (!s.resolved) await resolveSlide(s);
       }
     } finally {
       resolving = false;
     }
   }
 
+  /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
+
+  async function unzipFrames(zipUrl, frames) {
+    const buf = await (await fetch(zipUrl)).arrayBuffer();
+    const view = new DataView(buf);
+    // End of Central Directory を後ろから探す
+    let eocd = -1;
+    for (let i = buf.byteLength - 22; i >= 0 && i > buf.byteLength - 22 - 65536; i--) {
+      if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('no eocd');
+    const count = view.getUint16(eocd + 10, true);
+    let off = view.getUint32(eocd + 16, true);
+    const byName = new Map();
+    for (let n = 0; n < count; n++) {
+      if (view.getUint32(off, true) !== 0x02014b50) break;
+      const method = view.getUint16(off + 10, true);
+      const compSize = view.getUint32(off + 20, true);
+      const nameLen = view.getUint16(off + 28, true);
+      const extraLen = view.getUint16(off + 30, true);
+      const commentLen = view.getUint16(off + 32, true);
+      const localOff = view.getUint32(off + 42, true);
+      const name = new TextDecoder().decode(new Uint8Array(buf, off + 46, nameLen));
+      const lNameLen = view.getUint16(localOff + 26, true);
+      const lExtraLen = view.getUint16(localOff + 28, true);
+      const dataOff = localOff + 30 + lNameLen + lExtraLen;
+      byName.set(name, { method, compSize, dataOff });
+      off += 46 + nameLen + extraLen + commentLen;
+    }
+    const urls = [];
+    for (const f of frames) {
+      const ent = byName.get(f.file);
+      if (!ent) { urls.push(null); continue; }
+      const raw = new Uint8Array(buf, ent.dataOff, ent.compSize);
+      let bytes = raw;
+      if (ent.method === 8) {
+        const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+      const mime = /\.png$/i.test(f.file) ? 'image/png' : 'image/jpeg';
+      urls.push(URL.createObjectURL(new Blob([bytes], { type: mime })));
+    }
+    return urls;
+  }
+
+  function startUgoira(s) {
+    if (s.animTimer || !s.frameUrls) return;
+    const step = () => {
+      if (!s.frameUrls) return;
+      const url = s.frameUrls[s.animIdx % s.frameUrls.length];
+      if (url && s.mainImg) s.mainImg.src = url;
+      const delay = (s.frames[s.animIdx % s.frames.length].delay) || 100;
+      s.animIdx++;
+      s.animTimer = setTimeout(step, delay);
+    };
+    step();
+  }
+
+  function stopUgoira(s) {
+    if (s.animTimer) { clearTimeout(s.animTimer); s.animTimer = null; }
+  }
+
+  async function prepareUgoira(s) {
+    if (s.frameUrls || !s.zipUrl || !s.frames) return;
+    try {
+      s.frameUrls = await unzipFrames(s.zipUrl, s.frames);
+      if (s.sectionEl && s.sectionEl.dataset.visible === '1') startUgoira(s);
+    } catch (e) {
+      // 失敗したら静止画のまま
+    }
+  }
+
   /* ---------- 表示 ---------- */
+
+  function applyResolved(s) {
+    if (!s.sectionEl) return;
+    const holder = s.sectionEl.querySelector('.pts-holder');
+    if (!holder) return;
+    holder.innerHTML = '';
+    if (s.kind === 'multi' && s.pages && s.pages.length > 1) {
+      const pager = document.createElement('div');
+      pager.className = 'pts-pager';
+      s.pages.forEach((u, i) => {
+        const pg = document.createElement('div');
+        pg.className = 'pts-page';
+        const im = document.createElement('img');
+        im.className = 'pts-img';
+        im.src = u;
+        im.loading = i === 0 ? 'eager' : 'lazy';
+        im.alt = s.title || '';
+        pg.appendChild(im);
+        pager.appendChild(pg);
+      });
+      pager.addEventListener('scroll', () => {
+        const idx = Math.round(pager.scrollLeft / pager.clientWidth);
+        if (s.pageChip) s.pageChip.textContent = `${idx + 1} / ${s.pages.length}`;
+      }, { passive: true });
+      holder.appendChild(pager);
+      if (s.pageChip) {
+        s.pageChip.style.display = 'block';
+        s.pageChip.textContent = `1 / ${s.pages.length}`;
+      }
+      s.mainImg = pager.querySelector('img');
+    } else {
+      const im = document.createElement('img');
+      im.className = 'pts-img';
+      im.src = (s.pages && s.pages[0]) || s.thumb;
+      im.alt = s.title || '';
+      im.addEventListener('error', () => {
+        if (s.thumb && !im.src.includes(s.thumb)) im.src = s.thumb;
+      });
+      holder.appendChild(im);
+      s.mainImg = im;
+      if (s.kind === 'ugoira') prepareUgoira(s);
+    }
+  }
 
   function renderSlide(s, idx) {
     const sec = document.createElement('section');
     sec.className = 'pts-slide';
+    s.sectionEl = sec;
 
-    const img = document.createElement('img');
-    img.className = 'pts-img';
-    const first = s.full || upgradeUrl(s.thumb);
-    img.src = first || s.thumb;
-    img.dataset.thumb = s.full ? '' : '1';
-    img.alt = s.title || '';
-    img.loading = idx < 2 ? 'eager' : 'lazy';
-    img.addEventListener('error', () => {
-      if (s.thumb && !img.src.includes(s.thumb)) img.src = s.thumb;
-    });
-    s.imgEl = img;
-    sec.appendChild(img);
+    const holder = document.createElement('div');
+    holder.className = 'pts-holder';
+    const ph = document.createElement('img');
+    ph.className = 'pts-img';
+    ph.src = upgradeUrl(s.thumb) || s.thumb;
+    ph.alt = s.title || '';
+    ph.loading = idx < 2 ? 'eager' : 'lazy';
+    holder.appendChild(ph);
+    s.mainImg = ph;
+    sec.appendChild(holder);
+
+    const chip = document.createElement('div');
+    chip.className = 'pts-pagechip';
+    chip.style.display = 'none';
+    sec.appendChild(chip);
+    s.pageChip = chip;
 
     const meta = document.createElement('div');
     meta.className = 'pts-meta';
@@ -205,6 +338,7 @@
     sec.appendChild(rel);
 
     feedEl.appendChild(sec);
+    if (observer) observer.observe(sec);
   }
 
   /* ---------- 関連作品への切り替え ---------- */
@@ -212,21 +346,11 @@
   async function switchToRelated(slide, btn) {
     if (btn) { btn.textContent = '読み込み中…'; btn.disabled = true; }
     try {
-      const res = await fetch(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`, { credentials: 'same-origin' });
-      const json = await res.json();
-      if (json.error || !json.body || !json.body.illusts) throw new Error('recommend failed');
-      const items = json.body.illusts.map((it) => ({
-        id: String(it.id),
-        thumb: it.url || '',
-        full: null,
-        title: it.title || '',
-        author: it.userName || '',
-        page: `https://www.pixiv.net/artworks/${it.id}`,
-        imgEl: null, titleEl: null, authorEl: null,
-      })).filter((it) => it.id !== slide.id);
+      const body = await fetchJson(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`);
+      const items = (body.illusts || [])
+        .map((it) => newSlide(String(it.id), it.url || '', it.title || '', it.userName || ''))
+        .filter((it) => it.id !== slide.id);
       if (items.length === 0) throw new Error('no related');
-
-      // 今見ているスライドより後ろを捨てて、関連作品を続ける
       const idx = slides.indexOf(slide);
       slides = slides.slice(0, idx + 1);
       while (feedEl.children.length > idx + 1) {
@@ -239,6 +363,8 @@
       if (btn) { btn.textContent = '関連が取れませんでした'; btn.disabled = false; }
     }
   }
+
+  /* ---------- フィード管理 ---------- */
 
   function updateCounter() {
     const c = overlay.querySelector('.pts-counter');
@@ -289,6 +415,25 @@
 
   /* ---------- オーバーレイ ---------- */
 
+  function setupObserver() {
+    observer = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        const sec = en.target;
+        sec.dataset.visible = en.isIntersecting ? '1' : '';
+        const s = slides.find((x) => x.sectionEl === sec);
+        if (!s) return;
+        if (en.isIntersecting) {
+          if (s.kind === 'ugoira') {
+            if (s.frameUrls) startUgoira(s);
+            else if (s.resolved) prepareUgoira(s);
+          }
+        } else {
+          stopUgoira(s);
+        }
+      });
+    }, { root: null, threshold: 0.6 });
+  }
+
   function openViewer() {
     buildOverlay();
     overlay.style.display = 'block';
@@ -299,10 +444,12 @@
 
   function closeViewer() {
     overlay.style.display = 'none';
+    slides.forEach((s) => stopUgoira(s));
   }
 
   function buildOverlay() {
     if (overlay) return;
+    setupObserver();
     overlay = document.createElement('div');
     overlay.id = 'pts-overlay';
     overlay.innerHTML = `
@@ -336,16 +483,22 @@
       .pts-close{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;width:32px;height:32px;cursor:pointer;font-size:15px;}
       .pts-feed{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;}
       .pts-feed::-webkit-scrollbar{display:none;}
-      .pts-slide{position:relative;height:100%;scroll-snap-align:start;scroll-snap-stop:always;
-        display:flex;align-items:center;justify-content:center;background:#000;}
+      .pts-slide{position:relative;height:100%;scroll-snap-align:start;scroll-snap-stop:always;background:#000;}
+      .pts-holder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
       .pts-img{max-width:100%;max-height:100%;object-fit:contain;}
-      .pts-meta{position:absolute;left:0;right:0;bottom:0;padding:28px 16px 18px;color:#fff;pointer-events:none;
+      .pts-pager{display:flex;height:100%;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;scrollbar-width:none;width:100%;}
+      .pts-pager::-webkit-scrollbar{display:none;}
+      .pts-page{min-width:100%;height:100%;scroll-snap-align:start;scroll-snap-stop:always;
+        display:flex;align-items:center;justify-content:center;}
+      .pts-pagechip{position:absolute;top:52px;right:14px;z-index:2;background:rgba(0,0,0,.55);color:#fff;
+        font-size:12px;padding:4px 9px;border-radius:999px;}
+      .pts-meta{position:absolute;left:0;right:0;bottom:0;z-index:2;padding:28px 16px 18px;color:#fff;pointer-events:none;
         background:linear-gradient(transparent,rgba(0,0,0,.7));}
       .pts-title{font-size:15px;font-weight:700;line-height:1.4;}
       .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
-      .pts-open{position:absolute;right:14px;bottom:64px;background:rgba(255,255,255,.16);color:#fff;
+      .pts-open{position:absolute;right:14px;bottom:64px;z-index:2;background:rgba(255,255,255,.16);color:#fff;
         text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
-      .pts-related{position:absolute;right:14px;bottom:112px;background:#0096fa;color:#fff;border:0;
+      .pts-related{position:absolute;right:14px;bottom:112px;z-index:2;background:#0096fa;color:#fff;border:0;
         font-size:12px;font-weight:700;padding:9px 13px;border-radius:999px;cursor:pointer;}
       .pts-related:disabled{opacity:.6;}
     `;

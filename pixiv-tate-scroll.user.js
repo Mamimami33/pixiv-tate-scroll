@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.10
+// @version      3.13.11
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -4782,6 +4782,154 @@
   let wakeLock = null;
   let csrfToken = null;
 
+  let csrfTokenSource = '';
+  let csrfReadPromise = null;
+  let csrfPreferHome = false;
+  let lastBookmarkAttempt = null;
+  let bookmarkToastTimer = null;
+
+  function bookmarkSafeMessage(value) {
+    let text = String(value ?? '');
+    if (csrfToken) text = text.split(csrfToken).join('[非表示]');
+    return text
+      .replace(/(?:csrf[_-]?token|token|authorization)\s*[:=]\s*["']?[\w+\-/.]{8,}/ig,
+        'token=[非表示]')
+      .replace(/[A-Za-z0-9_\-]{32,}/g, '[非表示]')
+      .replace(/[\r\n\t]+/g, ' ').slice(0, 120);
+  }
+
+  function recordBookmarkAttempt(result, stage, httpStatus, apiMessage) {
+    lastBookmarkAttempt = {
+      at: new Date().toLocaleString('ja-JP'), result, stage,
+      httpStatus: httpStatus ?? null,
+      apiMessage: bookmarkSafeMessage(apiMessage),
+      tokenSource: csrfTokenSource || '未取得',
+      tokenLength: csrfToken?.length || 0
+    };
+    updateBookmarkDiagnosticUI();
+  }
+
+  function bookmarkDiagnosticText() {
+    const a = lastBookmarkAttempt;
+    if (!a) return '9. ブックマーク送信: 未施行 (POST診断は実行しません)';
+    const http = a.httpStatus == null
+      ? '未到達' : String(a.httpStatus);
+    return '9. ブックマーク送信: ' +
+      `${a.result} / 段階=${a.stage} / HTTP=${http}` +
+      ` / API=${a.apiMessage || 'なし'}` +
+      ` / token取得元=${a.tokenSource} (${a.tokenLength}文字)` +
+      ` / ${a.at}`;
+  }
+
+  function updateBookmarkDiagnosticUI() {
+    const el = overlay?.querySelector('.pts-bookmark-last');
+    if (el) el.textContent = bookmarkDiagnosticText();
+  }
+
+  function showBookmarkError(message) {
+    const toast = overlay?.querySelector('.pts-bookmark-toast');
+    if (!toast) return;
+    toast.textContent = '保存に失敗しました: ' +
+      bookmarkSafeMessage(message);
+    toast.hidden = false;
+    toast.classList.add('is-visible');
+    clearTimeout(bookmarkToastTimer);
+    bookmarkToastTimer = setTimeout(() => {
+      toast.classList.remove('is-visible');
+      toast.hidden = true;
+    }, 4500);
+  }
+
+  class BookmarkError extends Error {
+    constructor(stage, httpStatus, apiMessage) {
+      super(bookmarkSafeMessage(apiMessage)
+        || bookmarkStageLabel(stage));
+      this.name = 'BookmarkError';
+      this.stage = stage;
+      this.httpStatus = httpStatus ?? null;
+      this.apiMessage = bookmarkSafeMessage(apiMessage);
+    }
+  }
+
+  function bookmarkStageLabel(stage) {
+    return {
+      token: 'トークン取得失敗',
+      network: '通信エラー',
+      http: 'HTTPエラー',
+      response: '応答解析失敗',
+      api: 'APIエラー'
+    }[stage] || '保存に失敗しました';
+  }
+
+  function bookmarkFailure(
+    stage, message, httpStatus = null, apiMessage = ''
+  ) {
+    const err = new Error(bookmarkSafeMessage(message));
+    err.bookmarkStage = stage;
+    err.httpStatus = httpStatus;
+    err.apiMessage = bookmarkSafeMessage(apiMessage);
+    return err;
+  }
+
+  function csrfValid(value) {
+    return typeof value === 'string' &&
+      /^[A-Za-z0-9_-]{10,128}$/.test(value);
+  }
+
+  function csrfParse(text) {
+    try { return JSON.parse(text); }
+    catch (e) { return null; }
+  }
+
+  function csrfFromDocument(doc, html, prefix) {
+    const global = csrfParse(
+      doc.querySelector('meta[name="global-data"]')
+        ?.getAttribute('content') || ''
+    );
+    const globalToken =
+      global?.token ||
+      global?.csrfToken ||
+      global?.userData?.token;
+    if (csrfValid(globalToken)) {
+      return {
+        value: globalToken,
+        source: prefix + '.global-data'
+      };
+    }
+
+    const next = csrfParse(
+      doc.querySelector('#__NEXT_DATA__')?.textContent || ''
+    );
+    const props = next?.props?.pageProps;
+
+    let state = props?.serverSerializedPreloadedState;
+    if (typeof state === 'string') {
+      state = csrfParse(state);
+    }
+
+    const nextToken =
+      state?.api?.token ||
+      state?.api?.csrfToken ||
+      props?.api?.token ||
+      props?.csrfToken ||
+      props?.token;
+
+    if (csrfValid(nextToken)) {
+      return {
+        value: nextToken,
+        source: prefix + '.__NEXT_DATA__'
+      };
+    }
+
+    const matched = String(html || '').match(
+      /["']token["']\s*:\s*["']([A-Za-z0-9_-]{10,128})["']/i
+    );
+
+    return csrfValid(matched?.[1])
+      ? { value: matched[1], source: prefix + '.regex' }
+      : null;
+  }
+
   function gotoSlide(i, reason = 'other') {
     if (!feedEl || i < 0 || i >= slides.length) return;
 
@@ -4820,18 +4968,104 @@
 
   async function getCsrfToken() {
     if (csrfToken) return csrfToken;
-    const find = (html) => {
-      const m = html.match(/"token":"([0-9a-zA-Z]{10,})"/);
-      return m ? m[1] : null;
-    };
-    let t = null;
-    try { t = find(document.documentElement.innerHTML); } catch (e) {}
-    if (!t) {
-      const res = await fetch('https://www.pixiv.net/', { credentials: 'same-origin' });
-      t = find(await res.text());
+    if (csrfReadPromise) return csrfReadPromise;
+
+    csrfReadPromise = (async () => {
+      const page = () =>
+        (csrfFromDocument(document, document.documentElement.outerHTML, 'page') ||
+          csrfFromDocument(document, '', 'page'));
+
+      const home = async () => {
+        try {
+          const res = await fetch('https://www.pixiv.net/', {
+            method: 'GET',
+            credentials: 'same-origin',
+            cache: 'no-store'
+          });
+          if (!res.ok) return null;
+          const html = await res.text();
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          return csrfFromDocument(doc, html, 'home');
+        } catch (e) {
+          return null;
+        }
+      };
+
+      // 直前にCSRF拒否された場合はトップページを先に確認。
+      const hit = csrfPreferHome
+        ? (await home() || page())
+        : (page() || await home());
+
+      csrfPreferHome = false;
+      csrfToken = hit?.value || null;
+      csrfTokenSource = hit?.source || '未取得';
+
+      return csrfToken;
+    })();
+
+    try {
+      return await csrfReadPromise;
+    } finally {
+      csrfReadPromise = null;
     }
-    csrfToken = t;
-    return t;
+  }
+
+  function installBookmarkFeedback() {
+    if (!overlay || overlay.querySelector('.pts-bookmark-toast')) return;
+
+    const toast = document.createElement('div');
+    toast.className = 'pts-bookmark-toast';
+    toast.setAttribute('role', 'alert');
+    toast.hidden = true;
+    overlay.appendChild(toast);
+
+    const panel = overlay.querySelector(
+      '.pts-diag-panel .pts-diag-toolbar'
+    );
+    if (!panel) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'pts-bookmark-diag';
+    button.textContent = 'ブックマークの状態';
+    button.addEventListener('click', () => {
+      const el = overlay.querySelector('.pts-bookmark-last');
+      if (!el) return;
+      el.textContent = bookmarkDiagnosticText();
+    });
+    panel.appendChild(button);
+
+    const last = document.createElement('div');
+    last.className = 'pts-bookmark-last';
+    last.textContent = bookmarkDiagnosticText();
+    last.style.cssText =
+      'white-space:normal;font:12px/1.5 monospace;' +
+      'padding:8px 4px;color:#ddd;overflow-wrap:anywhere;';
+    panel.after(last);
+
+    const style = document.createElement('style');
+    style.textContent = `
+    #pts-overlay .pts-bookmark-toast[hidden]{
+      display:none!important
+    }
+    #pts-overlay .pts-bookmark-toast{
+      position:absolute;left:50%;
+      bottom:calc(90px + env(safe-area-inset-bottom));
+      transform:translateX(-50%);z-index:100;
+      width:max-content;max-width:calc(100% - 24px);
+      box-sizing:border-box;padding:12px 16px;
+      background:#541923ee;border:1px solid #ff9baa;
+      border-radius:12px;color:#fff;
+      font-size:13px;line-height:1.5;
+      text-align:center;pointer-events:none;
+      box-shadow:0 4px 20px #000b;
+      opacity:0;transition:opacity .25s ease;
+    }
+    #pts-overlay .pts-bookmark-toast.is-visible{
+      opacity:1;
+    }
+    `;
+    document.head.appendChild(style);
+    updateBookmarkDiagnosticUI();
   }
 
   function paintBookmarkBtn(s) {
@@ -4857,49 +5091,138 @@
     }
 
     const promise = (async () => {
-      const token = await getCsrfToken();
-      if (!token) throw new Error('token取得失敗');
+      let stage = 'token';
+      let status = null;
+      try {
+        const token = await getCsrfToken();
+        if (!token) {
+          throw bookmarkFailure('token', 'トークン取得失敗');
+        }
 
-      const res = await fetch('/ajax/illusts/bookmarks/add', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-csrf-token': token
-        },
-        body: JSON.stringify({
-          illust_id: id, restrict: 0, comment: '', tags: []
-        })
-      });
+        stage = 'network';
+        let res;
+        try {
+          res = await fetch('/ajax/illusts/bookmarks/add', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/json; charset=UTF-8',
+              'x-csrf-token': token
+            },
+            body: JSON.stringify({ illust_id: id, restrict: 0 })
+          });
+        } catch (error) {
+          if (csrfToken) {
+            csrfToken = null;
+            csrfTokenSource = '';
+          }
+          throw bookmarkFailure(
+            'network', '通信エラー', null, bookmarkSafeMessage(error)
+          );
+        }
 
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const json = await res.json();
-      if (json.error) throw new Error(json.message || 'api error');
+        status = res.status;
+        stage = 'http';
 
-      s.bookmarked = true;
-      knownBookmarkedIds.add(id);
-      paintBookmarkBtn(s);
+        if (res.status === 401 || res.status === 403) {
+          csrfPreferHome = true;
+          csrfToken = null;
+          csrfTokenSource = '';
+        }
 
-      if (!s.tasteLearned && s.tags?.length) {
-        learnFromWork(s.tags, s.userId, s.rawType, 3);
-        s.tasteLearned = true;
+        stage = 'response';
+
+        let json;
+        try {
+          json = await res.json();
+        } catch (e) {
+          throw bookmarkFailure(
+            res.ok ? 'response' : 'http',
+            res.ok ? 'JSON解析失敗' : `HTTP ${status}`,
+            status, ''
+          );
+        }
+
+        const message =
+          json?.body?.bookmarked ? '' :
+          json?.error?.message || json?.message || '';
+
+        if (!res.ok) {
+          throw bookmarkFailure(
+            'http', `HTTP ${status}`, status, message
+          );
+        }
+
+        stage = 'api';
+
+        if (!json || typeof json !== 'object' ||
+          json.error !== false) {
+          throw bookmarkFailure(
+            'api',
+            message || 'API成功応答を確認できません',
+            status, message
+          );
+        }
+
+        recordBookmarkAttempt('成功', '完了', status, '');
+
+        s.bookmarked = true;
+        knownBookmarkedIds.add(id);
+        paintBookmarkBtn(s);
+
+        if (!s.tasteLearned && s.tags?.length) {
+          learnFromWork(s.tags, s.userId, s.rawType, 3);
+          s.tasteLearned = true;
+        }
+
+        if (
+          mode === 'search' &&
+          slides.includes(s) &&
+          !searchGrid.open
+        ) {
+          void improveSearchFeedAfterBookmark(s);
+        }
+
+        return true;
+      } catch (err) {
+        const step = err.bookmarkStage || stage;
+        const http = err.httpStatus ?? status;
+        const api = bookmarkSafeMessage(err.apiMessage);
+
+        recordBookmarkAttempt(
+          '失敗', step, http, api || err.message
+        );
+
+        if (step === 'http' && (http === 401 || http === 403)) {
+          csrfPreferHome = true;
+          csrfToken = null;
+          csrfTokenSource = '';
+        }
+
+        const detail =
+          step === 'token' ? 'トークン取得失敗'
+          : step === 'http'
+            ? `HTTP ${http}${api ? ' / ' + api : ''}`
+            : step === 'api'
+              ? `API: ${api || err.message}`
+              : step === 'network' ? '通信エラー'
+              : step === 'response' ? '応答形式エラー'
+              : bookmarkSafeMessage(err.message);
+
+        showBookmarkError(detail);
+        throw err;
       }
-
-      // 検索フィードだけ保存成立後に改善。
-      // グリッドは専用の保存処理で対応する。
-      if (mode === 'search' && slides.includes(s) &&
-          !searchGrid.open) {
-        void improveSearchFeedAfterBookmark(s);
-      }
-
-      return true;
     })();
 
     s.bookmarkPromise = promise;
+
     try {
       return await promise;
     } finally {
-      if (s.bookmarkPromise === promise) s.bookmarkPromise = null;
+      if (s.bookmarkPromise === promise) {
+        s.bookmarkPromise = null;
+      }
     }
   }
 
@@ -5764,6 +6087,7 @@
       seq,
       '通信はGETのみ。APIの返答形式は実機で確認します。'
     );
+    diagAppend(seq,bookmarkDiagnosticText());
 
     const recCache = new Map();
 
@@ -6464,6 +6788,7 @@
 
     buildOverlay();
     installDiagnosticUI();
+    installBookmarkFeedback();
     installExperienceUI();
     installAmbientUI();
     bindSkipNavigation();
@@ -6495,6 +6820,12 @@
     if (!overlay) return;
     closeSearchGrid(false);
     closeDiagnosticPanel();
+    clearTimeout(bookmarkToastTimer);
+    const toast = overlay.querySelector('.pts-bookmark-toast');
+    if (toast) {
+      toast.classList.remove('is-visible');
+      toast.hidden = true;
+    }
     clearTimeout(singleTapTimer);
     clearTimeout(closeConfirmTimer);
     ambientReset();

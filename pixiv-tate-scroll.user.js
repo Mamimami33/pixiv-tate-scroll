@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.11.0
+// @version      3.11.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -640,50 +640,75 @@
 
   /* ---------- 表示 ---------- */
 
-  function applyResolved(s) {
+    function applyResolved(s) {
     if (!s.sectionEl) return;
+
+    const multi = s.kind === 'multi' &&
+      Array.isArray(s.pairs) && s.pairs.length > 1;
+
+    s.sectionEl.classList.toggle('pts-multi', multi);
+
     const holder = s.sectionEl.querySelector('.pts-holder');
     if (!holder) return;
-    if (s.kind === 'multi' && s.pairs && s.pairs.length > 1) {
+
+    if (multi) {
       holder.innerHTML = '';
       const pager = document.createElement('div');
       pager.className = 'pts-pager';
+
       s.pairs.forEach((pair, i) => {
         const pg = document.createElement('div');
         pg.className = 'pts-page';
         const im = document.createElement('img');
         im.className = 'pts-img';
         im.decoding = 'async';
-        // 3ページ目以降は近づくまで読み込まない（大量ページ作品の初期負荷を抑える）
+
         if (i <= 1) im.src = pair.r || pair.o;
         else im.dataset.src = pair.r || pair.o;
+
         im.loading = i === 0 ? 'eager' : 'lazy';
         im.alt = s.title || '';
         pg.appendChild(im);
         pager.appendChild(pg);
       });
+
       pager.addEventListener('scroll', () => {
-        const idx = Math.round(pager.scrollLeft / pager.clientWidth);
+        const idx = Math.round(
+          pager.scrollLeft / Math.max(1, pager.clientWidth)
+        );
         s.pageIdx = idx;
-        if (s.pageChip) s.pageChip.textContent = `${idx + 1} / ${s.pairs.length}`;
+
+        if (s.pageChip) {
+          s.pageChip.textContent =
+            `${idx + 1} / ${s.pairs.length}`;
+        }
+
         loadHorizontalNeighbors(s, idx);
         upgradeSlide(s);
       }, { passive: true });
+
       holder.appendChild(pager);
+
       if (s.pageChip) {
         s.pageChip.style.display = 'block';
         s.pageChip.textContent = `1 / ${s.pairs.length}`;
       }
+
       s.mainImg = pager.querySelector('img');
+
     } else {
-      // 仮表示のimg要素を使い回す（作り直すと一瞬消える。URLが同じなら読み直しも起きない）
       const pair = s.pairs && s.pairs[0];
       const target = (pair && (pair.r || pair.o)) || s.thumb;
       const im = s.mainImg;
+
       if (im && holder.contains(im)) {
         if (im.dataset) delete im.dataset.ptsPh;
-        if (target && !(im.getAttribute('src') || '').includes(target)) im.src = target;
+        if (target &&
+            !(im.getAttribute('src') || '').includes(target)) {
+          im.src = target;
+        }
         im.alt = s.title || im.alt || '';
+
       } else {
         holder.innerHTML = '';
         const nim = document.createElement('img');
@@ -691,9 +716,13 @@
         nim.decoding = 'async';
         nim.src = target;
         nim.alt = s.title || '';
+
         nim.addEventListener('error', () => {
-          if (s.thumb && !nim.src.includes(s.thumb)) nim.src = s.thumb;
+          if (s.thumb && !nim.src.includes(s.thumb)) {
+            nim.src = s.thumb;
+          }
         });
+
         holder.appendChild(nim);
         s.mainImg = nim;
       }
@@ -1891,18 +1920,45 @@
     autoKey = '';
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
   }
-  function syncDock() {
+    function syncDock() {
     if (!overlay || !experienceInstalled) return;
+
     const s = slides[currentIndex()];
-    const set = (sel, label) => {
-      const el = overlay.querySelector(sel);
+
+    const set = (selector, label) => {
+      const el = overlay.querySelector(selector);
       if (el) el.textContent = label;
     };
-    set('.pts-dock-save', s && (s.bookmarked || knownBookmarkedIds.has(String(s.id))) ? '✓ 保存済' : '🔖 保存');
-    set('.pts-dock-auto', autoSec ? '⏸ 自動ON' : '▶ 自動OFF');
-    set('.pts-dock-keep', keepCurrent ? '📌 キープ中' : '📌 キープ');
-    set('.pts-dock-fit', overlay.classList.contains('pts-fit-contain') ? '全体表示' : '画面充填');
-    set('.pts-dock-immersive', immersive ? 'UI表示' : '没入');
+
+    set(
+      '.pts-dock-save',
+      s && (s.bookmarked ||
+        knownBookmarkedIds.has(String(s.id)))
+        ? '✓ 保存済'
+        : '🔖 保存'
+    );
+
+    set(
+      '.pts-dock-auto',
+      autoSec ? '⏸ 自動ON' : '▶ 自動OFF'
+    );
+
+    set(
+      '.pts-dock-immersive',
+      immersive ? 'UI表示' : '没入'
+    );
+
+    set(
+      '.pts-tool-keep',
+      keepCurrent ? '📌 キープ中' : '📌 キープ'
+    );
+
+    set(
+      '.pts-tool-fit',
+      overlay.classList.contains('pts-fit-contain')
+        ? '全体表示'
+        : '画面充填'
+    );
   }
   function noteSessionVisit(s) {
     if (!s || !s.id) return;
@@ -2006,30 +2062,269 @@
     } else showControlsTemporarily();
     syncDock();
   }
+    let twoFingerTap = null;
+  let suppressTapUntil = 0;
+  const LIKE_TAP_WINDOW = 240;
+
+  function showLikeHeart(s, x, y) {
+    const section = s?.sectionEl;
+    if (!section) return;
+
+    const r = section.getBoundingClientRect();
+    const heart = document.createElement('span');
+
+    heart.className = 'pts-like-heart';
+    heart.textContent = '❤️';
+    heart.setAttribute('aria-hidden', 'true');
+
+    heart.style.left =
+      `${Math.max(0, Math.min(r.width, x - r.left))}px`;
+    heart.style.top =
+      `${Math.max(0, Math.min(r.height, y - r.top))}px`;
+
+    section.appendChild(heart);
+
+    heart.addEventListener(
+      'animationend',
+      () => heart.remove(),
+      { once: true }
+    );
+
+    setTimeout(() => heart.remove(), 1200);
+  }
+
+  async function likeArtwork(s, x, y) {
+    showLikeHeart(s, x, y);
+
+    const generation = feedGeneration;
+
+    try {
+      if (!s.resolved && (!s.tags?.length || !s.userId)) {
+        await resolveSlide(s);
+      }
+
+      // いいねのたびにフルウェイト3.0で学習。
+      // 滞在学習のpositiveSignals制限は使わない。
+      if (s.tags?.length ||
+          s.userId ||
+          Number(s.rawType) === 2) {
+        learnFromWork(s.tags, s.userId, s.rawType, 3);
+
+        // ensureBookmarked側の自動学習との
+        // 二重加点を防ぐ。
+        s.tasteLearned = true;
+      } else {
+        console.warn(
+          '[PTS like] 学習情報がなく加点は保留',
+          s.id
+        );
+      }
+
+      // 自前フィードでも関連候補を現在作品の後ろへ。
+      if (
+        generation === feedGeneration &&
+        mode === 'custom' &&
+        slides.includes(s)
+      ) {
+        void insertRecommendationsAfterBookmark(s);
+      }
+
+      // 既に保存済みならPOSTしない。
+      const newlySaved = await ensureBookmarked(s);
+
+      if (newlySaved) recordSessionSave(s);
+
+    } catch (e) {
+      console.warn('[PTS like] ブックマーク処理失敗', e);
+
+    } finally {
+      syncDock();
+    }
+  }
+
   function handleImageTap(e) {
-    const holder = e.target.closest('.pts-holder');
+    const holder = e.target.closest?.('.pts-holder');
     if (!holder) return;
-    // 元の renderSlide のタップ送りより先に処理する。
+
+    // renderSlideの従来タップ送りを抑止。
     e.stopImmediatePropagation();
-    if (!touchStart || Math.hypot(e.clientX - touchStart.x, e.clientY - touchStart.y) > 12) return;
+
+    if (
+      twoFingerTap ||
+      performance.now() < suppressTapUntil ||
+      e.isPrimary === false
+    ) return;
+
+    if (
+      !touchStart ||
+      touchStart.pointerId !== e.pointerId ||
+      Math.hypot(
+        e.clientX - touchStart.x,
+        e.clientY - touchStart.y
+      ) > 12
+    ) return;
+
     const s = slides[currentIndex()];
-    if (!s || !holder.closest('.pts-slide')?.isSameNode(s.sectionEl)) return;
-    const now = performance.now();
-    if (lastTap && lastTap.id === s.id && now - lastTap.time < 280 &&
-        Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 45) {
-      clearTimeout(singleTapTimer); singleTapTimer = null; lastTap = null;
-      toggleZoom(s, e.clientX, e.clientY);
+
+    if (!s || holder.closest('.pts-slide') !== s.sectionEl) {
       return;
     }
-    lastTap = { id: s.id, time: now, x: e.clientX, y: e.clientY };
-    clearTimeout(singleTapTimer);
-    singleTapTimer = setTimeout(() => {
+
+    const now = performance.now();
+
+    if (
+      lastTap &&
+      lastTap.id === String(s.id) &&
+      now - lastTap.time <= LIKE_TAP_WINDOW &&
+      Math.hypot(
+        e.clientX - lastTap.x,
+        e.clientY - lastTap.y
+      ) <= 46
+    ) {
+      clearTimeout(singleTapTimer);
+      singleTapTimer = null;
       lastTap = null;
-      if (immersive) { showControlsTemporarily(); return; }
+
+      void likeArtwork(s, e.clientX, e.clientY);
+      return;
+    }
+
+    lastTap = {
+      id: String(s.id),
+      time: now,
+      x: e.clientX,
+      y: e.clientY
+    };
+
+    clearTimeout(singleTapTimer);
+
+    singleTapTimer = setTimeout(() => {
+      singleTapTimer = null;
+      lastTap = null;
+
+      if (
+        !slides.includes(s) ||
+        slides[currentIndex()] !== s ||
+        overlay?.style.display === 'none'
+      ) return;
+
+      if (immersive) {
+        showControlsTemporarily();
+        return;
+      }
+
       if (zoomedSlide || s.kind === 'multi') return;
+
       const r = holder.getBoundingClientRect();
-      gotoSlide(currentIndex() + ((e.clientX - r.left) / r.width < .33 ? -1 : 1));
-    }, 280);
+
+      gotoSlide(
+        currentIndex() +
+        ((e.clientX - r.left) / Math.max(1, r.width) < .33
+          ? -1
+          : 1)
+      );
+    }, LIKE_TAP_WINDOW);
+  }
+
+  function bindExperienceGestures() {
+    feedEl.addEventListener('pointerdown', e => {
+      if (
+        e.isPrimary &&
+        e.target.closest?.('.pts-holder')
+      ) {
+        touchStart = {
+          x: e.clientX,
+          y: e.clientY,
+          pointerId: e.pointerId
+        };
+      }
+    }, true);
+
+    feedEl.addEventListener('pointerup', handleImageTap, true);
+
+    feedEl.addEventListener('pointercancel', () => {
+      touchStart = null;
+    }, true);
+
+    feedEl.addEventListener('touchstart', e => {
+      if (e.touches.length !== 2) return;
+
+      const holder = e.target.closest?.('.pts-holder');
+      const s = slides[currentIndex()];
+
+      if (
+        !holder ||
+        holder.closest('.pts-slide') !== s?.sectionEl
+      ) return;
+
+      twoFingerTap = {
+        s,
+        time: performance.now(),
+        moved: false,
+        start: Array.from(e.touches).map(t => ({
+          x: t.clientX,
+          y: t.clientY
+        })),
+        x: (e.touches[0].clientX +
+            e.touches[1].clientX) / 2,
+        y: (e.touches[0].clientY +
+            e.touches[1].clientY) / 2
+      };
+
+      suppressTapUntil = performance.now() + 650;
+
+      clearTimeout(singleTapTimer);
+      singleTapTimer = null;
+      lastTap = null;
+
+      if (e.cancelable) e.preventDefault();
+    }, { capture: true, passive: false });
+
+    feedEl.addEventListener('touchmove', e => {
+      if (!twoFingerTap) return;
+
+      if (e.touches.length !== 2) {
+        twoFingerTap.moved = true;
+      } else {
+        for (let i = 0; i < 2; i++) {
+          if (
+            Math.hypot(
+              e.touches[i].clientX -
+                twoFingerTap.start[i].x,
+              e.touches[i].clientY -
+                twoFingerTap.start[i].y
+            ) > 16
+          ) {
+            twoFingerTap.moved = true;
+          }
+        }
+      }
+
+      if (e.cancelable) e.preventDefault();
+    }, { capture: true, passive: false });
+
+    feedEl.addEventListener('touchend', e => {
+      if (!twoFingerTap || e.touches.length) return;
+
+      const g = twoFingerTap;
+      twoFingerTap = null;
+
+      suppressTapUntil = performance.now() + 450;
+
+      if (
+        !g.moved &&
+        performance.now() - g.time <= 380 &&
+        slides.includes(g.s)
+      ) {
+        if (e.cancelable) e.preventDefault();
+        toggleZoom(g.s, g.x, g.y);
+      }
+    }, { capture: true, passive: false });
+
+    feedEl.addEventListener('touchcancel', () => {
+      twoFingerTap = null;
+      suppressTapUntil = performance.now() + 450;
+    }, true);
   }
 
   function historyBack() {
@@ -2102,94 +2397,78 @@
     }, 2500);
   }
 
-  function installExperienceUI() {
-    if (experienceInstalled || !overlay) return;
-    experienceInstalled = true;
-    const dock = document.createElement('nav');
-    dock.className = 'pts-dock';
-    dock.setAttribute('aria-label', 'ビューア操作');
-    dock.innerHTML = [
-      ['save','🔖 保存'], ['auto','⏸ 自動ON'], ['keep','📌 キープ'],
-      ['immersive','没入'], ['back','↩ 戻る'], ['history','履歴'],
-      ['custom','自前フィード'], ['saved','保存分'], ['related','関連へ'],
-      ['page','ページ'], ['fit','画面充填'], ['tools','その他']
-    ].map(([k,t]) => `<button type="button" class="pts-dock-${k}" data-act="${k}">${t}</button>`).join('');
-    overlay.appendChild(dock);
-    const tools = document.createElement('div');
-    tools.className = 'pts-tools'; tools.hidden = true;
-    overlay.appendChild(tools);
-    // 既存イベントと診断はそのまま使う。閉じるだけ誤タップ防止用に付け替え。
-    for (const sel of ['.pts-quality','.pts-auto','.pts-custom','.pts-rescan','.pts-diagnostic']) {
-      const el = overlay.querySelector('.pts-bar ' + sel);
-      if (el) tools.appendChild(el);
-    }
-    const oldClose = overlay.querySelector('.pts-close');
-    if (oldClose) {
-      const replacement = oldClose.cloneNode(true);
-      replacement.textContent = '閉じる';
-      oldClose.replaceWith(replacement);
-      replacement.addEventListener('click', confirmCloseViewer);
-      tools.appendChild(replacement);
-    }
-    const openPage = document.createElement('button');
-    openPage.textContent = 'pixivで開く';
-    openPage.type = 'button';
-    openPage.addEventListener('click', () => {
-      const s = slides[currentIndex()];
-      if (s) window.open(s.page, '_blank', 'noopener');
-    });
-    tools.appendChild(openPage);
-    const panel = document.createElement('div');
-    panel.className = 'pts-history-panel'; panel.hidden = true;
-    panel.innerHTML = '<div class="pts-history-sheet"><div class="pts-history-head">閲覧履歴（最新50件）<button type="button" class="pts-history-close">閉じる</button></div><div class="pts-history-list"></div></div>';
-    overlay.appendChild(panel);
-    panel.querySelector('.pts-history-close').addEventListener('click', () => { panel.hidden = true; });
-    dock.addEventListener('click', e => {
-      const act = e.target.closest('button')?.dataset.act;
-      const s = slides[currentIndex()];
-      if (!act) return;
-      showControlsTemporarily();
-      if (act === 'save' && s) void toggleBookmark(s, s.bookmarkBtn);
-      if (act === 'auto') {
-        autoSec = autoSec ? 0 : 5;
-        const select = overlay.querySelector('.pts-auto');
-        if (select) select.value = String(autoSec);
-        resetAutoAdvance(); scheduleAutoAdvance(currentIndex());
-      }
-      if (act === 'keep') { keepCurrent = !keepCurrent; resetAutoAdvance(); scheduleAutoAdvance(currentIndex()); }
-      if (act === 'immersive') setImmersive(!immersive);
-      if (act === 'back') historyBack();
-      if (act === 'history') showSessionHistory();
-      if (act === 'custom') void switchToCustom();
-      if (act === 'saved') switchToSaved();
-      if (act === 'related' && s) void switchToRelated(s, null);
-      if (act === 'page') buildFeed();
-      if (act === 'fit') overlay.classList.toggle('pts-fit-contain');
-      if (act === 'tools') tools.hidden = !tools.hidden;
-      syncDock();
-    });
+    function handleExperienceAction(act, fromTools = false) {
+    if (!act || !overlay) return;
 
-    feedEl.addEventListener('pointerdown', e => {
-      if (e.target.closest('.pts-holder')) touchStart = { x:e.clientX, y:e.clientY };
-    }, true);
-    feedEl.addEventListener('pointerup', handleImageTap, true);
-    document.addEventListener('keydown', e => {
-      if (e.key !== 'Escape' || overlay.style.display === 'none') return;
-      e.stopImmediatePropagation(); e.preventDefault(); confirmCloseViewer();
-    }, true);
-    if (!activeTick) activeTick = setInterval(tickViewing, 250);
+    const s = slides[currentIndex()];
+    const tools = overlay.querySelector('.pts-tools');
+
+    showControlsTemporarily();
+
+    if (act === 'save' && s) {
+      void toggleBookmark(s, s.bookmarkBtn);
+    }
+
+    if (act === 'auto') {
+      autoSec = autoSec ? 0 : 5;
+
+      const select = overlay.querySelector('.pts-auto');
+      if (select) select.value = String(autoSec);
+
+      resetAutoAdvance();
+      scheduleAutoAdvance(currentIndex());
+    }
+
+    if (act === 'immersive') {
+      setImmersive(!immersive);
+    }
+
+    if (act === 'keep') {
+      keepCurrent = !keepCurrent;
+      resetAutoAdvance();
+      scheduleAutoAdvance(currentIndex());
+    }
+
+    if (act === 'back') historyBack();
+    if (act === 'history') showSessionHistory();
+    if (act === 'saved') switchToSaved();
+
+    if (act === 'related' && s) {
+      void switchToRelated(s, null);
+    }
+
+    if (act === 'page') buildFeed();
+
+    if (act === 'fit') {
+      overlay.classList.toggle('pts-fit-contain');
+    }
+
+    if (act === 'tools' && tools) {
+      tools.hidden = !tools.hidden;
+    } else if (fromTools && tools) {
+      tools.hidden = true;
+    }
+
+    syncDock();
+  }
+
+  function installExperienceCSS() {
     const style = document.createElement('style');
+
     style.textContent = `
       #pts-overlay .pts-bar{pointer-events:none;justify-content:center;background:linear-gradient(#0009,transparent);transition:opacity .2s}
       #pts-overlay.pts-top-hidden .pts-bar{opacity:0}
       #pts-overlay .pts-meta,#pts-overlay .pts-related,#pts-overlay .pts-bookmark,#pts-overlay .pts-open{display:none!important}
       #pts-overlay .pts-img{display:block;width:100%;height:100%;max-width:none;max-height:none;object-fit:cover}
       #pts-overlay.pts-fit-contain .pts-img{object-fit:contain}
-      #pts-overlay .pts-dock{position:absolute;bottom:0;left:0;right:0;z-index:19;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;padding:8px 8px calc(8px + env(safe-area-inset-bottom));background:linear-gradient(transparent,#000c 20%,#000d);transition:opacity .2s}
-      #pts-overlay .pts-dock button{min-height:44px;border:1px solid #ffffff28;background:#202020a8;color:#fff;border-radius:12px;font-size:12px;touch-action:manipulation}
-      #pts-overlay .pts-tools{position:absolute;bottom:calc(164px + env(safe-area-inset-bottom));left:8px;right:8px;z-index:21;background:#151515e8;border:1px solid #5558;border-radius:12px;padding:10px;display:flex;flex-wrap:wrap;gap:8px;max-height:40vh;overflow:auto}
+
+      #pts-overlay .pts-dock{position:absolute;bottom:0;left:0;right:0;z-index:19;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;padding:8px 8px calc(8px + env(safe-area-inset-bottom));background:linear-gradient(transparent,#000c 20%,#000d);transition:opacity .2s}
+      #pts-overlay .pts-dock button{min-height:48px;border:1px solid #ffffff28;background:#202020a8;color:#fff;border-radius:12px;font-size:13px;touch-action:manipulation}
+
+      #pts-overlay .pts-tools{position:absolute;bottom:calc(68px + env(safe-area-inset-bottom));left:8px;right:8px;z-index:21;background:#151515eb;border:1px solid #5558;border-radius:12px;padding:10px;display:flex;flex-wrap:wrap;gap:8px;max-height:55vh;overflow:auto}
       #pts-overlay .pts-tools[hidden],#pts-overlay .pts-history-panel[hidden]{display:none!important}
-      #pts-overlay .pts-tools button,#pts-overlay .pts-tools select{margin:0;padding:9px;color:white;background:#444;border:0;border-radius:8px}
+      #pts-overlay .pts-tools button,#pts-overlay .pts-tools select{margin:0;padding:9px;color:white;background:#444;border:0;border-radius:8px;min-height:42px}
+
       #pts-overlay .pts-history-panel{position:absolute;inset:0;z-index:35;background:#000d;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}
       #pts-overlay .pts-history-sheet{width:100%;max-width:900px;height:80dvh;background:#151515;color:white;border:1px solid #555;border-radius:12px;display:flex;flex-direction:column;padding:12px;box-sizing:border-box}
       #pts-overlay .pts-history-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px}
@@ -2197,7 +2476,11 @@
       #pts-overlay .pts-history-list{display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0}
       #pts-overlay .pts-history-list button{padding:11px;text-align:left;background:#303030;color:#fff;border:0;border-radius:7px}
       #pts-overlay .pts-history-list button:disabled{opacity:.4}
+
       #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-dock,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-bar,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-tools,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-pagechip,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-seek{opacity:0;pointer-events:none}
+
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-slide.pts-current.pts-multi .pts-pagechip{opacity:.42;pointer-events:none;top:calc(10px + env(safe-area-inset-top));right:9px;font-size:10px;padding:2px 6px;background:rgba(0,0,0,.35);color:#fff}
+
       #pts-overlay .pts-slide.pts-current .pts-holder{animation:ptsIn .16s ease-out}
       @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
       #pts-overlay .pts-slide.pts-slow:not(.pts-zoomed) .pts-img{animation:ptsSlow 5s ease-out both}
@@ -2206,11 +2489,136 @@
       #pts-overlay .pts-holder{touch-action:manipulation}
       #pts-overlay .pts-zoomed .pts-holder{touch-action:none}
       #pts-overlay.pts-low-effects .pts-current .pts-holder{animation:none!important}
-      @media(prefers-reduced-motion:reduce){#pts-overlay .pts-img,#pts-overlay .pts-holder{animation:none!important;transition:none!important}}
+
+      #pts-overlay .pts-like-heart{position:absolute;z-index:18;pointer-events:none;transform:translate(-50%,-50%);font-size:clamp(70px,20vw,120px);line-height:1;filter:drop-shadow(0 4px 16px #0009);animation:ptsHeart .85s ease-out forwards}
+      @keyframes ptsHeart{0%{opacity:0;transform:translate(-50%,-40%) scale(.35)}24%{opacity:1;transform:translate(-50%,-55%) scale(1.18)}65%{opacity:.95;transform:translate(-50%,-65%) scale(1)}100%{opacity:0;transform:translate(-50%,-100%) scale(1.14)}}
+
+      @media(prefers-reduced-motion:reduce){#pts-overlay .pts-img,#pts-overlay .pts-holder{animation:none!important;transition:none!important}#pts-overlay .pts-like-heart{animation-duration:.2s}}
     `;
+
     document.head.appendChild(style);
+  }
+
+  function installExperienceUI() {
+    if (experienceInstalled || !overlay) return;
+    experienceInstalled = true;
+
+    const dock = document.createElement('nav');
+    dock.className = 'pts-dock';
+    dock.setAttribute('aria-label', 'ビューア操作');
+
+    dock.innerHTML = [
+      ['save', '🔖 保存'],
+      ['auto', '⏸ 自動ON'],
+      ['immersive', '没入'],
+      ['tools', 'その他']
+    ].map(([k, t]) =>
+      `<button type="button" class="pts-dock-${k}" data-act="${k}">${t}</button>`
+    ).join('');
+
+    overlay.appendChild(dock);
+
+    const tools = document.createElement('div');
+    tools.className = 'pts-tools';
+    tools.hidden = true;
+
+    for (const [k, t] of [
+      ['keep', '📌 キープ'],
+      ['back', '↩ 戻る'],
+      ['history', '履歴'],
+      ['saved', '保存分'],
+      ['related', '関連へ'],
+      ['page', 'ページ'],
+      ['fit', '画面充填']
+    ]) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `pts-tool-${k}`;
+      btn.dataset.act = k;
+      btn.textContent = t;
+      tools.appendChild(btn);
+    }
+
+    overlay.appendChild(tools);
+
+    // イベント登録済みの要素をDOM移動。
+    // 診断・画質・自前フィード等の機能を保持。
+    for (const sel of [
+      '.pts-quality',
+      '.pts-auto',
+      '.pts-custom',
+      '.pts-rescan',
+      '.pts-diagnostic'
+    ]) {
+      const el = overlay.querySelector('.pts-bar ' + sel);
+      if (el) tools.appendChild(el);
+    }
+
+    const oldClose = overlay.querySelector('.pts-close');
+
+    if (oldClose) {
+      const replacement = oldClose.cloneNode(true);
+      replacement.textContent = '閉じる';
+      oldClose.replaceWith(replacement);
+      replacement.addEventListener('click', confirmCloseViewer);
+      tools.appendChild(replacement);
+    }
+
+    const openPage = document.createElement('button');
+    openPage.type = 'button';
+    openPage.textContent = 'pixivで開く';
+
+    openPage.addEventListener('click', () => {
+      const s = slides[currentIndex()];
+      if (s) window.open(s.page, '_blank', 'noopener');
+    });
+
+    tools.appendChild(openPage);
+
+    const panel = document.createElement('div');
+    panel.className = 'pts-history-panel';
+    panel.hidden = true;
+    panel.innerHTML = '<div class="pts-history-sheet"><div class="pts-history-head">閲覧履歴（最新50件）<button type="button" class="pts-history-close">閉じる</button></div><div class="pts-history-list"></div></div>';
+
+    overlay.appendChild(panel);
+
+    panel.querySelector('.pts-history-close')
+      .addEventListener('click', () => {
+        panel.hidden = true;
+      });
+
+    dock.addEventListener('click', e => {
+      const act = e.target.closest('button')?.dataset.act;
+      if (act) handleExperienceAction(act);
+    });
+
+    tools.addEventListener('click', e => {
+      const act = e.target.closest('button[data-act]')?.dataset.act;
+      if (act) handleExperienceAction(act, true);
+    });
+
+    bindExperienceGestures();
+
+    document.addEventListener('keydown', e => {
+      if (
+        e.key !== 'Escape' ||
+        overlay.style.display === 'none'
+      ) return;
+
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      confirmCloseViewer();
+    }, true);
+
+    if (!activeTick) {
+      activeTick = setInterval(tickViewing, 250);
+    }
+
+    installExperienceCSS();
+
     const sel = overlay.querySelector('.pts-auto');
     if (sel) sel.value = String(autoSec);
+
     syncDock();
   }
 

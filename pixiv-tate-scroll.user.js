@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.3.2
+// @version      3.3.3
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -134,6 +134,7 @@
     s.resolving = true;
     try {
       const body = await fetchJson(`/ajax/illust/${s.id}`);
+      s.rawType = body.illustType;
       if (body.title && !s.title) { s.title = body.title; if (s.titleEl) s.titleEl.textContent = s.title; }
       if (body.userName) { s.author = body.userName; if (s.authorEl) s.authorEl.textContent = s.author; }
       const pageCount = body.pageCount || 1;
@@ -168,6 +169,7 @@
       }
     } catch (e) {
       s.kind = 'single';
+      s.resolveError = (e && e.message) ? e.message : String(e);
       const u = upgradeUrl(s.thumb) || s.thumb;
       s.pairs = [{ r: u, o: u }];
     }
@@ -175,6 +177,7 @@
     s.resolving = false;
     applyResolved(s);
     upgradeSlide(s);
+    debugUgoira(s);
   }
 
   // 表示レベルに応じて画像を差し替える：表示中は元画像（quality=orig時）、近くは1200px
@@ -208,14 +211,13 @@
     }
   }
 
-  // うごイラの状態をスライド下部に出す（切り分け用）
+  // スライドの状態を下部に出す（切り分け用）
   function debugUgoira(s) {
     if (!s.debugEl) return;
-    if (s.kind !== 'ugoira' && !s.ugoiraError) { s.debugEl.textContent = ''; return; }
     s.debugEl.textContent =
-      `ugoira: kind=${s.kind} cur=${s.isCurrent ? 1 : 0} zip=${s.zipUrl ? 'あり' : 'なし'} ` +
-      `frames=${s.frames ? s.frames.length : '-'} urls=${s.frameUrls ? s.frameUrls.filter(Boolean).length : '-'} ` +
-      `anim=${s.animTimer ? '再生中' : '停止'} err=${s.ugoiraError || ''}`;
+      `type=${s.rawType === undefined ? '?' : s.rawType} kind=${s.kind} res=${s.resolved ? 1 : 0} cur=${s.isCurrent ? 1 : 0} ` +
+      `zip=${s.zipUrl ? 'あり' : 'なし'} frames=${s.frames ? s.frames.length : '-'} urls=${s.frameUrls ? s.frameUrls.filter(Boolean).length : '-'} ` +
+      `anim=${s.animTimer ? '再生中' : '停止'} err=${s.resolveError || s.ugoiraError || ''}`;
   }
 
   /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
@@ -577,12 +579,37 @@
     updateCounter();
   }
 
+  // スクロール位置から「表示中スライド」を決める（IntersectionObserverが効かない環境向けの本命判定）
+  let curTimer = null;
+  function markCurrentFromScroll() {
+    if (!feedEl || slides.length === 0) return;
+    const idx = Math.round(feedEl.scrollTop / Math.max(1, feedEl.clientHeight));
+    slides.forEach((s, i) => {
+      if (i === idx) {
+        if (!s.isCurrent) {
+          s.isCurrent = true;
+          if (s.resolved) upgradeSlide(s);
+          if (s.kind === 'ugoira') {
+            if (s.frameUrls) startUgoira(s);
+            else if (s.resolved) prepareUgoira(s);
+          }
+        }
+      } else if (s.isCurrent) {
+        s.isCurrent = false;
+        stopUgoira(s);
+        if (s.resolved) upgradeSlide(s);
+      }
+      debugUgoira(s);
+    });
+  }
+
   function buildFeed() {
     slides = [];
     mode = 'page';
     pageLoadMisses = 0;
     feedEl.innerHTML = '';
     addItems(scanPage());
+    setTimeout(markCurrentFromScroll, 400);
   }
 
   function appendNew() {
@@ -680,6 +707,8 @@
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
       if (remain < feedEl.clientHeight * 2) pageLoadMore();
+      clearTimeout(curTimer);
+      curTimer = setTimeout(markCurrentFromScroll, 130);
     }, { passive: true });
     document.addEventListener('keydown', (e) => {
       if (!overlay || overlay.style.display === 'none') return;

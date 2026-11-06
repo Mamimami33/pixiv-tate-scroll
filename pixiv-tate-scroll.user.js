@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.3.3
+// @version      3.3.4
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -138,7 +138,8 @@
       if (body.title && !s.title) { s.title = body.title; if (s.titleEl) s.titleEl.textContent = s.title; }
       if (body.userName) { s.author = body.userName; if (s.authorEl) s.authorEl.textContent = s.author; }
       const pageCount = body.pageCount || 1;
-      if (body.illustType === 1) {
+      if (body.illustType === 2) {
+        // pixivの種別コード: 0=イラスト / 1=マンガ / 2=うごイラ
         s.kind = 'ugoira';
         try {
           const meta = await fetchJson(`/ajax/illust/${s.id}/ugoira_meta`);

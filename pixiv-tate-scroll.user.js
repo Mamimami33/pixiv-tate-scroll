@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.6
+// @version      3.13.7
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -2969,52 +2969,32 @@
   }
 
   function tickViewing() {
-    if (
-      !overlay ||
-      overlay.style.display === 'none' ||
-      !activeView
-    ) return;
-
-    const v = activeView;
-    const now = performance.now();
+    if (!overlay || overlay.style.display === 'none' || !activeView) return;
+    const v = activeView, now = performance.now();
     const dt = Math.max(0, Math.min(1000, now - v.last));
-
     v.last = now;
-
+    // グリッドに覆われた作品は閲覧時間・既読・滞在学習の対象外。
+    if (searchGrid.open) return;
     const s = v.slide;
-
-    if (
-      document.hidden ||
-      slides[currentIndex()] !== s ||
-      !s.isCurrent ||
-      !visibleReady(s)
-    ) return;
-
+    if (document.hidden || slides[currentIndex()] !== s || !s.isCurrent || !visibleReady(s)) return;
     v.readySeen = true;
     v.elapsed += dt;
-
     if (!v.recorded && v.elapsed >= 1000) {
       v.recorded = true;
       markSeen(s.id);
       noteSessionVisit(s);
     }
-
     if (!v.long && v.elapsed >= 20000) {
       v.long = true;
       applyPositive(s, 'long', 0.25);
     }
-
-    if (
-      !v.loop &&
-      v.loopCompleted &&
-      v.elapsed >= 5000
-    ) {
+    if (!v.loop && v.loopCompleted && v.elapsed >= 5000) {
       v.loop = true;
       applyPositive(s, 'loop', 0.4);
     }
   }
   function onUgoiraLoop(s) {
-    if (activeView?.slide === s) {
+    if (!searchGrid.open && activeView?.slide === s) {
       activeView.loopCompleted = true;
     }
   }
@@ -3470,9 +3450,7 @@
       e.preventDefault();
       const word = input.value.trim();
       if (!word) return;
-      window.location.assign(
-        '/tags/' + encodeURIComponent(word) + '/artworks'
-      );
+      openSearchGrid(word);
     });
 
     bar.prepend(form);
@@ -3512,7 +3490,8 @@
 
       e.stopImmediatePropagation();
       e.preventDefault();
-      confirmCloseViewer();
+      if (searchGrid.open) closeSearchGrid();
+      else confirmCloseViewer();
     }, true);
 
     if (!activeTick) {
@@ -3520,7 +3499,339 @@
     }
 
     installExperienceCSS();
+    installSearchGridUI();
     syncDock();
+  }
+
+  /* ---------- v3.13.7: 検索グリッド（フィードとは独立） ---------- */
+  const searchGrid = {
+    open: false, token: 0, controller: null, busy: false,
+    finished: false, page: 1, config: null, tagsReady: false,
+    items: [], ids: new Set(), root: null, scroll: null,
+    cards: null, chips: null, title: null, status: null, retry: null
+  };
+
+  function closeSearchGrid(resume = true) {
+    const wasOpen = searchGrid.open;
+    searchGrid.token++;
+    searchGrid.controller?.abort();
+    searchGrid.controller = null;
+    searchGrid.busy = false;
+    searchGrid.open = false;
+    if (searchGrid.root) searchGrid.root.hidden = true;
+    overlay?.classList.remove('pts-grid-open');
+    if (wasOpen && activeView) activeView.last = performance.now();
+    if (wasOpen && resume) {
+      const s = slides[currentIndex()];
+      if (s?.isCurrent && s.kind === 'ugoira' && s.frameUrls?.length) {
+        startUgoira(s);
+      }
+    }
+  }
+
+  function openSearchGrid(value) {
+    const word = String(value || '').trim();
+    if (!word || !overlay || !searchGrid.root) return;
+    closeSearchGrid(false);
+    const current = slides[currentIndex()];
+    if (current?.kind === 'ugoira') stopUgoira(current);
+    const from = getSearchPageConfig();
+    searchGrid.config = {
+      word, order: from?.order || 'popular_d',
+      searchMode: from?.searchMode || 'all',
+      matchMode: from?.matchMode || 's_tag'
+    };
+    searchGrid.page = 1;
+    searchGrid.finished = false;
+    searchGrid.items = [];
+    searchGrid.ids.clear();
+    searchGrid.tagsReady = false;
+    searchGrid.cards.replaceChildren();
+    searchGrid.chips.replaceChildren();
+    searchGrid.scroll.scrollTop = 0;
+    searchGrid.title.textContent = `${word} の検索結果`;
+    searchGrid.status.textContent = '読み込み中…';
+    searchGrid.retry.hidden = true;
+    searchGrid.open = true;
+    searchGrid.root.hidden = false;
+    overlay.classList.add('pts-grid-open');
+    const input = overlay.querySelector('.pts-global-search input');
+    if (input) input.value = word;
+    const token = searchGrid.token;
+    void (async () => {
+      for (let n = 0; n < 2 && searchGrid.open &&
+        searchGrid.token === token && !searchGrid.finished &&
+        !searchGrid.items.length; n++) {
+        const ok = await searchGridLoadMore();
+        if (!ok) break;
+      }
+    })();
+  }
+
+  function searchGridDiversify(items) {
+    const pool = items.map(it => ({ it, base: tasteScore(it) }));
+    const output = [];
+    const previous = searchGrid.items.slice(-2);
+    while (pool.length) {
+      const tail = [...previous, ...output];
+      const last = String(tail.at(-1)?.userId || '');
+      const second = String(tail.at(-2)?.userId || '');
+      let best = 0, high = -Infinity;
+      for (let i = 0; i < pool.length; i++) {
+        const author = String(pool[i].it.userId || '');
+        let score = pool[i].base;
+        if (author && author === last) score -= 12;
+        if (author && author === second) score -= 5;
+        if (score > high) { high = score; best = i; }
+      }
+      output.push(pool.splice(best, 1)[0].it);
+    }
+    return output;
+  }
+
+  function searchGridThumbnail(it) {
+    // APIが正方形URLを明示していれば優先。URLを推測で生成しない。
+    const candidates = [it.urls?.square1200, it.square1200,
+      it.urls?.square, it.url, it.urls?.small,
+      it.urls?.regular, it.urls?.thumb];
+    return candidates.find(url => typeof url === 'string' && url) || '';
+  }
+
+  function renderGridTags(body) {
+    const bar = searchGrid.chips;
+    bar.replaceChildren();
+    const tags = findSearchTagCandidates(body, searchGrid.config.word);
+    for (const tag of tags) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.textContent = `#${tag}`;
+      chip.addEventListener('click', () => openSearchGrid(tag));
+      bar.appendChild(chip);
+    }
+    bar.hidden = !tags.length;
+  }
+
+  function appendGridCards(items) {
+    const fragment = document.createDocumentFragment();
+    for (const it of items) {
+      const id = String(it.id);
+      if (searchGrid.ids.has(id)) continue;
+      searchGrid.ids.add(id);
+      searchGrid.items.push(it);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pts-grid-item';
+      button.setAttribute('aria-label', it.title || `作品 ${id}`);
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.alt = '';
+      const src = searchGridThumbnail(it);
+      const fallback = it.url || it.urls?.small || '';
+      if (src) img.src = src;
+      if (fallback && fallback !== src) {
+        img.addEventListener('error', () => { img.src = fallback; }, { once: true });
+      }
+      button.appendChild(img);
+      button.addEventListener('click', () => openGridArtwork(it));
+      fragment.appendChild(button);
+    }
+    searchGrid.cards.appendChild(fragment);
+  }
+
+  async function searchGridLoadMore() {
+    const g = searchGrid;
+    if (!g.open || g.busy || g.finished || !g.config) return false;
+    g.busy = true;
+    g.retry.hidden = true;
+    g.status.textContent = '読み込み中…';
+    const token = g.token;
+    const controller = new AbortController();
+    g.controller = controller;
+    const collected = [];
+    let page = g.page, finished = false, error = null;
+    try {
+      for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
+        if (page > 1000) { finished = true; break; }
+        const params = new URLSearchParams({
+          word: g.config.word, order: g.config.order,
+          mode: g.config.searchMode, s_mode: g.config.matchMode,
+          p: String(page)
+        });
+        const url = '/ajax/search/artworks/' +
+          encodeURIComponent(g.config.word) + '?' + params;
+        let body;
+        try {
+          body = await fetchJson(url, controller.signal);
+        } catch (e) { error = e; break; }
+        if (!g.open || token !== g.token) return false;
+        const data = body?.illustManga?.data;
+        if (!Array.isArray(data)) {
+          error = new Error(`検索 p=${page}: 候補配列がありません`);
+          break;
+        }
+        if (!g.tagsReady) {
+          renderGridTags(body);
+          g.tagsReady = true;
+        }
+        collected.push(...data);
+        const total = Number(body?.illustManga?.total);
+        if (!data.length || (Number.isFinite(total) && total >= 0 &&
+          page * 36 >= total)) finished = true;
+        page++;
+        if (finished) break;
+      }
+      if (!g.open || token !== g.token) return false;
+      if (collected.length) {
+        const prepared = await prepareCandidates(collected, {
+          excludeIds: [...seenTimes.keys(), ...g.ids],
+          enrichTop: 0, rank: tasteScore
+        });
+        if (!g.open || token !== g.token) return false;
+        const chosen = searchGridDiversify(prepared.filter(it =>
+          !skipStrong(it.id) && !isSeen(it.id) &&
+          !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked));
+        if (chosen.length) appendGridCards(chosen);
+        g.page = page;
+        g.finished = finished;
+        g.busy = false;
+        if (finished) g.status.textContent = g.items.length ? `${g.items.length}件` : '該当がありません';
+        // 全件除外などでスクロールできない場合も続きを取得可能にする。
+        if (g.scroll.scrollHeight <= g.scroll.clientHeight + 4) {
+          g.retry.textContent = '続きを取得';
+          g.retry.hidden = false;
+        }
+      }
+      return !error;
+    } catch (e) {
+      if (g.open && token === g.token) {
+        g.status.textContent = `読み込み失敗: ${e.message || e}`;
+        g.retry.textContent = '再試行';
+        g.retry.hidden = false;
+        console.warn('[PTS grid]', e);
+      }
+      return false;
+    } finally {
+      if (token === g.token) {
+        g.busy = false;
+        g.controller = null;
+      }
+    }
+  }
+
+  function openGridArtwork(it) {
+    if (!searchGrid.open || !feedEl) return;
+    const id = String(it?.id || '');
+    if (!/^\d+$/.test(id)) return;
+    closeSearchGrid();
+    let idx = slides.findIndex(s => String(s.id) === id);
+    if (idx < 0) {
+      const selected = candidatesToSlides([it])[0];
+      if (!selected) return;
+      if (slides.length) {
+        insertSlidesAfter(Math.min(currentIndex(), slides.length - 1), [selected]);
+      } else {
+        addItems([selected]);
+      }
+      idx = slides.indexOf(selected);
+      if (mode === 'custom') customSeenIds.add(id);
+    }
+    navIntent = { reason: 'other', until: 0 };
+    feedEl.scrollTop = idx * feedEl.clientHeight;
+    markCurrentFromScroll();
+    void resolveSlide(slides[idx]);
+  }
+
+  function installSearchGridCSS() {
+    const style = document.createElement('style');
+    style.textContent = `
+  #pts-overlay .pts-search-grid[hidden]{display:none!important}
+  #pts-overlay.pts-grid-open .pts-feed{visibility:hidden;pointer-events:none}
+  #pts-overlay.pts-grid-open .pts-search-tags{display:none!important}
+  #pts-overlay .pts-search-grid{
+    position:absolute;top:calc(63px + env(safe-area-inset-top));
+    bottom:calc(73px + env(safe-area-inset-bottom));left:0;right:0;
+    z-index:25;background:#0d0d11;color:#fff;
+    display:flex;flex-direction:column
+  }
+  #pts-overlay .pts-grid-heading{
+    display:flex;align-items:center;gap:8px;padding:10px 12px 4px;flex-shrink:0
+  }
+  #pts-overlay .pts-grid-title{
+    flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;font-weight:700
+  }
+  #pts-overlay .pts-grid-back,#pts-overlay .pts-grid-retry{
+    flex:0 0 auto;background:#2a2a30;color:#fff;border:1px solid #ffffff30;border-radius:999px;padding:7px 10px;cursor:pointer;touch-action:manipulation
+  }
+  #pts-overlay .pts-grid-chips{
+    display:flex;gap:6px;overflow-x:auto;padding:4px 10px 10px;
+    flex-shrink:0;scrollbar-width:none;-webkit-overflow-scrolling:touch
+  }
+  #pts-overlay .pts-grid-chips[hidden]{display:none!important}
+  #pts-overlay .pts-grid-chips button{
+    flex:0 0 auto;white-space:nowrap;background:#35353c;color:#fff;
+    border:1px solid #ffffff30;border-radius:999px;padding:7px 11px
+  }
+  #pts-overlay .pts-grid-scroll{
+    flex:1;min-height:0;overflow-y:auto;padding:0 10px 10px;-webkit-overflow-scrolling:touch
+  }
+  #pts-overlay .pts-grid-cards{
+    display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px
+  }
+  #pts-overlay .pts-grid-item{
+    display:block;aspect-ratio:1/1;min-width:0;width:100%;padding:0;
+    border:0;border-radius:2px;overflow:hidden;background:#202025;
+    touch-action:manipulation;cursor:pointer
+  }
+  #pts-overlay .pts-grid-item img{
+    display:block;width:100%;height:100%;object-fit:cover!important
+  }
+  #pts-overlay .pts-grid-footer{
+    display:flex;flex-wrap:wrap;align-items:center;justify-content:center;
+    gap:10px;padding:14px 4px;color:#bbb;font-size:12px
+  }
+  #pts-overlay .pts-grid-retry[hidden]{display:none!important}
+  `;
+    document.head.appendChild(style);
+  }
+
+  function installSearchGridUI() {
+    if (searchGrid.root || !overlay) return;
+    const root = document.createElement('section');
+    root.className = 'pts-search-grid';
+    root.hidden = true;
+    root.setAttribute('aria-label', '検索グリッド');
+    root.innerHTML = `
+      <div class="pts-grid-heading">
+        <span class="pts-grid-title"></span>
+        <button type="button" class="pts-grid-back">フィードに戻る</button>
+      </div>
+      <div class="pts-grid-chips" hidden></div>
+      <div class="pts-grid-scroll">
+        <div class="pts-grid-cards"></div>
+        <div class="pts-grid-footer">
+          <span class="pts-grid-status"></span>
+          <button type="button" class="pts-grid-retry" hidden>再試行</button>
+        </div>
+      </div>
+    `;
+    overlay.appendChild(root);
+    Object.assign(searchGrid, {
+      root, scroll: root.querySelector('.pts-grid-scroll'),
+      cards: root.querySelector('.pts-grid-cards'),
+      chips: root.querySelector('.pts-grid-chips'),
+      title: root.querySelector('.pts-grid-title'),
+      status: root.querySelector('.pts-grid-status'),
+      retry: root.querySelector('.pts-grid-retry')
+    });
+    root.querySelector('.pts-grid-back').addEventListener('click', closeSearchGrid);
+    searchGrid.retry.addEventListener('click', () => void searchGridLoadMore());
+    searchGrid.scroll.addEventListener('scroll', () => {
+      const el = searchGrid.scroll;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight <
+        el.clientHeight * 1.5) void searchGridLoadMore();
+    }, { passive: true });
+    installSearchGridCSS();
   }
 
   // 候補一覧の形をソースごとに吸収。IDだけの作者profile/allは採用しない。
@@ -5575,28 +5886,21 @@
 
   function closeViewer() {
     if (!overlay) return;
-
+    closeSearchGrid(false);
     closeDiagnosticPanel();
-
     clearTimeout(singleTapTimer);
     clearTimeout(closeConfirmTimer);
     ambientReset();
-
     overlay.querySelector('.pts-history-panel')
       ?.setAttribute('hidden', '');
-
     feedGeneration++;
     customResetState();
     searchBusy = false;
-
     slides.forEach(cleanupSlide);
     slides = [];
-
     if (feedEl) feedEl.replaceChildren();
-
     activeView = null;
     overlay.style.display = 'none';
-
     keepAwake(false);
     saveSeenTimes();
   }

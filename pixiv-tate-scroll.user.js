@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.5
+// @version      3.13.6
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -3592,6 +3592,9 @@
   let searchLastFailure = 0;
   let searchTagCandidates = [];
 
+  // 検索専用。1回の追加読み込みで最大3ページ取得。
+  const SEARCH_BATCH_PAGES = 3;
+
   function findSearchTagCandidates(body, currentWord) {
     const result = [];
     const used = new Set([currentWord]);
@@ -3699,103 +3702,140 @@
   }
 
   async function searchLoadMore() {
-    if (mode !== 'search' || !searchConfig ||
-        searchBusy || searchFinished ||
-        overlay?.style.display === 'none') return;
-
+    if (mode !== 'search' || !searchConfig || searchBusy ||
+      searchFinished || overlay?.style.display === 'none') return;
     if (Date.now() - searchLastFailure < 4000) return;
 
     searchBusy = true;
     const generation = feedGeneration;
-    const page = searchPage;
+    let nextPage = searchPage;
+    let reachedEnd = false;
+    let failure = null;
+    const collected = [];
 
     try {
-      const params = new URLSearchParams({
-        word: searchConfig.word,
-        order: searchConfig.order,
-        mode: searchConfig.searchMode,
-        s_mode: searchConfig.matchMode,
-        p: String(page)
-      });
+      for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
+        const page = nextPage;
+        if (page > 1000) { reachedEnd = true; break; }
 
-      const url =
-        '/ajax/search/artworks/' +
-        encodeURIComponent(searchConfig.word) +
-        '?' + params.toString();
+        const params = new URLSearchParams({
+          word: searchConfig.word,
+          order: searchConfig.order,
+          mode: searchConfig.searchMode,
+          s_mode: searchConfig.matchMode,
+          p: String(page)
+        });
 
-      const body = await fetchJson(url);
+        const url = '/ajax/search/artworks/' +
+          encodeURIComponent(searchConfig.word) + '?' + params;
 
-      if (generation !== feedGeneration ||
-          mode !== 'search') return;
+        let body;
+        try {
+          body = await fetchJson(url);
+        } catch (e) {
+          failure = e;
+          break; // 失敗ページを飛ばさず、次回ここから再試行
+        }
 
-      const data = body?.illustManga?.data;
+        if (generation !== feedGeneration || mode !== 'search') return;
 
-      if (!Array.isArray(data)) {
-        throw new Error('検索APIのdataが配列ではありません');
+        const data = body?.illustManga?.data;
+
+        if (!Array.isArray(data)) {
+          failure = new Error(
+            `検索API p=${page}: dataが配列ではありません`
+          );
+          break;
+        }
+
+        if (page === searchConfig.page) {
+          searchTagCandidates = findSearchTagCandidates(
+            body, searchConfig.word
+          );
+          renderSearchTagCandidates();
+        }
+
+        collected.push(...data);
+        nextPage = page + 1;
+
+        const total = Number(body?.illustManga?.total);
+
+        if (!data.length ||
+          (Number.isFinite(total) && total >= 0 &&
+            page * 36 >= total)) {
+          reachedEnd = true;
+          break;
+        }
       }
+      if (generation !== feedGeneration || mode !== 'search') return;
+      if (collected.length) {
+        // 候補にtags/userId等があるため個別補完はしない。
+        const prepared = await prepareCandidates(collected, {
+          excludeIds: [...seenTimes.keys()],
+          enrichTop: 0,
+          rank: tasteScore
+        });
 
-      if (page === searchConfig.page) {
-        searchTagCandidates = findSearchTagCandidates(
-          body, searchConfig.word
+        if (generation !== feedGeneration || mode !== 'search') return;
+
+        // 自前フィードと同じ作者連続ペナルティ(-12/-5)。
+        const arranged = customDiversify(
+          prepared.filter(it => !skipStrong(it.id))
         );
-        renderSearchTagCandidates();
-      }
 
-      const displayed = new Set(
-        slides.map(s => String(s.id))
-      );
+        const existing = new Set(
+          slides.map(s => String(s.id))
+        );
 
-      const selected = [];
+        const selected = arranged.filter(it => {
+          const id = String(it.id);
 
-      for (const raw of data) {
-        if (!raw || typeof raw !== 'object') continue;
+          if (existing.has(id) || isSeen(id) ||
+            knownBookmarkedIds.has(id) ||
+            it.bookmarked) return false;
 
-        const it = normalizeCandidate(raw);
+          existing.add(id);
+          return true;
+        });
 
-        if (!/^\d+$/.test(it.id) ||
-            displayed.has(it.id) ||
-            isSeen(it.id) ||
-            knownBookmarkedIds.has(it.id) ||
-            it.bookmarked) continue;
-
-        displayed.add(it.id);
-        selected.push(it);
-      }
-
-      if (selected.length) {
-        addItems(candidatesToSlides(selected));
-        if (slides.length === selected.length) {
-          markCurrentFromScroll();
+        const first = slides.length === 0;
+        if (selected.length) {
+          addItems(candidatesToSlides(selected));
+          if (first) markCurrentFromScroll();
         }
       }
 
-      const total = Number(body?.illustManga?.total);
-      const size = 36;
+      searchPage = nextPage;
+      searchFinished = reachedEnd;
+      searchLastFailure = failure ? Date.now() : 0;
 
-      searchPage = page + 1;
-
-      if (!data.length ||
-          (Number.isFinite(total) && total >= 0 &&
-           page * size >= total)) {
-        searchFinished = true;
+      if (failure) {
+        console.warn('[PTS search]', failure);
       }
 
-      if (!slides.length && searchFinished) {
-        overlay.querySelector('.pts-counter').textContent =
-          '表示可能な検索結果がありません';
+      if (!slides.length && (searchFinished || failure)) {
+        const counter = overlay?.querySelector('.pts-counter');
+        if (counter) {
+          counter.textContent = failure
+            ? '検索取得失敗: ' + (failure.message || failure)
+            : '表示可能な検索結果がありません';
+        }
       }
-
     } catch (e) {
       searchLastFailure = Date.now();
       console.warn('[PTS search]', e);
 
       if (!slides.length) {
-        overlay.querySelector('.pts-counter').textContent =
-          '検索取得失敗: ' + (e?.message || e);
+        const counter = overlay?.querySelector('.pts-counter');
+        if (counter) {
+          counter.textContent =
+            '検索取得失敗: ' + (e.message || e);
+        }
       }
-
     } finally {
-      if (generation === feedGeneration) searchBusy = false;
+      if (generation === feedGeneration) {
+        searchBusy = false;
+      }
     }
   }
 

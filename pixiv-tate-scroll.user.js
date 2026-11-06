@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.4
+// @version      3.13.5
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -2533,8 +2533,6 @@
   let sessionBackTarget = '';
   let activeView = null;
   let activeTick = null;
-  let immersive = false;
-  let uiHideTimer = null;
   let reloadTimes = [];
   let effectsReduced = false;
   let closeConfirmTimer = null;
@@ -2712,64 +2710,108 @@
   function installAmbientUI() {
     if (ambient.installed || !overlay || !feedEl) return;
     ambient.installed = true;
+
     const stage = document.createElement('div');
     stage.className = 'pts-ambient-stage';
     stage.setAttribute('aria-hidden', 'true');
+
     for (let n = 0; n < 2; n++) {
       const layer = document.createElement('div');
       layer.className = 'pts-ambient-layer';
-      for (let k = 0; k < 4; k++) layer.appendChild(document.createElement('div'));
+
+      for (let k = 0; k < 4; k++) {
+        layer.appendChild(document.createElement('div'));
+      }
+
       stage.appendChild(layer);
       ambient.layers.push(layer);
     }
+
     overlay.insertBefore(stage, feedEl);
     ambient.stage = stage;
+
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'pts-ambient-toggle';
-    button.textContent = 'アンビエント:ON';
+
     button.addEventListener('click', () => {
       ambient.enabled = !ambient.enabled;
-      button.textContent = `アンビエント:${ambient.enabled ? 'ON' : 'OFF'}`;
+
       ambientReset();
       stage.hidden = !ambient.enabled;
-      if (ambient.enabled) ambientSchedule(0);
+
+      syncDock();
+
+      if (ambient.enabled) {
+        ambientSchedule(0);
+      }
     });
-    overlay.querySelector('.pts-tools')?.appendChild(button);
+
+    // その他パネルではなく、横スクロールドックに追加。
+    overlay.querySelector('.pts-dock')?.appendChild(button);
+    stage.hidden = !ambient.enabled;
+    syncDock();
+
     const style = document.createElement('style');
+
     style.textContent = `
-    #pts-overlay .pts-ambient-stage{position:absolute;inset:0;z-index:0;
-      pointer-events:none;overflow:hidden;background:#000}
-    #pts-overlay .pts-ambient-stage[hidden]{display:none!important}
-    #pts-overlay .pts-ambient-layer{position:absolute;inset:0;opacity:0;
-      pointer-events:none;transition:opacity .48s ease}
-    #pts-overlay .pts-feed{position:relative;z-index:1;background:transparent}
-    #pts-overlay .pts-slide{background:transparent}
-    @media(prefers-reduced-motion:reduce){
-      #pts-overlay .pts-ambient-layer{transition-duration:.12s}
-    }
-    `;
+      #pts-overlay .pts-ambient-stage{
+        position:absolute;inset:0;z-index:0;
+        pointer-events:none;overflow:hidden;background:#000
+      }
+      #pts-overlay .pts-ambient-stage[hidden]{
+        display:none!important
+      }
+      #pts-overlay .pts-ambient-layer{
+        position:absolute;inset:0;opacity:0;
+        pointer-events:none;transition:opacity .48s ease
+      }
+      #pts-overlay .pts-feed{
+        position:relative;z-index:1;background:transparent
+      }
+      #pts-overlay .pts-slide{background:transparent}
+      @media(prefers-reduced-motion:reduce){
+        #pts-overlay .pts-ambient-layer{
+          transition-duration:.12s
+        }
+      }
+  `;
+
     document.head.appendChild(style);
+
     feedEl.addEventListener('load', e => {
       const s = slides[currentIndex()];
-      if (e.target?.tagName !== 'IMG' || !s.sectionEl?.contains(e.target)) return;
-      if (s.kind === 'ugoira' && ambient.cache.has(`${s.id}:ugoira`)) return;
+
+      if (
+        e.target?.tagName !== 'IMG' ||
+        !s?.sectionEl?.contains(e.target)
+      ) return;
+
+      if (
+        s.kind === 'ugoira' &&
+        ambient.cache.has(`${s.id}:ugoira`)
+      ) return;
+
       ambientSchedule(75);
     }, true);
+
     feedEl.addEventListener('scroll', e => {
       const node = e.target;
-      if (node?.classList?.contains('pts-pager') &&
-        node.closest('.pts-slide') === slides[currentIndex()]?.sectionEl) {
+
+      if (
+        node?.classList?.contains('pts-pager') &&
+        slides[currentIndex()]?.sectionEl?.contains(node)
+      ) {
         ambientSchedule(160);
       }
     }, true);
-    window.addEventListener('resize', () => ambientSchedule(160));
+
+    window.addEventListener('resize', () => {
+      ambientSchedule(80);
+    }, { passive: true });
+
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
-        ambientReset();
-      } else {
-        ambientSchedule(100);
-      }
+      if (!document.hidden) ambientSchedule(60);
     });
   }
 
@@ -2846,14 +2888,13 @@
   }
 
   function syncDock() {
-    if (!overlay || !experienceInstalled) return;
-
-    const btn = overlay.querySelector(
-      '.pts-dock-immersive'
+    if (!overlay) return;
+    const button = overlay.querySelector(
+      '.pts-ambient-toggle'
     );
-
-    if (btn) {
-      btn.textContent = immersive ? 'UI表示' : '没入';
+    if (button) {
+      button.textContent =
+        `アンビエント:${ambient.enabled ? 'ON' : 'OFF'}`;
     }
   }
   function noteSessionVisit(s) {
@@ -2980,26 +3021,6 @@
 
 
 
-  function showControlsTemporarily() {
-    if (!overlay) return;
-    overlay.classList.add('pts-controls-show');
-    overlay.classList.remove('pts-top-hidden');
-    clearTimeout(uiHideTimer);
-    uiHideTimer = setTimeout(() => {
-      if (immersive) overlay.classList.remove('pts-controls-show');
-      else overlay.classList.add('pts-top-hidden');
-    }, 2500);
-  }
-  function setImmersive(on) {
-    immersive = !!on;
-    overlay.classList.toggle('pts-immersive', immersive);
-    overlay.classList.toggle('pts-controls-show', !immersive);
-    if (immersive) {
-      overlay.classList.add('pts-top-hidden');
-      clearTimeout(uiHideTimer);
-    } else showControlsTemporarily();
-    syncDock();
-  }
   const LIKE_TAP_WINDOW = 240;
 
   function showLikeHeart(s, x, y) {
@@ -3069,8 +3090,6 @@
   function handleImageTap(e) {
     const holder = e.target.closest?.('.pts-holder');
     if (!holder) return;
-
-    // 既存renderSlide側のタップ送りとの二重実行防止。
     e.stopImmediatePropagation();
 
     if (e.isPrimary === false || !touchStart) return;
@@ -3127,18 +3146,12 @@
         overlay?.style.display === 'none'
       ) return;
 
-      if (immersive) {
-        showControlsTemporarily();
-        return;
-      }
-
       if (s.kind === 'multi') return;
 
       const r = holder.getBoundingClientRect();
       const step =
-        (e.clientX - r.left) / Math.max(1, r.width) < .33
-          ? -1 : 1;
-
+        (e.clientX - r.left) /
+          Math.max(1, r.width) < 0.33 ? -1 : 1;
       gotoSlide(currentIndex() + step, 'user');
     }, LIKE_TAP_WINDOW);
   }
@@ -3211,124 +3224,95 @@
     }, 2500);
   }
 
-  function handleExperienceAction(act, fromTools = false) {
-    if (!act || !overlay) return;
-
-    const tools = overlay.querySelector('.pts-tools');
-
-    if (act === 'immersive') {
-      setImmersive(!immersive);
-      return;
-    }
-
-    if (act === 'tools') {
-      if (tools) tools.hidden = !tools.hidden;
-      showControlsTemporarily();
-      return;
-    }
-
-    if (act === 'history') {
-      showSessionHistory();
-    }
-
-    if (act === 'refresh') {
-      void refreshCurrentSlide();
-    }
-
-    if (fromTools && tools) {
-      tools.hidden = true;
-    }
-
-    syncDock();
-  }
-
   function installExperienceCSS() {
     const style = document.createElement('style');
 
     style.textContent = `
       #pts-overlay .pts-bar{
-        pointer-events:none;
-        justify-content:center;
-        background:linear-gradient(#0009,transparent);
-        transition:opacity .2s
+        position:absolute;top:0;left:0;right:0;z-index:40;
+        display:flex;align-items:center;gap:8px;
+        box-sizing:border-box;
+        padding:calc(8px + env(safe-area-inset-top)) 10px 8px;
+        color:#fff;background:linear-gradient(#000d,#0007);
+        pointer-events:auto;overflow:visible;white-space:normal
       }
-      #pts-overlay.pts-top-hidden .pts-bar{opacity:0}
-
-      #pts-overlay .pts-meta,
-      #pts-overlay .pts-related,
-      #pts-overlay .pts-bookmark,
-      #pts-overlay .pts-open{display:none!important}
-
-      #pts-overlay .pts-img{
-        display:block;
-        width:100%;
-        height:100%;
-        max-width:100%;
-        max-height:100%;
-        object-fit:contain!important;
-        animation:none!important;
-        transform:none!important
+      #pts-overlay .pts-global-search{
+        display:flex;flex:1;min-width:0;gap:6px;height:38px
+      }
+      #pts-overlay .pts-global-search input{
+        flex:1;min-width:0;width:100%;box-sizing:border-box;
+        background:#25252d;color:#fff;
+        border:1px solid #ffffff35;border-radius:10px;
+        padding:0 12px;font-size:14px;outline:none
+      }
+      #pts-overlay .pts-global-search input:focus{
+        border-color:#ffffff8a
+      }
+      #pts-overlay .pts-global-search button{
+        flex:0 0 auto;min-width:56px;padding:0 10px;
+        border:1px solid #ffffff30;border-radius:10px;
+        background:#444c;color:white;font-size:13px
+      }
+      #pts-overlay .pts-counter{
+        flex:0 0 auto;max-width:29%;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;
+        font-size:11px;opacity:.72
       }
 
       #pts-overlay .pts-dock{
-        position:absolute;bottom:0;left:0;right:0;z-index:19;
-        display:grid;
-        grid-template-columns:repeat(2,minmax(0,1fr));
-        gap:8px;
-        padding:8px 8px calc(8px + env(safe-area-inset-bottom));
-        background:linear-gradient(transparent,#000c 20%,#000d);
-        transition:opacity .2s
+        position:absolute;bottom:0;left:0;right:0;z-index:30;
+        display:flex;flex-wrap:nowrap;align-items:center;gap:7px;
+        overflow-x:auto;overflow-y:hidden;scrollbar-width:none;
+        -webkit-overflow-scrolling:touch;
+        overscroll-behavior-x:contain;touch-action:pan-x;
+        padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+        box-sizing:border-box;
+        background:linear-gradient(transparent,#000e 18%,#000f);
+      }
+      #pts-overlay .pts-dock::-webkit-scrollbar{
+        display:none
       }
       #pts-overlay .pts-dock button{
-        min-height:48px;border:1px solid #ffffff28;
-        background:#202020a8;color:white;
-        border-radius:12px;font-size:14px;
+        flex:0 0 auto;min-height:48px;
+        padding:0 14px;white-space:nowrap;
+        border:1px solid #ffffff32;
+        background:#303030dd;color:#fff;
+        border-radius:11px;font-size:13px;
         touch-action:manipulation
       }
-
-      #pts-overlay .pts-tools{
-        position:absolute;
-        bottom:calc(68px + env(safe-area-inset-bottom));
-        left:8px;right:8px;z-index:21;
-        background:#151515eb;border:1px solid #5558;
-        border-radius:12px;padding:10px;
-        display:flex;flex-wrap:wrap;gap:8px;
-        max-height:55vh;overflow:auto
+      #pts-overlay .pts-dock .pts-close{
+        position:static;right:auto
       }
-      #pts-overlay .pts-tools[hidden],
+
       #pts-overlay .pts-history-panel[hidden],
       #pts-overlay .pts-search-tags[hidden]{
         display:none!important
       }
-      #pts-overlay .pts-tools button{
-        padding:10px;color:#fff;background:#444;
-        border:0;border-radius:8px;min-height:42px
-      }
-
       #pts-overlay .pts-history-panel{
-        position:absolute;inset:0;z-index:35;
+        position:absolute;inset:0;z-index:60;
         background:#000d;display:flex;
         align-items:center;justify-content:center;
         padding:12px;box-sizing:border-box
       }
       #pts-overlay .pts-history-sheet{
         width:100%;max-width:900px;height:80dvh;
-        background:#151515;color:white;
+        background:#151515;color:#fff;
         border:1px solid #555;border-radius:12px;
-        display:flex;flex-direction:column;
-        padding:12px;box-sizing:border-box
+        display:flex;flex-direction:column;padding:12px;
+        box-sizing:border-box
       }
+
       #pts-overlay .pts-history-head{
         display:flex;align-items:center;
         justify-content:space-between;padding-bottom:10px
       }
       #pts-overlay .pts-history-head button{
-        padding:10px;border-radius:8px;
-        background:#444;color:white;border:0
+        padding:10px;border:0;border-radius:8px;
+        background:#444;color:#fff
       }
       #pts-overlay .pts-history-list{
-        display:flex;flex-direction:column;
-        gap:6px;overflow:auto;min-height:0
+        display:flex;flex-direction:column;gap:6px;
+        overflow:auto;min-height:0
       }
       #pts-overlay .pts-history-list button{
         padding:11px;text-align:left;
@@ -3337,93 +3321,65 @@
       }
       #pts-overlay .pts-history-list button:disabled{opacity:.4}
 
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-dock,
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-bar,
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-tools,
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-pagechip{
-        opacity:0;pointer-events:none
-      }
-      #pts-overlay.pts-immersive:not(.pts-controls-show)
-        .pts-slide.pts-current.pts-multi .pts-pagechip{
-        opacity:.42;pointer-events:none;
-        top:calc(10px + env(safe-area-inset-top));
-        right:9px;font-size:10px;padding:2px 6px;
-        background:rgba(0,0,0,.35);color:#fff
-      }
-
       #pts-overlay .pts-seek{
         position:absolute;left:12px;right:12px;
-        top:auto;bottom:calc(73px + env(safe-area-inset-bottom));
+        top:auto;bottom:calc(80px + env(safe-area-inset-bottom));
         height:32px;z-index:27;background:none;
-        touch-action:none
+        touch-action:none;pointer-events:auto
       }
       #pts-overlay .pts-seek::before{
-        content:"";position:absolute;
-        left:0;right:0;top:50%;
+        content:"";position:absolute;left:0;right:0;top:50%;
         height:4px;transform:translateY(-50%);
-        background:rgba(255,255,255,.30);border-radius:4px
+        background:#ffffff55;border-radius:4px
       }
       #pts-overlay .pts-seek-fill{
-        position:absolute;left:0;top:50%;
-        height:4px;transform:translateY(-50%);
-        background:#0096fa;border-radius:4px
+        position:absolute;left:0;top:50%;height:4px;
+        transform:translateY(-50%);background:#0096fa;
+        border-radius:4px
       }
       #pts-overlay .pts-seek-knob{
-        position:absolute;top:50%;left:0%;
+        position:absolute;top:50%;left:0;
         width:16px;height:16px;margin-left:0;
         transform:translate(-50%,-50%);
         border-radius:50%;background:#fff;
         box-shadow:0 1px 5px #0009
       }
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-seek{
-        opacity:1!important;pointer-events:auto!important
-      }
       #pts-overlay .pts-ugoira-status{
         position:absolute;left:50%;top:43%;z-index:17;
         transform:translate(-50%,-50%);
         padding:10px 15px;border-radius:12px;
-        background:rgba(0,0,0,.78);color:#fff;
-        font-size:13px;text-align:center;
-        pointer-events:none;max-width:85vw
+        background:#000c;color:#fff;font-size:13px;
+        text-align:center;pointer-events:none;max-width:85vw
       }
-      #pts-overlay .pts-ugoira-status[hidden]{
-        display:none!important
-      }
+      #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
       #pts-overlay .pts-ugoira-error{color:#ffd6d6}
 
       #pts-overlay .pts-search-tags{
-        position:absolute;left:0;right:0;z-index:20;
-        top:calc(39px + env(safe-area-inset-top));
+        position:absolute;left:0;right:0;z-index:22;
+        top:calc(65px + env(safe-area-inset-top));
         display:flex;gap:6px;padding:4px 10px;
         overflow-x:auto;scrollbar-width:none;
-        background:linear-gradient(#000a,#0003);
-        transition:opacity .2s
+        background:linear-gradient(#0009,#0002)
       }
-      #pts-overlay .pts-search-tags::-webkit-scrollbar{
-        display:none
-      }
+      #pts-overlay .pts-search-tags::-webkit-scrollbar{display:none}
       #pts-overlay .pts-search-tags button{
         flex-shrink:0;white-space:nowrap;color:#fff;
-        background:#333b;border:1px solid #ffffff30;
+        background:#333c;border:1px solid #ffffff30;
         border-radius:999px;padding:7px 11px;font-size:12px
       }
-      #pts-overlay.pts-top-hidden .pts-search-tags,
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-search-tags{
-        opacity:0;pointer-events:none
-      }
 
+      #pts-overlay .pts-img{
+        display:block;width:100%;height:100%;
+        max-width:100%;max-height:100%;
+        object-fit:contain!important;animation:none!important
+      }
+      #pts-overlay .pts-holder{touch-action:pan-x pan-y}
       #pts-overlay .pts-slide.pts-current .pts-holder{
         animation:ptsIn .16s ease-out
       }
-      @keyframes ptsIn{
-        from{opacity:.83}to{opacity:1}
-      }
+      @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
       #pts-overlay.pts-low-effects .pts-current .pts-holder{
         animation:none!important
-      }
-
-      #pts-overlay .pts-holder{
-        touch-action:pan-x pan-y
       }
       #pts-overlay .pts-like-heart{
         position:absolute;z-index:18;pointer-events:none;
@@ -3438,14 +3394,10 @@
         100%{opacity:0;transform:translate(-50%,-100%) scale(1.14)}
       }
       @media(prefers-reduced-motion:reduce){
-        #pts-overlay .pts-holder{
-          animation:none!important;transition:none!important
-        }
-        #pts-overlay .pts-like-heart{
-          animation-duration:.2s
-        }
+        #pts-overlay .pts-holder{animation:none!important}
+        #pts-overlay .pts-like-heart{animation-duration:.2s}
       }
-    `;
+  `;
 
     document.head.appendChild(style);
   }
@@ -3457,74 +3409,88 @@
     const dock = document.createElement('nav');
     dock.className = 'pts-dock';
     dock.setAttribute('aria-label', 'ビューア操作');
-
-    dock.innerHTML = `
-      <button type="button"
-        class="pts-dock-immersive"
-        data-act="immersive">没入</button>
-      <button type="button"
-        class="pts-dock-tools"
-        data-act="tools">その他</button>
-    `;
-
     overlay.appendChild(dock);
 
-    const tools = document.createElement('div');
-    tools.className = 'pts-tools';
-    tools.hidden = true;
+    const addButton = (className, label, handler) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = className;
+      button.textContent = label;
+      button.addEventListener('click', handler);
+      dock.appendChild(button);
+      return button;
+    };
 
-    const history = document.createElement('button');
-    history.type = 'button';
-    history.dataset.act = 'history';
-    history.textContent = '履歴';
-    tools.appendChild(history);
+    addButton('pts-history-button', '履歴', showSessionHistory);
 
-    overlay.appendChild(tools);
-
-    // 診断・更新はイベント登録済みの要素を移動。
-    for (const sel of [
+    // 診断・更新の既存イベントを保持してDOM移動。
+    for (const selector of [
       '.pts-diagnostic',
       '.pts-rescan'
     ]) {
-      const el = overlay.querySelector('.pts-bar ' + sel);
-      if (el) tools.appendChild(el);
+      const button = overlay.querySelector(
+        '.pts-bar ' + selector
+      );
+      if (button) dock.appendChild(button);
     }
 
     const oldClose = overlay.querySelector('.pts-close');
-
     if (oldClose) {
-      const replacement = oldClose.cloneNode(true);
-      replacement.textContent = '閉じる';
-      oldClose.replaceWith(replacement);
-      replacement.addEventListener('click', confirmCloseViewer);
-      tools.appendChild(replacement);
+      const close = oldClose.cloneNode(true);
+      close.textContent = '閉じる';
+      oldClose.replaceWith(close);
+      close.addEventListener('click', confirmCloseViewer);
+      dock.appendChild(close);
     }
 
-    const openPage = document.createElement('button');
-    openPage.type = 'button';
-    openPage.textContent = 'pixivで開く';
-
-    openPage.addEventListener('click', () => {
+    addButton('pts-open-original', 'pixivで開く', () => {
       const s = slides[currentIndex()];
       if (s) window.open(s.page, '_blank', 'noopener');
     });
 
-    tools.appendChild(openPage);
+    const bar = overlay.querySelector('.pts-bar');
+    const form = document.createElement('form');
+    form.className = 'pts-global-search';
+    form.setAttribute('role', 'search');
+
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.placeholder = 'pixivで検索';
+    input.autocomplete = 'off';
+    input.enterKeyHint = 'search';
+    input.setAttribute('aria-label', 'pixiv検索ワード');
+    input.value = getSearchPageConfig()?.word || '';
+
+    const submit = document.createElement('button');
+    submit.type = 'submit';
+    submit.textContent = '検索';
+
+    form.append(input, submit);
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const word = input.value.trim();
+      if (!word) return;
+      window.location.assign(
+        '/tags/' + encodeURIComponent(word) + '/artworks'
+      );
+    });
+
+    bar.prepend(form);
 
     const panel = document.createElement('div');
     panel.className = 'pts-history-panel';
     panel.hidden = true;
 
     panel.innerHTML = `
-      <div class="pts-history-sheet">
-        <div class="pts-history-head">
-          閲覧履歴（最新50件）
-          <button type="button"
-            class="pts-history-close">閉じる</button>
-        </div>
-        <div class="pts-history-list"></div>
+    <div class="pts-history-sheet">
+      <div class="pts-history-head">
+        閲覧履歴（最新50件）
+        <button type="button"
+          class="pts-history-close">閉じる</button>
       </div>
-    `;
+      <div class="pts-history-list"></div>
+    </div>
+  `;
 
     overlay.appendChild(panel);
 
@@ -3533,21 +3499,16 @@
         panel.hidden = true;
       });
 
-    dock.addEventListener('click', e => {
-      const act = e.target.closest('button')?.dataset.act;
-      if (act) handleExperienceAction(act);
-    });
-
-    tools.addEventListener('click', e => {
-      const act = e.target.closest('button[data-act]')?.dataset.act;
-      if (act) handleExperienceAction(act, true);
-    });
-
     bindExperienceGestures();
 
     document.addEventListener('keydown', e => {
-      if (e.key !== 'Escape' ||
-          overlay.style.display === 'none') return;
+      if (
+        e.key !== 'Escape' ||
+        overlay.style.display === 'none'
+      ) return;
+
+      // 検索入力中のEscapeは検索欄側に任せる。
+      if (e.target.closest?.('.pts-global-search')) return;
 
       e.stopImmediatePropagation();
       e.preventDefault();
@@ -3723,19 +3684,18 @@
     for (const tag of searchTagCandidates) {
       const chip = document.createElement('button');
       chip.type = 'button';
-      chip.textContent = `# ${tag}`;
+      chip.textContent = `#${tag}`;
 
       chip.addEventListener('click', () => {
-        const url =
-          '/tags/' + encodeURIComponent(tag) + '/artworks';
-        window.location.assign(url);
+        window.location.assign(
+          '/tags/' + encodeURIComponent(tag) + '/artworks'
+        );
       });
 
       bar.appendChild(chip);
     }
 
     bar.hidden = false;
-    showControlsTemporarily();
   }
 
   async function searchLoadMore() {
@@ -5543,22 +5503,28 @@
 
   function openViewer() {
     if (overlay && overlay.style.display !== 'none') return;
+
     buildOverlay();
     installDiagnosticUI();
     installExperienceUI();
     installAmbientUI();
     bindSkipNavigation();
+
     ambientReset();
+
     skippedThisSession.clear();
     viewedThisSession.clear();
     navIntent = { reason: 'other', until: 0 };
+
     sessionTrail.length = 0;
     activeView = null;
+
     searchConfig = getSearchPageConfig();
     mode = searchConfig ? 'search' : 'custom';
+
     overlay.style.display = 'block';
     keepAwake(true);
-    setImmersive(false);
+
     if (mode === 'search') {
       void startSearchFeed();
     } else {
@@ -5569,21 +5535,28 @@
 
   function closeViewer() {
     if (!overlay) return;
+
     closeDiagnosticPanel();
-    clearTimeout(uiHideTimer);
+
     clearTimeout(singleTapTimer);
     clearTimeout(closeConfirmTimer);
     ambientReset();
+
     overlay.querySelector('.pts-history-panel')
       ?.setAttribute('hidden', '');
+
     feedGeneration++;
     customResetState();
     searchBusy = false;
+
     slides.forEach(cleanupSlide);
     slides = [];
+
     if (feedEl) feedEl.replaceChildren();
+
     activeView = null;
     overlay.style.display = 'none';
+
     keepAwake(false);
     saveSeenTimes();
   }

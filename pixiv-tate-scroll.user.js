@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.9.0
+// @version      3.10.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -23,7 +23,7 @@
   let slides = [];
   let pageLoadBusy = false;
   let pageLoadMisses = 0;
-  let mode = 'page'; // 'page' | 'related'
+  let mode = 'page'; // 'page' | 'related' | 'custom'
   let nearObs = null;
   // 画像サーバーへの接続を先に温めておく（初回表示の高速化）
   const pc = document.createElement('link');
@@ -162,7 +162,8 @@
       s.bookmarked = s.bookmarked || knownBookmarkedIds.has(String(s.id)) || !!body.bookmarkData;
       if (s.bookmarked) {
         knownBookmarkedIds.add(String(s.id));
-        if (!s.tasteLearned) {
+        if (!s.tasteLearned
+          && !bookmarkHistory.works.some((w) => String(w.id) === String(s.id))) {
           learnFromWork(s.tags, s.userId, body.illustType, 3);
           s.tasteLearned = true;
         }
@@ -895,12 +896,16 @@
   /* ---------- フィード管理 ---------- */
 
   function updateCounter() {
+    if (!overlay) return;
     const c = overlay.querySelector('.pts-counter');
+    if (!c) return;
     if (slides.length === 0) {
-      c.textContent = 'このページに作品が見つかりませんでした';
-    } else {
-      c.textContent = mode === 'related' ? `${slides.length} 件（関連モード）` : `${slides.length} 件`;
+      c.textContent = mode === 'custom' ? '自前フィードを準備中…' : 'このページに作品が見つかりませんでした';
+      return;
     }
+    if (mode === 'related') c.textContent = `${slides.length} 件（関連）`;
+    else if (mode === 'custom') c.textContent = `${slides.length} 件（自前）`;
+    else c.textContent = `${slides.length} 件`;
   }
 
   function addItems(items) {
@@ -1270,23 +1275,33 @@
     const seen = new Set();
     const unique = [];
     for (const raw of rawItems || []) {
+      if (!raw) continue;
       const it = normalizeCandidate(raw);
       if (!it.id || excludeIds.has(it.id) || seen.has(it.id)) continue;
       if (it.bookmarked) { knownBookmarkedIds.add(it.id); continue; }
       seen.add(it.id);
       unique.push(it);
     }
-    const prelim = sortByTaste(unique);
-    const enrichTop = options.enrichTop != null ? options.enrichTop : 24;
+    // 通常モードは従来の好みスコア。customではシード票を含むスコアを options.rank で注入できる
+    const rank = typeof options.rank === 'function' ? options.rank : tasteScore;
+    function ranked(items) {
+      return items
+        .map((it, index) => ({ it, index, score: Number(rank(it)) || 0 }))
+        .sort((a, b) => (b.score - a.score) || (a.index - b.index))
+        .map((x) => x.it);
+    }
+    const prelim = ranked(unique);
+    const enrichTop = Math.max(0, Math.floor(options.enrichTop != null ? options.enrichTop : 24));
     const head = prelim.slice(0, enrichTop);
     const tail = prelim.slice(enrichTop);
-    const enriched = await mapLimited(head, 4, enrichCandidate);
+    const enriched = await mapLimited(head, Math.min(4, Math.max(1, enrichTop)), enrichCandidate);
     const headOk = enriched.filter((it) => {
       if (!it) return false;
       if (it.bookmarked) { knownBookmarkedIds.add(it.id); return false; }
       return true;
     });
-    return [...sortByTaste(headOk), ...tail];
+    // 補完後も同じランキング関数で並べ直す（票の加点が途中で消えない）
+    return ranked([...headOk, ...tail]);
   }
 
   function candidatesToSlides(items) {
@@ -1298,6 +1313,289 @@
       s.bookmarked = false;
       return s;
     });
+  }
+
+  /* ---------- 自前フィード v1（ChatGPT実装） ---------- */
+
+  const CUSTOM_TARGET = 80;
+  const CUSTOM_MAX_REQUESTS = 6;
+  const CUSTOM_VOTE_BONUS = 8;
+  const CUSTOM_DISCOVERY_BONUS = 2;
+
+  let customBusy = false;
+  let customSeedOffset = 0;
+  let customNextIds = [];
+  let customQueuedIds = new Set();
+  let customSeenIds = new Set();
+  let customExhausted = false;
+  let customBatchNumber = 0;
+
+  // 既存フィードの表示済み作品も記録する（同一ページ内では再表示しない）
+  function rememberDisplayedSlides() {
+    for (const s of slides) {
+      if (s.id) customSeenIds.add(String(s.id));
+    }
+  }
+
+  function customPageArtworkId() {
+    const match = location.pathname.match(/^\/artworks\/(\d+)(?:\/|$)/);
+    return match ? match[1] : '';
+  }
+
+  function customPickSeeds() {
+    const result = [];
+    const seen = new Set();
+    const add = (id) => {
+      const value = String(id || '');
+      if (!/^\d+$/.test(value) || seen.has(value)) return;
+      seen.add(value);
+      result.push(value);
+    };
+    // 初回のみ作品ページの作品をシードにする
+    if (customBatchNumber === 0) add(customPageArtworkId());
+    // 履歴から3件。次バッチでは3件ずつ先へ進める
+    const works = bookmarkHistory.works || [];
+    let added = 0;
+    while (customSeedOffset < works.length && added < 3) {
+      const work = works[customSeedOffset++];
+      const before = result.length;
+      add(work && work.id);
+      if (result.length > before) added++;
+    }
+    return result.slice(0, 4);
+  }
+
+  function customMergeNextIds(ids) {
+    for (const value of ids || []) {
+      const id = String(value);
+      if (!/^\d+$/.test(id)) continue;
+      if (customQueuedIds.has(id)) continue;
+      if (customSeenIds.has(id)) continue;
+      if (knownBookmarkedIds.has(id)) continue;
+      if (slides.some((s) => String(s.id) === id)) continue;
+      customQueuedIds.add(id);
+      customNextIds.push(id);
+    }
+    if (customNextIds.length > 500) {
+      customNextIds = customNextIds.slice(0, 500);
+      customQueuedIds = new Set(customNextIds);
+    }
+  }
+
+  // 候補をIDで統合し、複数シードから推薦された回数を票として記録する
+  function customCollect(results) {
+    const map = new Map();
+    let order = 0;
+    for (const result of results) {
+      const items = Array.isArray(result.items) ? result.items : [];
+      const votedInSource = new Set();
+      for (const raw of items) {
+        const id = candidateId(raw);
+        if (!id) continue;
+        let entry = map.get(id);
+        if (!entry) {
+          entry = { ...raw, id, _customVotes: 0, _customDiscovery: false, _customOrder: order++ };
+          map.set(id, entry);
+        } else {
+          for (const key of ['tags', 'userId', 'illustType', 'pageCount', 'url', 'title', 'userName']) {
+            const oldValue = entry[key];
+            const newValue = raw[key];
+            if ((oldValue == null || oldValue === '' || (Array.isArray(oldValue) && oldValue.length === 0)) && newValue != null) {
+              entry[key] = newValue;
+            }
+          }
+        }
+        if (votedInSource.has(id)) continue;
+        votedInSource.add(id);
+        if (result.type === 'seed') entry._customVotes++;
+        else if (result.type === 'discovery') entry._customDiscovery = true;
+      }
+    }
+    return [...map.values()];
+  }
+
+  function customBaseScore(it) {
+    return tasteScore(it)
+      + (Number(it._customVotes) || 0) * CUSTOM_VOTE_BONUS
+      + (it._customDiscovery ? CUSTOM_DISCOVERY_BONUS : 0);
+  }
+
+  // 最終順位を1件ずつ決め、作者の連続だけを緩く抑える
+  function customDiversify(items) {
+    const pool = items.slice();
+    const output = [];
+    const previousAuthors = slides.slice(-2).map((s) => (s.userId ? String(s.userId) : ''));
+    while (pool.length > 0) {
+      let bestIndex = 0;
+      let bestScore = -Infinity;
+      let bestVotes = -Infinity;
+      let bestOrder = Infinity;
+      const last = output.length ? output[output.length - 1] : null;
+      const secondLast = output.length >= 2 ? output[output.length - 2] : null;
+      const lastAuthor = last ? String(last.userId || '') : (previousAuthors.at(-1) || '');
+      const secondAuthor = secondLast ? String(secondLast.userId || '')
+        : (output.length === 1 ? (previousAuthors.at(-1) || '') : (previousAuthors.at(-2) || ''));
+      for (let i = 0; i < pool.length; i++) {
+        const it = pool[i];
+        const author = String(it.userId || '');
+        let score = customBaseScore(it);
+        if (author && author === lastAuthor) score -= 12;
+        if (author && author === secondAuthor) score -= 5;
+        const votes = Number(it._customVotes) || 0;
+        const ord = Number(it._customOrder) || 0;
+        if (score > bestScore
+          || (score === bestScore && votes > bestVotes)
+          || (score === bestScore && votes === bestVotes && ord < bestOrder)) {
+          bestIndex = i;
+          bestScore = score;
+          bestVotes = votes;
+          bestOrder = ord;
+        }
+      }
+      output.push(pool.splice(bestIndex, 1)[0]);
+    }
+    return output;
+  }
+
+  // 単一バッチの取得（初回：シード最大4＋discovery＋補完枠／追加：nextIds＋新シード＋discovery）
+  async function customFetchBatch() {
+    const first = customBatchNumber === 0;
+    const seeds = customPickSeeds();
+    const jobs = [];
+    let nextBatch = [];
+    if (!first && customNextIds.length > 0) {
+      nextBatch = customNextIds.slice(0, 60);
+      jobs.push({
+        type: 'next',
+        ids: nextBatch,
+        run: () => fetchJson('/ajax/illust/recommend/illusts?illustIds=' + encodeURIComponent(nextBatch.join(',')) + '&lang=ja'),
+      });
+    }
+    for (const id of seeds) {
+      jobs.push({
+        type: 'seed',
+        id,
+        run: () => fetchJson(`/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`),
+      });
+    }
+    jobs.push({
+      type: 'discovery',
+      run: () => fetchJson('/ajax/discovery/artworks?mode=all&limit=60'),
+    });
+    const maxCollectionRequests = first ? CUSTOM_MAX_REQUESTS - 1 : CUSTOM_MAX_REQUESTS;
+    const selectedJobs = jobs.slice(0, maxCollectionRequests);
+    const settled = await Promise.allSettled(selectedJobs.map((job) => job.run()));
+    const results = [];
+    const nextIdsToMerge = [];
+    let successful = 0;
+    settled.forEach((entry, i) => {
+      const job = selectedJobs[i];
+      if (entry.status !== 'fulfilled') {
+        console.warn('[PTS custom] 候補取得失敗', job.type, entry.reason);
+        return;
+      }
+      successful++;
+      const body = entry.value || {};
+      results.push({ type: job.type, items: Array.isArray(body.illusts) ? body.illusts : [] });
+      if (Array.isArray(body.nextIds)) nextIdsToMerge.push(...body.nextIds);
+      if (job.type === 'next') {
+        const consumed = new Set(job.ids);
+        customNextIds = customNextIds.filter((id) => !consumed.has(id));
+        customQueuedIds = new Set(customNextIds);
+      }
+    });
+    if (successful === 0) throw new Error('全ての候補取得に失敗');
+    customMergeNextIds(nextIdsToMerge);
+    const collected = customCollect(results);
+    const prepared = await prepareCandidates(collected, {
+      excludeIds: [...customSeenIds],
+      enrichTop: first ? 1 : 0,
+      rank: customBaseScore,
+    });
+    const ranked = customDiversify(prepared);
+    return ranked.slice(0, CUSTOM_TARGET);
+  }
+
+  function customResetState() {
+    customBusy = false;
+    customSeedOffset = 0;
+    customNextIds = [];
+    customQueuedIds = new Set();
+    customExhausted = false;
+    customBatchNumber = 0;
+  }
+
+  async function switchToCustom() {
+    if (!overlay || !feedEl) return;
+    feedGeneration++;
+    const generation = feedGeneration;
+    rememberDisplayedSlides();
+    slides.forEach(cleanupSlide);
+    slides = [];
+    feedEl.innerHTML = '';
+    feedEl.scrollTop = 0;
+    mode = 'custom';
+    relatedNextIds = [];
+    relatedLoading = false;
+    relatedSwitchBusy = false;
+    customResetState();
+    customBusy = true;
+    updateCounter();
+    const button = overlay.querySelector('.pts-custom');
+    if (button) { button.disabled = true; button.textContent = '生成中…'; }
+    try {
+      const items = await customFetchBatch();
+      if (generation !== feedGeneration || mode !== 'custom' || overlay.style.display === 'none') return;
+      if (items.length === 0) throw new Error('表示可能な候補がありません');
+      addItems(candidatesToSlides(items));
+      for (const it of items) customSeenIds.add(String(it.id));
+      customBatchNumber++;
+      const firstSlide = slides[0];
+      if (firstSlide) {
+        firstSlide.isCurrent = true;
+        resolveSlide(firstSlide);
+        armWatchdog(firstSlide);
+      }
+      markCurrentFromScroll();
+    } catch (e) {
+      if (generation === feedGeneration && mode === 'custom') {
+        console.warn('[PTS custom]', e);
+        const c = overlay.querySelector('.pts-counter');
+        if (c) c.textContent = '自前フィード失敗: ' + (e.message || e);
+      }
+    } finally {
+      if (generation === feedGeneration && mode === 'custom') {
+        customBusy = false;
+        if (button) { button.disabled = false; button.textContent = '自前フィード'; }
+      }
+    }
+  }
+
+  async function customLoadMore() {
+    if (mode !== 'custom' || customBusy || customExhausted || !overlay || overlay.style.display === 'none') return;
+    customBusy = true;
+    const generation = feedGeneration;
+    try {
+      const items = await customFetchBatch();
+      if (generation !== feedGeneration || mode !== 'custom') return;
+      const existing = new Set(slides.map((s) => String(s.id)));
+      const selected = items.filter((it) => !existing.has(String(it.id))
+        && !customSeenIds.has(String(it.id))
+        && !knownBookmarkedIds.has(String(it.id)));
+      if (selected.length > 0) {
+        addItems(candidatesToSlides(selected));
+        for (const it of selected) customSeenIds.add(String(it.id));
+      }
+      customBatchNumber++;
+      const noMoreSeeds = customSeedOffset >= (bookmarkHistory.works || []).length;
+      if (selected.length === 0 && noMoreSeeds && customNextIds.length === 0) {
+        customExhausted = true;
+      }
+    } catch (e) {
+      console.warn('[PTS custom] 続き取得失敗', e);
+    } finally {
+      if (generation === feedGeneration) customBusy = false;
+    }
   }
 
   function mergeNextIds(ids) {
@@ -1490,7 +1788,7 @@
       // 共通処理：pixivへの保存・状態更新・学習
       const newlySaved = await ensureBookmarked(s);
       // 通常の保存操作だけ、おすすめを直後に差し込む
-      if (newlySaved) {
+      if (newlySaved && mode !== 'custom') {
         insertRecommendationsAfterBookmark(s);
       }
     } catch (e) {
@@ -1519,6 +1817,7 @@
 
   function buildFeed() {
     feedGeneration++;
+    customResetState();
     relatedNextIds = [];
     relatedLoading = false;
     relatedSwitchBusy = false;
@@ -1590,6 +1889,7 @@
 
   function closeViewer() {
     feedGeneration++;
+    customResetState();
     overlay.style.display = 'none';
     keepAwake(false);
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
@@ -1617,6 +1917,7 @@
           <option value="15">自動15秒</option>
           <option value="30">自動30秒</option>
         </select>
+        <button class="pts-custom">自前フィード</button>
         <button class="pts-rescan">再スキャン</button>
         <button class="pts-close" title="閉じる">✕</button>
       </div>
@@ -1625,6 +1926,7 @@
     feedEl = overlay.querySelector('.pts-feed');
     overlay.querySelector('.pts-close').addEventListener('click', closeViewer);
     overlay.querySelector('.pts-rescan').addEventListener('click', buildFeed);
+    overlay.querySelector('.pts-custom').addEventListener('click', switchToCustom);
     overlay.querySelector('.pts-quality').addEventListener('change', (e) => {
       quality = e.target.value;
       // 画質を変えたら、解決済みスライドの表示レベルだけ付け替える（取り直しはしない）
@@ -1637,8 +1939,9 @@
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
       if (remain < feedEl.clientHeight * 2) {
-        if (mode === 'related') relatedLoadMore();
-        else pageLoadMore();
+        if (mode === 'custom') customLoadMore();
+        else if (mode === 'related') relatedLoadMore();
+        else if (mode === 'page') pageLoadMore();
       }
       clearTimeout(curTimer);
       curTimer = setTimeout(markCurrentFromScroll, 130);
@@ -1663,6 +1966,13 @@
       .pts-bookmark{position:absolute;right:14px;bottom:160px;z-index:2;background:rgba(255,255,255,.16);color:#fff;border:0;
         border-radius:999px;padding:10px 14px;font-size:13px;}
       .pts-bookmark.pts-bookmarked{background:#1e9e6a;}
+      .pts-custom{background:#0096fa;color:#fff;border:0;border-radius:999px;padding:7px 12px;cursor:pointer;font-size:12px;white-space:nowrap;}
+      .pts-custom:disabled{opacity:.6;}
+      @media (max-width:480px){
+        .pts-bar{gap:5px;padding:8px 6px;}
+        .pts-custom{padding:7px 8px;font-size:11px;}
+        .pts-counter{font-size:11px;}
+      }
       .pts-close{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;width:32px;height:32px;cursor:pointer;font-size:15px;}
       .pts-feed{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;overscroll-behavior:contain;}
       .pts-feed::-webkit-scrollbar{display:none;}

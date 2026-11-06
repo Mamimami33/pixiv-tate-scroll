@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.4.2
+// @version      3.5.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -149,8 +149,11 @@
         // pixivの種別コード: 0=イラスト / 1=マンガ / 2=うごイラ
         s.kind = 'ugoira';
         try {
-          const meta = await fetchJson(`/ajax/illust/${s.id}/ugoira_meta`);
-          s.zipUrl = meta.src || meta.originalSrc || null;
+          let meta = s.metaPromise ? await s.metaPromise : null;
+          if (!meta) meta = await fetchJson(`/ajax/illust/${s.id}/ugoira_meta`);
+          s.zipSmall = meta.src || null;
+          s.zipFull = meta.originalSrc || null;
+          s.zipUrl = s.zipSmall || s.zipFull;
           s.frames = meta.frames || null;
           if (!s.zipUrl) s.ugoiraError = 'メタにZIPなし';
           else if (!s.frames || s.frames.length === 0) s.ugoiraError = 'フレーム情報なし';
@@ -436,6 +439,7 @@
         const valid = s.frameUrls.filter(Boolean).length;
         if (valid === 0) throw new Error('フレーム0枚');
         if (s.isCurrent) startUgoira(s);
+        upgradeUgoiraHiRes(s);
         return;
       }
       // 第2候補：個別フレームURL（_ugoira0, _ugoira1, ...）
@@ -469,6 +473,22 @@
     }
   }
 
+  // うごイラ：小さいZIPで先に再生を始め、裏で元サイズのZIPに差し替えて綺麗にする
+  async function upgradeUgoiraHiRes(s) {
+    if (!s.zipFull || s.zipFull === s.zipUrl || s.hiDone || s.hiRunning) return;
+    s.hiRunning = true;
+    try {
+      const urls = await unzipFrames(s.zipFull, s.frames, undefined);
+      if (urls.filter(Boolean).length > 0) {
+        const old = s.frameUrls;
+        s.frameUrls = urls;
+        s.hiDone = true;
+        if (old) old.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
+      }
+    } catch (e) { /* 小さいまま続行 */ }
+    s.hiRunning = false;
+  }
+
   /* ---------- 閲覧中の読み込み優先（滞り検知つき） ---------- */
 
   // 表示中のスライドを最優先にする：他のうごイラ準備を止め、未解決なら即解決し、画像の優先度を上げる
@@ -477,6 +497,10 @@
       if (o !== s && o.ugoiraAbort) o.ugoiraAbort.abort();
       if (o.mainImg) { try { o.mainImg.fetchPriority = (o === s) ? 'high' : 'low'; } catch (e) {} }
     });
+    // うごイラかどうか分からない段階でも、メタ取得だけ先行させておく（違えば1回分だけ無駄になる）
+    if (!s.resolved && !s.metaPromise) {
+      s.metaPromise = fetchJson(`/ajax/illust/${s.id}/ugoira_meta`).catch(() => null);
+    }
     if (!s.resolved && !s.resolving) resolveSlide(s);
     if (s.kind === 'ugoira' && !s.frameUrls && s.resolved) prepareUgoira(s);
   }
@@ -529,6 +553,7 @@
         pg.className = 'pts-page';
         const im = document.createElement('img');
         im.className = 'pts-img';
+        im.decoding = 'async';
         im.src = i === 0 ? (pair.r || pair.o) : (pair.r || pair.o);
         im.loading = i === 0 ? 'eager' : 'lazy';
         im.alt = s.title || '';
@@ -548,6 +573,7 @@
     } else {
       const im = document.createElement('img');
       im.className = 'pts-img';
+      im.decoding = 'async';
       const pair = s.pairs && s.pairs[0];
       im.src = (pair && (pair.r || pair.o)) || s.thumb;
       im.alt = s.title || '';
@@ -568,8 +594,15 @@
     holder.className = 'pts-holder';
     const ph = document.createElement('img');
     ph.className = 'pts-img';
-    // 仮表示は軽いサムネイル。本番画像は見える位置に来てから読み込む
-    ph.src = s.thumb || upgradeUrl(s.thumb);
+    ph.decoding = 'async';
+    // 先頭の数枚は、サムネイルURLから変換した1200px画像を即表示する（API応答を待たない）
+    // それ以外は近づくまで読み込まない（帯域を先頭と表示中に譲る）
+    if (idx < 3) {
+      ph.src = upgradeUrl(s.thumb) || s.thumb;
+      ph.onerror = () => { if (s.thumb && ph.src !== s.thumb) ph.src = s.thumb; };
+    } else {
+      ph.dataset.ptsPh = '1';
+    }
     ph.alt = s.title || '';
     ph.loading = idx < 2 ? 'eager' : 'lazy';
     holder.appendChild(ph);
@@ -749,13 +782,16 @@
         if (s.resolved) upgradeSlide(s);
       }
     });
-    // 次の1枚の元画像を先読みしておく（スワイプした瞬間に綺麗な画像が出る）
+    // 前後（次2枚・前1枚）の元画像を先読みしておく（スワイプした瞬間に綺麗な画像が出る）
     if (quality === 'orig') {
-      const nx = slides[idx + 1];
-      if (nx && nx.resolved && nx.kind !== 'ugoira' && nx.pairs && nx.pairs[0] && nx.pairs[0].o) {
-        const pre = new Image();
-        pre.src = nx.pairs[0].o;
-      }
+      [idx + 1, idx + 2, idx - 1].forEach((j) => {
+        const nx = slides[j];
+        if (nx && nx.resolved && nx.kind !== 'ugoira' && nx.pairs && nx.pairs[0] && nx.pairs[0].o) {
+          const pre = new Image();
+          pre.decoding = 'async';
+          pre.src = nx.pairs[0].o;
+        }
+      });
     }
   }
 
@@ -765,6 +801,8 @@
     pageLoadMisses = 0;
     feedEl.innerHTML = '';
     addItems(scanPage());
+    // 先頭4枚はオブザーバーを待たず即解決（開いてすぐ綺麗に）
+    slides.slice(0, 4).forEach((s) => resolveSlide(s));
     setTimeout(markCurrentFromScroll, 400);
   }
 
@@ -796,8 +834,13 @@
       entries.forEach((en) => {
         if (!en.isIntersecting) return;
         const s = slides.find((x) => x.sectionEl === en.target);
-        if (s && !s.resolved) resolveSlide(s);
-        else if (s) upgradeSlide(s);
+        if (!s) return;
+        // 遅らせていた仮表示サムネイルをここで読み込む
+        if (s.mainImg && s.mainImg.dataset && s.mainImg.dataset.ptsPh && !s.mainImg.getAttribute('src') && s.thumb) {
+          s.mainImg.src = s.thumb;
+        }
+        if (!s.resolved) resolveSlide(s);
+        else upgradeSlide(s);
       });
     }, { root: null, rootMargin: '300% 0px 300% 0px', threshold: 0 });
 

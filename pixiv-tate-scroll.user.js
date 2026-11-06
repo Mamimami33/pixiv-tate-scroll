@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.4.0
+// @version      3.4.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -375,7 +375,9 @@
       // 現在フレーム開始時点までの累計時間でバーを進める
       let elapsed = 0;
       for (let k = 0; k < i; k++) elapsed += (s.frames[k].delay || 100);
-      if (s.seekFill) s.seekFill.style.width = (total > 0 ? (elapsed / total) * 100 : 0) + '%';
+      const pct = total > 0 ? (elapsed / total) * 100 : 0;
+      if (s.seekFill) s.seekFill.style.width = pct + '%';
+      if (s.seekKnob) s.seekKnob.style.left = pct + '%';
       const delay = (s.frames[i].delay) || 100;
       s.animIdx++;
       s.animTimer = setTimeout(step, delay);
@@ -383,18 +385,25 @@
     step();
   }
 
-  // シークバーがタップされたらその位置のフレームへ跳ぶ
-  function seekUgoira(s, ratio) {
-    if (!s.frameUrls || !s.frames || !s.animTotal) return;
-    let target = ratio * s.animTotal;
+  // シークバーの位置に合わせてフレームを表示する（ドラッグ中のプレビュー）
+  function dragUgoira(s, ratio) {
+    if (!s.frameUrls || !s.frames) return;
+    const total = s.animTotal || s.frames.reduce((a, f) => a + (f.delay || 100), 0);
+    s.animTotal = total;
+    let target = ratio * total;
     let idx = 0;
+    let elapsed = 0;
     while (idx < s.frames.length - 1 && target >= (s.frames[idx].delay || 100)) {
       target -= (s.frames[idx].delay || 100);
+      elapsed += (s.frames[idx].delay || 100);
       idx++;
     }
     s.animIdx = idx;
-    if (s.animTimer) { clearTimeout(s.animTimer); s.animTimer = null; }
-    if (s.isCurrent) startUgoira(s);
+    const url = s.frameUrls[idx % s.frameUrls.length];
+    if (url && s.mainImg) s.mainImg.src = url;
+    const pct = total > 0 ? (elapsed / total) * 100 : 0;
+    if (s.seekFill) s.seekFill.style.width = pct + '%';
+    if (s.seekKnob) s.seekKnob.style.left = pct + '%';
   }
 
   function stopUgoira(s) {
@@ -520,18 +529,39 @@
     sec.appendChild(chip);
     s.pageChip = chip;
 
-    // うごイラ用シークバー（上部バー直下）
+    // うごイラ用シークバー（上部バー直下・ドラッグで操作できる）
     const seek = document.createElement('div');
     seek.className = 'pts-seek';
     seek.style.display = 'none';
     const seekFill = document.createElement('div');
     seekFill.className = 'pts-seek-fill';
     seek.appendChild(seekFill);
-    seek.addEventListener('pointerdown', (e) => {
+    const knob = document.createElement('div');
+    knob.className = 'pts-seek-knob';
+    seek.appendChild(knob);
+    s.seekKnob = knob;
+    const dragTo = (clientX) => {
       const r = seek.getBoundingClientRect();
-      seekUgoira(s, Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));
+      dragUgoira(s, Math.min(1, Math.max(0, (clientX - r.left) / r.width)));
+    };
+    seek.addEventListener('pointerdown', (e) => {
+      seek.setPointerCapture(e.pointerId);
+      s.seekDragging = true;
+      stopUgoira(s);
+      dragTo(e.clientX);
       e.stopPropagation();
+      e.preventDefault();
     });
+    seek.addEventListener('pointermove', (e) => {
+      if (s.seekDragging) dragTo(e.clientX);
+    });
+    const dragEnd = () => {
+      if (!s.seekDragging) return;
+      s.seekDragging = false;
+      if (s.isCurrent && s.frameUrls) startUgoira(s);
+    };
+    seek.addEventListener('pointerup', dragEnd);
+    seek.addEventListener('pointercancel', dragEnd);
     sec.appendChild(seek);
     s.seekEl = seek;
     s.seekFill = seekFill;
@@ -571,25 +601,56 @@
 
   /* ---------- 関連作品への切り替え ---------- */
 
+  let relatedNextIds = [];
+  let relatedLoading = false;
+
   async function switchToRelated(slide, btn) {
     if (btn) { btn.textContent = '読み込み中…'; btn.disabled = true; }
     try {
       const body = await fetchJson(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`);
-      const items = (body.illusts || [])
+      let illusts = body.illusts || [];
+      relatedNextIds = (body.nextIds || []).map(String);
+      // illustsが空でも候補IDがあればそちらから取る
+      if (illusts.length === 0 && relatedNextIds.length > 0) {
+        const batch = relatedNextIds.splice(0, 60);
+        const b2 = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
+        illusts = b2.illusts || [];
+        if (b2.nextIds) relatedNextIds = relatedNextIds.concat(b2.nextIds.map(String));
+      }
+      const items = illusts
         .map((it) => newSlide(String(it.id), it.url || '', it.title || '', it.userName || ''))
         .filter((it) => it.id !== slide.id);
-      if (items.length === 0) throw new Error('no related');
+      if (items.length === 0) throw new Error('関連0件');
       const idx = slides.indexOf(slide);
       slides = slides.slice(0, idx + 1);
       while (feedEl.children.length > idx + 1) {
-        feedEl.removeChild(feedEl.lastChild);
+        const removed = feedEl.lastChild;
+        if (nearObs) nearObs.unobserve(removed);
+        if (curObs) curObs.unobserve(removed);
+        feedEl.removeChild(removed);
       }
       mode = 'related';
       addItems(items);
       if (btn) btn.textContent = '関連に切替済み';
     } catch (e) {
-      if (btn) { btn.textContent = '関連が取れませんでした'; btn.disabled = false; }
+      if (btn) { btn.textContent = '失敗: ' + ((e && e.message) || e); btn.disabled = false; }
     }
+  }
+
+  // 関連モードの続き読み込み（候補IDが残っている間は末尾に足していく）
+  async function relatedLoadMore() {
+    if (mode !== 'related' || relatedLoading || relatedNextIds.length === 0) return;
+    relatedLoading = true;
+    try {
+      const batch = relatedNextIds.splice(0, 60);
+      const body = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
+      if (body.nextIds) relatedNextIds = relatedNextIds.concat(body.nextIds.map(String));
+      const items = (body.illusts || [])
+        .map((it) => newSlide(String(it.id), it.url || '', it.title || '', it.userName || ''))
+        .filter((it) => !slides.some((s) => s.id === it.id));
+      addItems(items);
+    } catch (e) { /* 次のスクロールで再試行 */ }
+    relatedLoading = false;
   }
 
   /* ---------- フィード管理 ---------- */
@@ -745,7 +806,10 @@
     });
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
-      if (remain < feedEl.clientHeight * 2) pageLoadMore();
+      if (remain < feedEl.clientHeight * 2) {
+        if (mode === 'related') relatedLoadMore();
+        else pageLoadMore();
+      }
       clearTimeout(curTimer);
       curTimer = setTimeout(markCurrentFromScroll, 130);
     }, { passive: true });
@@ -780,8 +844,9 @@
         background:linear-gradient(transparent,rgba(0,0,0,.7));}
       .pts-title{font-size:15px;font-weight:700;line-height:1.4;}
       .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
-      .pts-seek{position:absolute;left:0;right:0;top:48px;height:18px;z-index:6;background:linear-gradient(to bottom, rgba(255,255,255,.25) 0 3px, transparent 3px);}
-      .pts-seek-fill{height:3px;width:0%;background:#0096fa;}
+      .pts-seek{position:absolute;left:0;right:0;top:48px;height:26px;z-index:6;background:linear-gradient(to bottom, rgba(255,255,255,.25) 0 4px, transparent 4px);touch-action:none;}
+      .pts-seek-fill{height:4px;width:0%;background:#0096fa;}
+      .pts-seek-knob{position:absolute;top:2px;left:0%;width:16px;height:16px;margin-left:-8px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5);}
       .pts-open{position:absolute;right:14px;bottom:64px;z-index:2;background:rgba(255,255,255,.16);color:#fff;
         text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
       .pts-related{position:absolute;right:14px;bottom:112px;z-index:2;background:#0096fa;color:#fff;border:0;

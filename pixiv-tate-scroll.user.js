@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.10.2
+// @version      3.11.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -438,30 +438,36 @@
   }
 
   function startUgoira(s) {
-    if (s.animTimer || !s.frameUrls) return;
+    if (s.animTimer || !s.frameUrls?.length || !s.frames?.length) return;
     upgradeUgoiraHiRes(s);
     if (s.pageChip) {
       s.pageChip.style.display = 'block';
       s.pageChip.textContent = 'うごイラ再生中';
     }
-    // シークバー（再生位置）を出す
     const total = s.frames.reduce((a, f) => a + (f.delay || 100), 0);
     s.animTotal = total;
     if (s.seekEl) s.seekEl.style.display = 'block';
     const step = () => {
-      if (!s.frameUrls) return;
+      if (!s.frameUrls?.length || !s.isCurrent) { s.animTimer = null; return; }
       const i = s.animIdx % s.frameUrls.length;
       const url = s.frameUrls[i];
-      if (url && s.mainImg) s.mainImg.src = url;
-      // 現在フレーム開始時点までの累計時間でバーを進める
+      if (url && s.mainImg && s.mainImg.src !== url) s.mainImg.src = url;
       let elapsed = 0;
-      for (let k = 0; k < i; k++) elapsed += (s.frames[k].delay || 100);
-      const pct = total > 0 ? (elapsed / total) * 100 : 0;
+      for (let k = 0; k < i; k++) elapsed += s.frames[k]?.delay || 100;
+      const pct = total > 0 ? elapsed / total * 100 : 0;
       if (s.seekFill) s.seekFill.style.width = pct + '%';
       if (s.seekKnob) s.seekKnob.style.left = pct + '%';
-      const delay = (s.frames[i].delay) || 100;
+      const delay = s.frames[i]?.delay || 100;
       s.animIdx++;
-      s.animTimer = setTimeout(step, delay);
+      s.loopSteps = (s.loopSteps || 0) + 1;
+      s.animTimer = setTimeout(() => {
+        s.animTimer = null;
+        if (!s.isCurrent) return;
+        if (s.loopSteps >= s.frameUrls.length) {
+          s.loopSteps = 0; onUgoiraLoop(s);
+        }
+        step();
+      }, delay);
     };
     step();
   }
@@ -490,6 +496,7 @@
 
   function stopUgoira(s) {
     if (s.animTimer) { clearTimeout(s.animTimer); s.animTimer = null; }
+    s.loopSteps = 0;
   }
 
   function setChip(s, text) {
@@ -586,9 +593,17 @@
 
   // 画像の読み込みを強制的にやり直す（壊れて終わっているときだけ。読み込み途中では呼ばない）
   function forceReloadImage(s) {
+    const now = Date.now();
+    reloadTimes = reloadTimes.filter(t => now - t < 60000);
+    reloadTimes.push(now);
+    if (reloadTimes.length >= 3) {
+      effectsReduced = true;
+      overlay?.classList.add('pts-low-effects');
+    }
     const img = s.mainImg;
-    if (!img || !s.pairs || !s.pairs[0]) return;
-    const url = (quality === 'orig' && s.pairs[0].o) ? s.pairs[0].o : (s.pairs[0].r || s.pairs[0].o);
+    if (!img || !s.pairs?.[0]) return;
+    const pair = s.pairs[0];
+    const url = quality === 'orig' && pair.o ? pair.o : (pair.r || pair.o);
     if (!url) return;
     img.src = '';
     img.src = url;
@@ -899,13 +914,13 @@
     if (!overlay) return;
     const c = overlay.querySelector('.pts-counter');
     if (!c) return;
-    if (slides.length === 0) {
-      c.textContent = mode === 'custom' ? '自前フィードを準備中…' : 'このページに作品が見つかりませんでした';
-      return;
+    if (!slides.length) {
+      c.textContent = mode === 'custom' ? '自前フィード準備中…' : '作品が見つかりません';
+    } else {
+      const name = {related:'関連',custom:'自前',saved:'保存分'}[mode];
+      c.textContent = `${slides.length} 件${name ? `（${name}）` : ''}`;
     }
-    if (mode === 'related') c.textContent = `${slides.length} 件（関連）`;
-    else if (mode === 'custom') c.textContent = `${slides.length} 件（自前）`;
-    else c.textContent = `${slides.length} 件`;
+    syncDock();
   }
 
   function addItems(items) {
@@ -920,54 +935,42 @@
   // スクロール位置から「表示中スライド」を決める（IntersectionObserverが効かない環境向けの本命判定）
   let curTimer = null;
   function markCurrentFromScroll() {
-    if (!feedEl || slides.length === 0) return;
-    const idx = Math.round(feedEl.scrollTop / Math.max(1, feedEl.clientHeight));
+    if (!feedEl || !slides.length) return;
+    const idx = Math.max(0, Math.min(slides.length - 1, currentIndex()));
     slides.forEach((s, i) => {
-      if (i === idx) {
-        if (!s.isCurrent) {
-          s.isCurrent = true;
-          if (s.resolved) upgradeSlide(s);
-          else resolveSlide(s);
-          if (s.kind === 'ugoira') {
-            if (s.frameUrls) startUgoira(s);
-            else if (s.resolved) prepareUgoira(s);
-          }
-          armWatchdog(s);
+      const current = i === idx;
+      s.sectionEl?.classList.toggle('pts-current', current);
+      if (current && !s.isCurrent) {
+        s.isCurrent = true;
+        if (s.resolved) upgradeSlide(s);
+        else resolveSlide(s);
+        if (s.kind === 'ugoira') {
+          if (s.frameUrls) startUgoira(s);
+          else if (s.resolved) prepareUgoira(s);
         }
-      } else if (s.isCurrent) {
-        s.isCurrent = false;
-        stopUgoira(s);
+        armWatchdog(s);
+      } else if (!current && s.isCurrent) {
+        s.isCurrent = false; stopUgoira(s);
         if (s.resolved) upgradeSlide(s);
       }
     });
-    // 近く（前後3枚）の仮表示サムネイルは、監視を待たずスクロール位置から直接読み込む
-    slides.forEach((s, i) => {
-      if (Math.abs(i - idx) <= 3 && s.mainImg && s.mainImg.dataset && s.mainImg.dataset.ptsPh
-        && !s.mainImg.getAttribute('src') && s.thumb) {
-        s.mainImg.src = s.thumb;
-      }
-    });
-    // 先読みは「表示中が読み終わってから」。表示中より先に帯域を食うと全部遅くなる
-    const cur = slides[idx];
-    const curOk = cur && (cur.kind === 'ugoira' ? !!cur.frameUrls
-      : (cur.mainImg && cur.mainImg.complete && cur.mainImg.naturalWidth > 0));
-    if (quality === 'orig' && curOk) {
-      const n1 = slides[idx + 1];
-      if (n1 && n1.resolved && n1.kind !== 'ugoira' && n1.pairs && n1.pairs[0] && n1.pairs[0].o && !n1.preloadedO) {
-        n1.preloadedO = true;
-        const pre = new Image();
-        pre.decoding = 'async';
-        pre.src = n1.pairs[0].o;
-      }
-      const n2 = slides[idx + 2];
-      if (n2 && n2.resolved && n2.kind !== 'ugoira' && n2.pairs && n2.pairs[0] && n2.pairs[0].r && !n2.preloadedR) {
-        n2.preloadedR = true;
-        const pre2 = new Image();
-        pre2.decoding = 'async';
-        pre2.src = n2.pairs[0].r;
+    const s = slides[idx];
+    onCurrentSlideChanged(s);
+    for (let i = Math.max(0, idx - 3); i <= Math.min(slides.length - 1, idx + 3); i++) {
+      const x = slides[i];
+      if (x.mainImg?.dataset?.ptsPh && !x.mainImg.getAttribute('src') && x.thumb) x.mainImg.src = x.thumb;
+    }
+    if (quality === 'orig' && visibleReady(s)) {
+      for (const [step, field, urlKey] of [[1,'preloadedO','o'],[2,'preloadedR','r']]) {
+        const n = slides[idx + step];
+        if (n?.resolved && n.kind !== 'ugoira' && n.pairs?.[0]?.[urlKey] && !n[field]) {
+          n[field] = true;
+          const pre = new Image(); pre.decoding = 'async'; pre.src = n.pairs[0][urlKey];
+        }
       }
     }
     scheduleAutoAdvance(idx);
+    syncDock();
   }
 
   /* ---------- 自前レコメンド v2（履歴500件＋永続化） ---------- */
@@ -1490,7 +1493,7 @@
   /* ---------- 自前フィード v1（ChatGPT実装） ---------- */
 
   const CUSTOM_TARGET = 80;
-  const CUSTOM_MAX_REQUESTS = 6;
+  const CUSTOM_MAX_REQUESTS = 8;
   const CUSTOM_VOTE_BONUS = 8;
   const CUSTOM_DISCOVERY_BONUS = 2;
 
@@ -1556,40 +1559,45 @@
 
   // 候補をIDで統合し、複数シードから推薦された回数を票として記録する
   function customCollect(results) {
-    const map = new Map();
+    const merged = new Map();
     let order = 0;
     for (const result of results) {
-      const items = Array.isArray(result.items) ? result.items : [];
-      const votedInSource = new Set();
-      for (const raw of items) {
+      const perSource = new Set();
+      for (const raw of (Array.isArray(result.items) ? result.items : [])) {
         const id = candidateId(raw);
-        if (!id) continue;
-        let entry = map.get(id);
-        if (!entry) {
-          entry = { ...raw, id, _customVotes: 0, _customDiscovery: false, _customOrder: order++ };
-          map.set(id, entry);
+        if (!/^\d+$/.test(id)) continue;
+        let it = merged.get(id);
+        if (!it) {
+          it = { ...raw, id, url: raw.url || raw.urls?.regular || raw.urls?.small ||
+            raw.urls?.original || '', _customVotes: 0, _customDiscovery: false,
+            _customSources: [], _customOrder: order++ };
+          merged.set(id, it);
         } else {
-          for (const key of ['tags', 'userId', 'illustType', 'pageCount', 'url', 'title', 'userName']) {
-            const oldValue = entry[key];
-            const newValue = raw[key];
-            if ((oldValue == null || oldValue === '' || (Array.isArray(oldValue) && oldValue.length === 0)) && newValue != null) {
-              entry[key] = newValue;
-            }
+          for (const key of ['tags','userId','illustType','pageCount','url','title','userName']) {
+            const old = it[key], newer = raw[key];
+            if ((old == null || old === '' || (Array.isArray(old) && !old.length)) &&
+                newer != null) it[key] = newer;
           }
+          if (!it.bookmarkData && raw.bookmarkData) it.bookmarkData = raw.bookmarkData;
         }
-        if (votedInSource.has(id)) continue;
-        votedInSource.add(id);
-        if (result.type === 'seed') entry._customVotes++;
-        else if (result.type === 'discovery') entry._customDiscovery = true;
+        if (perSource.has(id)) continue;
+        perSource.add(id);
+        if (!it._customSources.includes(result.type)) it._customSources.push(result.type);
+        if (result.type === 'seed') it._customVotes++;
+        if (result.type === 'discovery') it._customDiscovery = true;
       }
     }
-    return [...map.values()];
+    return [...merged.values()];
   }
 
   function customBaseScore(it) {
-    return tasteScore(it)
-      + (Number(it._customVotes) || 0) * CUSTOM_VOTE_BONUS
-      + (it._customDiscovery ? CUSTOM_DISCOVERY_BONUS : 0);
+    const sources = Array.isArray(it._customSources) ? it._customSources : [];
+    return tasteScore(it) + (Number(it._customVotes) || 0) * CUSTOM_VOTE_BONUS +
+      (sources.includes('discovery') ? 2 : 0) +
+      (sources.includes('tag') ? 5 : 0) +
+      (sources.includes('follow') ? 4 : 0) +
+      (sources.includes('author') ? 3 : 0) +
+      (Number(it.illustType) === 2 ? 5 : 0);
   }
 
   // 最終順位を1件ずつ決め、作者の連続だけを緩く抑える
@@ -1632,60 +1640,79 @@
   // 単一バッチの取得（初回：シード最大4＋discovery＋補完枠／追加：nextIds＋新シード＋discovery）
   async function customFetchBatch() {
     const first = customBatchNumber === 0;
-    const seeds = customPickSeeds();
     const jobs = [];
-    let nextBatch = [];
-    if (!first && customNextIds.length > 0) {
-      nextBatch = customNextIds.slice(0, 60);
-      jobs.push({
-        type: 'next',
-        ids: nextBatch,
-        run: () => fetchJson('/ajax/illust/recommend/illusts?illustIds=' + encodeURIComponent(nextBatch.join(',')) + '&lang=ja'),
-      });
+    const seeds = customPickSeeds();
+    if (!first && customNextIds.length) {
+      const ids = customNextIds.slice(0, 60);
+      jobs.push({ type:'next', ids, run: () => fetchJson(
+        '/ajax/illust/recommend/illusts?illustIds=' +
+        encodeURIComponent(ids.join(',')) + '&lang=ja') });
     }
-    for (const id of seeds) {
-      jobs.push({
-        type: 'seed',
-        id,
-        run: () => fetchJson(`/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`),
-      });
+    for (const id of seeds) jobs.push({ type:'seed', run:() => fetchJson(
+      `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`) });
+    jobs.push({ type:'discovery', run:() => fetchJson(
+      '/ajax/discovery/artworks?mode=all&limit=60') });
+    const tags = Object.entries(historyProfile.tags).map(([k,v]) =>
+      [k, Number(v || 0) + Number(profile.tags[k] || 0) * 1.5])
+      .filter(([k,v]) => k && Number.isFinite(v) && v > 0)
+      .sort((a,b) => b[1] - a[1]).slice(0, 12).map(([k]) => k);
+    if (!tags.length) tags.push('R-18');
+    const tag = tags[customTagOffset++ % tags.length];
+    jobs.push({ type:'tag', run:() => fetchJson(
+      '/ajax/search/artworks/' + encodeURIComponent(tag) + '?' +
+      new URLSearchParams({word:tag,order:'popular_d',mode:'all',s_mode:'s_tag',p:'1'})) });
+    if (!customFollowFinished) {
+      const page = customFollowPage;
+      jobs.push({ type:'follow', page, run:() => fetchJson(
+        `/ajax/follow_latest/illust?mode=all&p=${page}`) });
     }
-    jobs.push({
-      type: 'discovery',
-      run: () => fetchJson('/ajax/discovery/artworks?mode=all&limit=60'),
+    const authors = Object.entries(historyProfile.authors).filter(([k,v]) =>
+      /^\d+$/.test(k) && Number(v) > 0).sort((a,b) => b[1]-a[1]).slice(0,12);
+    if (authors.length) {
+      const authorId = authors[customAuthorOffset++ % authors.length][0];
+      jobs.push({ type:'author', run:() => fetchJson(
+        `/ajax/user/${encodeURIComponent(authorId)}/illusts?limit=30&tag=&lang=ja`) });
+    }
+    // 最大8回、同時実行は3回まで。失敗したソースだけ無視する。
+    const chosen = jobs.slice(0, CUSTOM_MAX_REQUESTS);
+    const settled = await mapLimited(chosen, 3, async job => {
+      try { return {ok:true, body:await job.run()}; }
+      catch (e) { return {ok:false, error:e}; }
     });
-    const maxCollectionRequests = first ? CUSTOM_MAX_REQUESTS - 1 : CUSTOM_MAX_REQUESTS;
-    const selectedJobs = jobs.slice(0, maxCollectionRequests);
-    const settled = await Promise.allSettled(selectedJobs.map((job) => job.run()));
-    const results = [];
-    const nextIdsToMerge = [];
+    const results = [], nextIds = [];
     let successful = 0;
-    settled.forEach((entry, i) => {
-      const job = selectedJobs[i];
-      if (entry.status !== 'fulfilled') {
-        console.warn('[PTS custom] 候補取得失敗', job.type, entry.reason);
+    settled.forEach((r,i) => {
+      const job = chosen[i];
+      if (!r?.ok) {
+        if (job.type !== 'author') console.warn('[PTS custom]', job.type, r?.error);
         return;
       }
+      const body = r.body || {};
+      const found = customCandidateArray(body);
+      let items = found;
+      if (job.type === 'author') items = items.filter(x =>
+        x && typeof x.url === 'string' && x.url.length > 0);
+      if (job.type === 'author' && !items.length) return; // 要確認APIは黙って無効化
       successful++;
-      const body = entry.value || {};
-      results.push({ type: job.type, items: Array.isArray(body.illusts) ? body.illusts : [] });
-      if (Array.isArray(body.nextIds)) nextIdsToMerge.push(...body.nextIds);
+      results.push({type:job.type, items});
+      if (Array.isArray(body.nextIds)) nextIds.push(...body.nextIds);
+      if (job.type === 'follow') {
+        if (items.length) customFollowPage = job.page + 1;
+        else customFollowFinished = true;
+      }
       if (job.type === 'next') {
         const consumed = new Set(job.ids);
-        customNextIds = customNextIds.filter((id) => !consumed.has(id));
+        customNextIds = customNextIds.filter(x => !consumed.has(x));
         customQueuedIds = new Set(customNextIds);
       }
     });
-    if (successful === 0) throw new Error('全ての候補取得に失敗');
-    customMergeNextIds(nextIdsToMerge);
-    const collected = customCollect(results);
-    const prepared = await prepareCandidates(collected, {
-      excludeIds: [...customSeenIds],
-      enrichTop: first ? 1 : 0,
-      rank: customBaseScore,
+    if (!successful) throw new Error('全候補ソースの取得に失敗');
+    customMergeNextIds(nextIds);
+    const prepared = await prepareCandidates(customCollect(results), {
+      excludeIds: [...customSeenIds, ...seenTimes.keys()],
+      enrichTop: 0, rank: customBaseScore
     });
-    const ranked = customDiversify(prepared);
-    return ranked.slice(0, CUSTOM_TARGET);
+    return customDiversify(prepared).slice(0, CUSTOM_TARGET);
   }
 
   function customResetState() {
@@ -1695,74 +1722,66 @@
     customQueuedIds = new Set();
     customExhausted = false;
     customBatchNumber = 0;
+    customTagOffset = 0;
+    customFollowPage = 1;
+    customFollowFinished = false;
+    customAuthorOffset = 0;
   }
 
   async function switchToCustom() {
-    if (!overlay || !feedEl) return;
+    if (!overlay || !feedEl || customBusy) return;
     feedGeneration++;
     const generation = feedGeneration;
-    rememberDisplayedSlides();
-    slides.forEach(cleanupSlide);
-    slides = [];
-    feedEl.innerHTML = '';
-    feedEl.scrollTop = 0;
+    if (zoomedSlide) clearZoom();
+    resetAutoAdvance();
+    slides.forEach(cleanupSlide); slides = [];
+    feedEl.innerHTML = ''; feedEl.scrollTop = 0;
     mode = 'custom';
-    relatedNextIds = [];
-    relatedLoading = false;
-    relatedSwitchBusy = false;
-    customResetState();
-    customBusy = true;
-    updateCounter();
-    const button = overlay.querySelector('.pts-custom');
-    if (button) { button.disabled = true; button.textContent = '生成中…'; }
+    relatedNextIds = []; relatedLoading = false; relatedSwitchBusy = false;
+    customResetState(); customBusy = true; updateCounter();
+    const btn = overlay.querySelector('.pts-custom');
+    if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
     try {
       const items = await customFetchBatch();
       if (generation !== feedGeneration || mode !== 'custom' || overlay.style.display === 'none') return;
-      if (items.length === 0) throw new Error('表示可能な候補がありません');
+      if (!items.length) throw new Error('表示可能な候補がありません');
       addItems(candidatesToSlides(items));
-      for (const it of items) customSeenIds.add(String(it.id));
+      for (const it of items) customSeenIds.add(String(it.id)); // 提示済み。既読は別
       customBatchNumber++;
-      const firstSlide = slides[0];
-      if (firstSlide) {
-        firstSlide.isCurrent = true;
-        resolveSlide(firstSlide);
-        armWatchdog(firstSlide);
-      }
+      if (slides[0]) resolveSlide(slides[0]);
       markCurrentFromScroll();
     } catch (e) {
       if (generation === feedGeneration && mode === 'custom') {
         console.warn('[PTS custom]', e);
-        const c = overlay.querySelector('.pts-counter');
-        if (c) c.textContent = '自前フィード失敗: ' + (e.message || e);
+        overlay.querySelector('.pts-counter').textContent = '自前フィード失敗: ' + (e.message || e);
       }
     } finally {
       if (generation === feedGeneration && mode === 'custom') {
         customBusy = false;
-        if (button) { button.disabled = false; button.textContent = '自前フィード'; }
+        if (btn) { btn.disabled = false; btn.textContent = '自前フィード'; }
       }
     }
   }
 
   async function customLoadMore() {
-    if (mode !== 'custom' || customBusy || customExhausted || !overlay || overlay.style.display === 'none') return;
+    if (mode !== 'custom' || customBusy || customExhausted ||
+        !overlay || overlay.style.display === 'none') return;
     customBusy = true;
     const generation = feedGeneration;
     try {
       const items = await customFetchBatch();
       if (generation !== feedGeneration || mode !== 'custom') return;
-      const existing = new Set(slides.map((s) => String(s.id)));
-      const selected = items.filter((it) => !existing.has(String(it.id))
-        && !customSeenIds.has(String(it.id))
-        && !knownBookmarkedIds.has(String(it.id)));
-      if (selected.length > 0) {
+      const existing = new Set(slides.map(s => String(s.id)));
+      const selected = items.filter(it => !existing.has(String(it.id)) &&
+        !customSeenIds.has(String(it.id)) && !isSeen(it.id) &&
+        !knownBookmarkedIds.has(String(it.id)));
+      if (selected.length) {
         addItems(candidatesToSlides(selected));
         for (const it of selected) customSeenIds.add(String(it.id));
       }
       customBatchNumber++;
-      const noMoreSeeds = customSeedOffset >= (bookmarkHistory.works || []).length;
-      if (selected.length === 0 && noMoreSeeds && customNextIds.length === 0) {
-        customExhausted = true;
-      }
+      if (!selected.length && customSeedOffset >= (bookmarkHistory.works || []).length &&
+          !customNextIds.length && customFollowFinished) customExhausted = true;
     } catch (e) {
       console.warn('[PTS custom] 続き取得失敗', e);
     } finally {
@@ -1795,15 +1814,491 @@
     updateCounter();
   }
 
+  /* ---------- v3.11: 既読・セッション・体験制御 ---------- */
+  const SEEN_KEY = 'PTS_SEEN_V1';
+  const SEEN_LIFE = 90 * 86400000;
+  const SEEN_MAX = 5000;
+  const seenTimes = new Map();
+  const sessionTrail = [];
+  const sessionSaved = [];
+  const POSITIVE_KEY = 'PTS_POSITIVE_V1';
+  const positiveSignals = new Set();
+  try {
+    const saved = JSON.parse(localStorage.getItem(POSITIVE_KEY) || '[]');
+    if (Array.isArray(saved)) {
+      for (const key of saved.slice(-10000)) {
+        if (/^\d+:(long|loop)$/.test(String(key))) positiveSignals.add(String(key));
+      }
+    }
+  } catch (e) { /* 未保存なら空から開始 */ }
+  let sessionBackTarget = '';
+  let activeView = null;
+  let activeTick = null;
+  let keepCurrent = false;
+  let immersive = false;
+  let uiHideTimer = null;
+  let zoomedSlide = null;
+  let reloadTimes = [];
+  let effectsReduced = false;
+  let closeConfirmTimer = null;
+  let experienceInstalled = false;
+  let autoKey = '';
+  let touchStart = null;
+  let lastTap = null;
+  let singleTapTimer = null;
+
+  function loadSeenTimes() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(SEEN_KEY) || '{}');
+      const now = Date.now();
+      for (const [id, time] of Object.entries(raw)) {
+        if (/^\d+$/.test(id) && Number.isFinite(time)
+            && time > now - SEEN_LIFE && time <= now) seenTimes.set(id, time);
+      }
+      trimSeenTimes();
+    } catch (e) { console.warn('[PTS] 既読読み込み失敗', e); }
+  }
+  function trimSeenTimes() {
+    if (seenTimes.size <= SEEN_MAX) return;
+    const sorted = [...seenTimes].sort((a, b) => a[1] - b[1]);
+    for (const [id] of sorted.slice(0, seenTimes.size - SEEN_MAX)) seenTimes.delete(id);
+  }
+  let seenSaveTimer = null;
+  function saveSeenTimes() {
+    clearTimeout(seenSaveTimer); seenSaveTimer = null;
+    trimSeenTimes();
+    try { localStorage.setItem(SEEN_KEY, JSON.stringify(Object.fromEntries(seenTimes))); }
+    catch (e) { console.warn('[PTS] 既読保存失敗', e); }
+  }
+  function markSeen(id) {
+    if (!/^\d+$/.test(String(id))) return;
+    seenTimes.set(String(id), Date.now());
+    trimSeenTimes();
+    clearTimeout(seenSaveTimer);
+    seenSaveTimer = setTimeout(saveSeenTimes, 1500);
+  }
+  function isSeen(id) { return seenTimes.has(String(id)); }
+  loadSeenTimes();
+  window.addEventListener('pagehide', saveSeenTimes);
+
+  function visibleReady(s) {
+    if (!s || !s.resolved) return false;
+    if (s.kind === 'ugoira') return !!(s.frameUrls && s.frameUrls.length);
+    const img = s.mainImg;
+    return !!(img && img.complete && img.naturalWidth > 0);
+  }
+  function resetAutoAdvance() {
+    autoKey = '';
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+  }
+  function syncDock() {
+    if (!overlay || !experienceInstalled) return;
+    const s = slides[currentIndex()];
+    const set = (sel, label) => {
+      const el = overlay.querySelector(sel);
+      if (el) el.textContent = label;
+    };
+    set('.pts-dock-save', s && (s.bookmarked || knownBookmarkedIds.has(String(s.id))) ? '✓ 保存済' : '🔖 保存');
+    set('.pts-dock-auto', autoSec ? '⏸ 自動ON' : '▶ 自動OFF');
+    set('.pts-dock-keep', keepCurrent ? '📌 キープ中' : '📌 キープ');
+    set('.pts-dock-fit', overlay.classList.contains('pts-fit-contain') ? '全体表示' : '画面充填');
+    set('.pts-dock-immersive', immersive ? 'UI表示' : '没入');
+  }
+  function noteSessionVisit(s) {
+    if (!s || !s.id) return;
+    const id = String(s.id);
+    if (sessionBackTarget === id) { sessionBackTarget = ''; return; }
+    if (sessionTrail.at(-1)?.id === id) return;
+    sessionTrail.push({ id, title: s.title || id, thumb: s.thumb || '' });
+    if (sessionTrail.length > 50) sessionTrail.shift();
+  }
+  function onCurrentSlideChanged(s) {
+    if (!s || activeView?.slide === s) return;
+    activeView = { slide: s, elapsed: 0, last: performance.now(), recorded: false,
+      long: false, loop: false, loopCompleted: false };
+    if (zoomedSlide && zoomedSlide !== s) clearZoom();
+    resetAutoAdvance();
+    syncDock();
+  }
+  function applyPositive(s, kind, weight) {
+    const key = `${s.id}:${kind}`;
+    if (positiveSignals.has(key) || !s.tags?.length) return;
+    positiveSignals.add(key);
+    const recent = [...positiveSignals].slice(-10000);
+    if (positiveSignals.size > 10000) {
+      positiveSignals.clear(); recent.forEach(k => positiveSignals.add(k));
+    }
+    try { localStorage.setItem(POSITIVE_KEY, JSON.stringify(recent)); }
+    catch (e) { console.warn('[PTS] 学習履歴保存失敗', e); }
+    learnFromWork(s.tags, s.userId, s.rawType, weight);
+  }
+
+  function tickViewing() {
+    if (!overlay || overlay.style.display === 'none' || !activeView) return;
+    const v = activeView, now = performance.now();
+    const dt = Math.max(0, Math.min(1000, now - v.last));
+    v.last = now;
+    const s = v.slide;
+    if (document.hidden || slides[currentIndex()] !== s || !s.isCurrent || !visibleReady(s)) return;
+    v.elapsed += dt;
+    if (!v.recorded && v.elapsed >= 1000) {
+      v.recorded = true; markSeen(s.id); noteSessionVisit(s);
+    }
+    if (!v.long && v.elapsed >= 20000) {
+      v.long = true; applyPositive(s, 'long', 0.25);
+    }
+    if (!v.loop && v.loopCompleted && v.elapsed >= 5000) {
+      v.loop = true; applyPositive(s, 'loop', 0.4);
+    }
+    s.sectionEl?.classList.toggle('pts-slow',
+      !effectsReduced && s.kind !== 'ugoira' && !zoomedSlide);
+  }
+  function onUgoiraLoop(s) {
+    if (activeView?.slide === s) activeView.loopCompleted = true;
+    if (s.isCurrent && autoSec && !keepCurrent && !zoomedSlide && !document.hidden) {
+      void advanceWhenReady(s);
+    }
+  }
+
+  function clearZoom() {
+    if (!zoomedSlide) return;
+    if (zoomedSlide.mainImg) {
+      zoomedSlide.mainImg.style.transform = '';
+      zoomedSlide.mainImg.style.transformOrigin = '';
+    }
+    zoomedSlide.sectionEl?.classList.remove('pts-zoomed');
+    zoomedSlide = null;
+    if (feedEl) feedEl.style.overflowY = '';
+    resetAutoAdvance();
+    scheduleAutoAdvance(currentIndex());
+  }
+  function toggleZoom(s, x, y) {
+    if (!s?.mainImg) return;
+    if (zoomedSlide === s) { clearZoom(); return; }
+    clearZoom();
+    const rect = s.mainImg.getBoundingClientRect();
+    const px = Math.min(100, Math.max(0, ((x - rect.left) / Math.max(1, rect.width)) * 100));
+    const py = Math.min(100, Math.max(0, ((y - rect.top) / Math.max(1, rect.height)) * 100));
+    s.mainImg.style.transformOrigin = `${px}% ${py}%`;
+    s.mainImg.style.transform = 'scale(2)';
+    s.sectionEl?.classList.add('pts-zoomed');
+    zoomedSlide = s;
+    feedEl.style.overflowY = 'hidden';
+    resetAutoAdvance();
+  }
+  function showControlsTemporarily() {
+    if (!overlay) return;
+    overlay.classList.add('pts-controls-show');
+    overlay.classList.remove('pts-top-hidden');
+    clearTimeout(uiHideTimer);
+    uiHideTimer = setTimeout(() => {
+      if (immersive) overlay.classList.remove('pts-controls-show');
+      else overlay.classList.add('pts-top-hidden');
+    }, 2500);
+  }
+  function setImmersive(on) {
+    immersive = !!on;
+    overlay.classList.toggle('pts-immersive', immersive);
+    overlay.classList.toggle('pts-controls-show', !immersive);
+    if (immersive) {
+      overlay.classList.add('pts-top-hidden');
+      clearTimeout(uiHideTimer);
+    } else showControlsTemporarily();
+    syncDock();
+  }
+  function handleImageTap(e) {
+    const holder = e.target.closest('.pts-holder');
+    if (!holder) return;
+    // 元の renderSlide のタップ送りより先に処理する。
+    e.stopImmediatePropagation();
+    if (!touchStart || Math.hypot(e.clientX - touchStart.x, e.clientY - touchStart.y) > 12) return;
+    const s = slides[currentIndex()];
+    if (!s || !holder.closest('.pts-slide')?.isSameNode(s.sectionEl)) return;
+    const now = performance.now();
+    if (lastTap && lastTap.id === s.id && now - lastTap.time < 280 &&
+        Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 45) {
+      clearTimeout(singleTapTimer); singleTapTimer = null; lastTap = null;
+      toggleZoom(s, e.clientX, e.clientY);
+      return;
+    }
+    lastTap = { id: s.id, time: now, x: e.clientX, y: e.clientY };
+    clearTimeout(singleTapTimer);
+    singleTapTimer = setTimeout(() => {
+      lastTap = null;
+      if (immersive) { showControlsTemporarily(); return; }
+      if (zoomedSlide || s.kind === 'multi') return;
+      const r = holder.getBoundingClientRect();
+      gotoSlide(currentIndex() + ((e.clientX - r.left) / r.width < .33 ? -1 : 1));
+    }, 280);
+  }
+
+  function historyBack() {
+    if (!sessionTrail.length) return;
+    if (sessionTrail.at(-1)?.id === String(slides[currentIndex()]?.id)) {
+      if (sessionTrail.length < 2) return;
+      sessionTrail.pop();
+    }
+    const prev = sessionTrail.at(-1);
+    const idx = slides.findIndex(s => String(s.id) === prev.id);
+    if (idx >= 0) { sessionBackTarget = prev.id; gotoSlide(idx); }
+  }
+  function showSessionHistory() {
+    const panel = overlay.querySelector('.pts-history-panel');
+    const list = panel.querySelector('.pts-history-list');
+    list.replaceChildren();
+    for (const item of [...sessionTrail].reverse()) {
+      const btn = document.createElement('button');
+      const available = slides.some(s => String(s.id) === item.id);
+      btn.textContent = `${available ? '▶' : '—'} ${item.title || item.id} (${item.id})`;
+      btn.disabled = !available;
+      btn.addEventListener('click', () => {
+        panel.hidden = true;
+        const idx = slides.findIndex(s => String(s.id) === item.id);
+        if (idx >= 0) { sessionBackTarget = item.id; gotoSlide(idx); }
+      });
+      list.appendChild(btn);
+    }
+    if (!list.childElementCount) list.textContent = '閲覧履歴はまだありません';
+    panel.hidden = false;
+  }
+  function recordSessionSave(s) {
+    if (!s || sessionSaved.some(x => x.id === String(s.id))) return;
+    sessionSaved.push({ id: String(s.id), title: s.title, url: s.thumb,
+      userName: s.author, userId: s.userId, tags: s.tags || [],
+      illustType: s.rawType, bookmarkData: { id: s.id } });
+  }
+  function switchToSaved() {
+    if (!overlay || !feedEl) return;
+    if (!sessionSaved.length) {
+      const n = overlay.querySelector('.pts-counter');
+      if (n) n.textContent = 'このセッションで保存した作品はまだありません';
+      return;
+    }
+    feedGeneration++;
+    clearZoom(); resetAutoAdvance();
+    slides.forEach(cleanupSlide);
+    slides = []; feedEl.replaceChildren(); feedEl.scrollTop = 0;
+    mode = 'saved';
+    const items = sessionSaved.map(it => {
+      const s = newSlide(it.id, it.url, it.title, it.userName);
+      s.tags = it.tags; s.userId = it.userId; s.rawType = it.illustType;
+      s.bookmarked = true; return s;
+    });
+    addItems(items);
+    items.forEach(paintBookmarkBtn);
+    markCurrentFromScroll();
+  }
+  function confirmCloseViewer() {
+    const btn = overlay?.querySelector('.pts-close');
+    if (!btn) return;
+    if (btn.dataset.confirm === '1') {
+      clearTimeout(closeConfirmTimer);
+      btn.dataset.confirm = '0'; closeViewer(); return;
+    }
+    btn.dataset.confirm = '1'; btn.textContent = '本当に閉じる？';
+    clearTimeout(closeConfirmTimer);
+    closeConfirmTimer = setTimeout(() => {
+      btn.dataset.confirm = '0'; btn.textContent = '閉じる';
+    }, 2500);
+  }
+
+  function installExperienceUI() {
+    if (experienceInstalled || !overlay) return;
+    experienceInstalled = true;
+    const dock = document.createElement('nav');
+    dock.className = 'pts-dock';
+    dock.setAttribute('aria-label', 'ビューア操作');
+    dock.innerHTML = [
+      ['save','🔖 保存'], ['auto','⏸ 自動ON'], ['keep','📌 キープ'],
+      ['immersive','没入'], ['back','↩ 戻る'], ['history','履歴'],
+      ['custom','自前フィード'], ['saved','保存分'], ['related','関連へ'],
+      ['page','ページ'], ['fit','画面充填'], ['tools','その他']
+    ].map(([k,t]) => `<button type="button" class="pts-dock-${k}" data-act="${k}">${t}</button>`).join('');
+    overlay.appendChild(dock);
+    const tools = document.createElement('div');
+    tools.className = 'pts-tools'; tools.hidden = true;
+    overlay.appendChild(tools);
+    // 既存イベントと診断はそのまま使う。閉じるだけ誤タップ防止用に付け替え。
+    for (const sel of ['.pts-quality','.pts-auto','.pts-custom','.pts-rescan','.pts-diagnostic']) {
+      const el = overlay.querySelector('.pts-bar ' + sel);
+      if (el) tools.appendChild(el);
+    }
+    const oldClose = overlay.querySelector('.pts-close');
+    if (oldClose) {
+      const replacement = oldClose.cloneNode(true);
+      replacement.textContent = '閉じる';
+      oldClose.replaceWith(replacement);
+      replacement.addEventListener('click', confirmCloseViewer);
+      tools.appendChild(replacement);
+    }
+    const openPage = document.createElement('button');
+    openPage.textContent = 'pixivで開く';
+    openPage.type = 'button';
+    openPage.addEventListener('click', () => {
+      const s = slides[currentIndex()];
+      if (s) window.open(s.page, '_blank', 'noopener');
+    });
+    tools.appendChild(openPage);
+    const panel = document.createElement('div');
+    panel.className = 'pts-history-panel'; panel.hidden = true;
+    panel.innerHTML = '<div class="pts-history-sheet"><div class="pts-history-head">閲覧履歴（最新50件）<button type="button" class="pts-history-close">閉じる</button></div><div class="pts-history-list"></div></div>';
+    overlay.appendChild(panel);
+    panel.querySelector('.pts-history-close').addEventListener('click', () => { panel.hidden = true; });
+    dock.addEventListener('click', e => {
+      const act = e.target.closest('button')?.dataset.act;
+      const s = slides[currentIndex()];
+      if (!act) return;
+      showControlsTemporarily();
+      if (act === 'save' && s) void toggleBookmark(s, s.bookmarkBtn);
+      if (act === 'auto') {
+        autoSec = autoSec ? 0 : 5;
+        const select = overlay.querySelector('.pts-auto');
+        if (select) select.value = String(autoSec);
+        resetAutoAdvance(); scheduleAutoAdvance(currentIndex());
+      }
+      if (act === 'keep') { keepCurrent = !keepCurrent; resetAutoAdvance(); scheduleAutoAdvance(currentIndex()); }
+      if (act === 'immersive') setImmersive(!immersive);
+      if (act === 'back') historyBack();
+      if (act === 'history') showSessionHistory();
+      if (act === 'custom') void switchToCustom();
+      if (act === 'saved') switchToSaved();
+      if (act === 'related' && s) void switchToRelated(s, null);
+      if (act === 'page') buildFeed();
+      if (act === 'fit') overlay.classList.toggle('pts-fit-contain');
+      if (act === 'tools') tools.hidden = !tools.hidden;
+      syncDock();
+    });
+
+    feedEl.addEventListener('pointerdown', e => {
+      if (e.target.closest('.pts-holder')) touchStart = { x:e.clientX, y:e.clientY };
+    }, true);
+    feedEl.addEventListener('pointerup', handleImageTap, true);
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape' || overlay.style.display === 'none') return;
+      e.stopImmediatePropagation(); e.preventDefault(); confirmCloseViewer();
+    }, true);
+    if (!activeTick) activeTick = setInterval(tickViewing, 250);
+    const style = document.createElement('style');
+    style.textContent = `
+      #pts-overlay .pts-bar{pointer-events:none;justify-content:center;background:linear-gradient(#0009,transparent);transition:opacity .2s}
+      #pts-overlay.pts-top-hidden .pts-bar{opacity:0}
+      #pts-overlay .pts-meta,#pts-overlay .pts-related,#pts-overlay .pts-bookmark,#pts-overlay .pts-open{display:none!important}
+      #pts-overlay .pts-img{display:block;width:100%;height:100%;max-width:none;max-height:none;object-fit:cover}
+      #pts-overlay.pts-fit-contain .pts-img{object-fit:contain}
+      #pts-overlay .pts-dock{position:absolute;bottom:0;left:0;right:0;z-index:19;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;padding:8px 8px calc(8px + env(safe-area-inset-bottom));background:linear-gradient(transparent,#000c 20%,#000d);transition:opacity .2s}
+      #pts-overlay .pts-dock button{min-height:44px;border:1px solid #ffffff28;background:#202020a8;color:#fff;border-radius:12px;font-size:12px;touch-action:manipulation}
+      #pts-overlay .pts-tools{position:absolute;bottom:calc(164px + env(safe-area-inset-bottom));left:8px;right:8px;z-index:21;background:#151515e8;border:1px solid #5558;border-radius:12px;padding:10px;display:flex;flex-wrap:wrap;gap:8px;max-height:40vh;overflow:auto}
+      #pts-overlay .pts-tools[hidden],#pts-overlay .pts-history-panel[hidden]{display:none!important}
+      #pts-overlay .pts-tools button,#pts-overlay .pts-tools select{margin:0;padding:9px;color:white;background:#444;border:0;border-radius:8px}
+      #pts-overlay .pts-history-panel{position:absolute;inset:0;z-index:35;background:#000d;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}
+      #pts-overlay .pts-history-sheet{width:100%;max-width:900px;height:80dvh;background:#151515;color:white;border:1px solid #555;border-radius:12px;display:flex;flex-direction:column;padding:12px;box-sizing:border-box}
+      #pts-overlay .pts-history-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px}
+      #pts-overlay .pts-history-head button{padding:10px;border-radius:8px;background:#444;color:white;border:0}
+      #pts-overlay .pts-history-list{display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0}
+      #pts-overlay .pts-history-list button{padding:11px;text-align:left;background:#303030;color:#fff;border:0;border-radius:7px}
+      #pts-overlay .pts-history-list button:disabled{opacity:.4}
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-dock,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-bar,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-tools,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-pagechip,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-seek{opacity:0;pointer-events:none}
+      #pts-overlay .pts-slide.pts-current .pts-holder{animation:ptsIn .16s ease-out}
+      @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
+      #pts-overlay .pts-slide.pts-slow:not(.pts-zoomed) .pts-img{animation:ptsSlow 5s ease-out both}
+      @keyframes ptsSlow{from{transform:scale(1)}to{transform:scale(1.025)}}
+      #pts-overlay .pts-zoomed .pts-img{transition:transform .18s ease-out!important;animation:none!important}
+      #pts-overlay .pts-holder{touch-action:manipulation}
+      #pts-overlay .pts-zoomed .pts-holder{touch-action:none}
+      #pts-overlay.pts-low-effects .pts-current .pts-holder{animation:none!important}
+      @media(prefers-reduced-motion:reduce){#pts-overlay .pts-img,#pts-overlay .pts-holder{animation:none!important;transition:none!important}}
+    `;
+    document.head.appendChild(style);
+    const sel = overlay.querySelector('.pts-auto');
+    if (sel) sel.value = String(autoSec);
+    syncDock();
+  }
+
+  // 候補一覧の形をソースごとに吸収。IDだけの作者profile/allは採用しない。
+  function customCandidateArray(body) {
+    const preferred = [body?.illustManga?.data, body?.thumbnails?.illust,
+      body?.illusts, body?.works, body?.items, body?.data];
+    for (const a of preferred) if (Array.isArray(a) &&
+        a.some(x => x && (x.id != null || x.illustId != null))) return a;
+    const q = [{o:body, d:0}];
+    let traversed = 0;
+    while (q.length && traversed++ < 50) {
+      const {o,d} = q.shift();
+      if (!o || typeof o !== 'object' || d >= 3) continue;
+      for (const v of Object.values(o).slice(0,30)) {
+        if (Array.isArray(v) && v.some(x => x && typeof x === 'object' &&
+            (x.id != null || x.illustId != null))) return v;
+        if (v && !Array.isArray(v) && typeof v === 'object') q.push({o:v,d:d+1});
+      }
+    }
+    return [];
+  }
+  let customTagOffset = 0;
+  let customFollowPage = 1;
+  let customFollowFinished = false;
+  let customAuthorOffset = 0;
+
+  /* ---------- v3.11: advanceWhenReady 最終版（24/24） ---------- */
+  async function advanceWhenReady(s) {
+    if (!slides.includes(s) || !s.isCurrent || !autoSec ||
+        keepCurrent || zoomedSlide || document.hidden || s.advancePending) return;
+    s.advancePending = true;
+    const generation = feedGeneration;
+    try {
+      const idx = slides.indexOf(s);
+      if (idx === slides.length - 1) {
+        if (mode === 'custom' && !customBusy && !customExhausted &&
+            Date.now() - (s.lastFetchAttempt || 0) > 8000) {
+          s.lastFetchAttempt = Date.now();
+          await customLoadMore();
+        } else if (mode === 'related' && relatedNextIds.length) {
+          await relatedLoadMore();
+        } else if (mode === 'page' && !pageLoadBusy && pageLoadMisses < 4) {
+          pageLoadMore();
+        }
+      }
+      if (generation !== feedGeneration || slides[idx] !== s ||
+          !s.isCurrent || !autoSec || keepCurrent || zoomedSlide) return;
+      const next = slides[idx + 1];
+      if (!next) {
+        if (mode === 'saved' && slides.length > 1) gotoSlide(0);
+        else if ((mode === 'custom' && !customExhausted) ||
+                 (mode === 'related' && relatedNextIds.length) ||
+                 (mode === 'page' && pageLoadMisses < 4)) {
+          setTimeout(() => { if (s.isCurrent) void advanceWhenReady(s); }, 1200);
+        }
+        return;
+      }
+      if (!next.resolved) void resolveSlide(next);
+      if (!visibleReady(next)) {
+        setTimeout(() => { if (s.isCurrent) void advanceWhenReady(s); }, 550);
+        return;
+      }
+      gotoSlide(idx + 1);
+    } finally {
+      s.advancePending = false;
+    }
+  }
+
+  // 非表示中の経過時間を自動送りへ持ち越さない。
+  document.addEventListener('visibilitychange', () => {
+    resetAutoAdvance();
+    if (activeView) activeView.last = performance.now();
+    if (document.visibilityState === 'visible' && overlay?.style.display !== 'none') {
+      scheduleAutoAdvance(currentIndex());
+    }
+  });
+
   /* ---------- 片手・ハンズフリー向け機能 ---------- */
 
-  let autoSec = 0;
+  let autoSec = 5;
   let autoTimer = null;
   let wakeLock = null;
   let csrfToken = null;
 
   function gotoSlide(i) {
     if (!feedEl || i < 0 || i >= slides.length) return;
+    if (zoomedSlide) clearZoom();
     feedEl.scrollTo({ top: i * feedEl.clientHeight, behavior: 'smooth' });
   }
 
@@ -1814,14 +2309,23 @@
 
   // 自動送り：表示が落ち着いたらタイマーを張り直す。うごイラは1ループ分は最低待つ
   function scheduleAutoAdvance(idx) {
-    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-    if (!autoSec || !overlay || overlay.style.display === 'none') return;
     const s = slides[idx];
-    let delay = autoSec * 1000;
-    if (s && s.kind === 'ugoira' && s.animTotal) delay = Math.max(delay, Math.min(s.animTotal, 60000));
-    autoTimer = setTimeout(() => {
-      if (idx + 1 < slides.length) gotoSlide(idx + 1);
-    }, delay);
+    if (!s || !autoSec || keepCurrent || zoomedSlide ||
+        !overlay || overlay.style.display === 'none' || document.hidden) {
+      resetAutoAdvance(); return;
+    }
+    const key = `${mode}/${idx}/${s.id}/${autoSec}`;
+    if (autoKey === key) return;
+    resetAutoAdvance(); autoKey = key;
+    const poll = () => {
+      if (autoKey !== key || !s.isCurrent || keepCurrent || !autoSec || zoomedSlide) return;
+      if (!visibleReady(s)) { autoTimer = setTimeout(poll, 250); return; }
+      if (s.kind === 'ugoira') { if (!s.animTimer) startUgoira(s); return; }
+      autoTimer = setTimeout(() => {
+        if (autoKey === key && s.isCurrent) void advanceWhenReady(s);
+      }, autoSec * 1000);
+    };
+    autoTimer = setTimeout(poll, 250);
   }
 
   // 画面が消えないようにする（対応ブラウザのみ）
@@ -1950,28 +2454,24 @@
   }
 
   async function toggleBookmark(s, btn) {
-    if (s.bookmarked) {
-      paintBookmarkBtn(s);
-      return;
-    }
+    if (!s || !btn) return;
+    if (s.bookmarked) { paintBookmarkBtn(s); syncDock(); return; }
     btn.disabled = true;
     btn.textContent = '保存中…';
     try {
-      // 共通処理：pixivへの保存・状態更新・学習
       const newlySaved = await ensureBookmarked(s);
-      // 通常の保存操作だけ、おすすめを直後に差し込む
-      if (newlySaved && mode !== 'custom') {
-        insertRecommendationsAfterBookmark(s);
+      if (newlySaved) {
+        recordSessionSave(s);
+        if (mode !== 'custom' && mode !== 'saved') void insertRecommendationsAfterBookmark(s);
       }
     } catch (e) {
-      // 並行して別の保存処理が成功した場合は失敗表示しない
-      if (s.bookmarked) {
-        paintBookmarkBtn(s);
-        return;
+      if (!s.bookmarked) {
+        console.warn('[PTS] ブックマーク失敗', e);
+        btn.textContent = '保存失敗 もう一度タップ';
       }
-      console.warn('[PTS] ブックマーク失敗', e);
-      btn.textContent = '保存失敗 もう一度タップ';
+    } finally {
       btn.disabled = false;
+      syncDock();
     }
   }
 
@@ -1989,23 +2489,20 @@
 
   function buildFeed() {
     feedGeneration++;
+    if (zoomedSlide) clearZoom();
+    resetAutoAdvance();
     customResetState();
-    relatedNextIds = [];
-    relatedLoading = false;
-    relatedSwitchBusy = false;
-    slides.forEach(cleanupSlide);
-    slides = [];
-    mode = 'page';
-    pageLoadMisses = 0;
-    feedEl.innerHTML = '';
+    relatedNextIds = []; relatedLoading = false; relatedSwitchBusy = false;
+    slides.forEach(cleanupSlide); slides = []; mode = 'page';
+    pageLoadMisses = 0; feedEl.innerHTML = ''; feedEl.scrollTop = 0;
     addItems(scanPage());
-    // 最初の1枚を最優先で即解決し、次は間隔を空けて続ける（一斉に始めると最初の1枚が遅くなる）
     if (slides[0]) {
       slides[0].isCurrent = true;
-      resolveSlide(slides[0]);
-      armWatchdog(slides[0]);
+      resolveSlide(slides[0]); armWatchdog(slides[0]);
     }
-    slides.slice(1, 4).forEach((s, i) => setTimeout(() => { if (slides.includes(s)) resolveSlide(s); }, 350 * (i + 1)));
+    slides.slice(1, 4).forEach((s, i) => setTimeout(() => {
+      if (slides.includes(s)) resolveSlide(s);
+    }, 350 * (i + 1)));
     setTimeout(markCurrentFromScroll, 400);
   }
 
@@ -3192,26 +3689,35 @@
 
   function openViewer() {
     buildOverlay();
-    // 診断ボタンとパネルを一度だけ設置する（この時点では診断は実行しない）
     installDiagnosticUI();
+    installExperienceUI();
     overlay.style.display = 'block';
     keepAwake(true);
+    setImmersive(false);
+    keepCurrent = false;
+    sessionTrail.length = 0;
+    sessionSaved.length = 0;
+    activeView = null;
     buildFeed();
     setTimeout(() => pageLoadMore(), 800);
     setTimeout(() => pageLoadMore(), 2500);
   }
 
   function closeViewer() {
-    // 診断中なら通信を中止し、パネルを閉じる
     closeDiagnosticPanel();
+    clearTimeout(uiHideTimer); clearTimeout(singleTapTimer);
+    clearTimeout(closeConfirmTimer);
+    overlay.querySelector('.pts-history-panel')?.setAttribute('hidden', '');
+    if (zoomedSlide) clearZoom();
+    resetAutoAdvance();
     feedGeneration++;
     customResetState();
     overlay.style.display = 'none';
     keepAwake(false);
-    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-    slides.forEach(cleanupSlide);
-    slides = [];
+    slides.forEach(cleanupSlide); slides = [];
     if (feedEl) feedEl.innerHTML = '';
+    activeView = null;
+    saveSeenTimes();
   }
 
   function buildOverlay() {

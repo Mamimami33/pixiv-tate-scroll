@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.14
+// @version      3.13.15
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -3734,11 +3734,42 @@
     return tags.some(t => t.includes(query)) ? 1 : 0;
   }
 
+  // 検索専用。関連度は最大400点に収め、1000点刻みのtierを維持する。
+  const SEARCH_TASTE_WEIGHT = 0.3;
+  const SEARCH_WORD_TAG_WEIGHT = 40;
+  const SEARCH_RELATED_TAG_WEIGHT = 24;
+
+  function searchRelatedTags(body) {
+    const lists = [body?.relatedTags, body?.illustManga?.relatedTags,
+      body?.tagSuggestions, body?.suggestTags];
+    return [...new Set(lists.flatMap(items =>
+      Array.isArray(items) ? items.map(it => typeof it === 'string'
+        ? it : it?.tag ?? it?.name ?? it?.word) : []
+    ).filter(t => typeof t === 'string' && t.trim()).map(t =>
+      t.normalize('NFKC').trim().toLocaleLowerCase()))];
+  }
+
+  function searchWordRelevance(it, word, relatedTags = []) {
+    const query = String(word || '').normalize('NFKC')
+      .trim().toLocaleLowerCase();
+    if (!query) return 0;
+    const tags = [...new Set(normTags(it.tags).map(t =>
+      String(t).normalize('NFKC').toLocaleLowerCase()))];
+    const matches = tags.filter(t => t.includes(query)).length;
+    const related = tags.filter(t => t !== query && relatedTags.includes(t)).length;
+    return Math.min(400,
+      Math.min(8, matches) * SEARCH_WORD_TAG_WEIGHT +
+      Math.min(8, related) * SEARCH_RELATED_TAG_WEIGHT
+    );
+  }
+
   function searchPrioritize(
     items, word, previous = [], boosts = new Set(), source = null,
-    limit = Infinity
+    limit = Infinity, relatedTags = []
   ) {
-    const pool = items.slice();
+    // 保存後は一致候補だけを選ぶ。既存テールの非一致作品は末尾に残す。
+    const unmatched = source ? items.filter(it => !searchWordTier(it, word)) : [];
+    const pool = source ? items.filter(it => searchWordTier(it, word) > 0) : items.slice();
     const ordered = [];
     let repeated = 0;
 
@@ -3764,7 +3795,8 @@
 
         // 検索一致の1000点刻みは分散点より優先。
         let score = searchWordTier(it, word) * 1000 +
-          tasteScore(normalized) +
+          searchWordRelevance(it, word, relatedTags) +
+          tasteScore(normalized) * SEARCH_TASTE_WEIGHT +
           (boosts.has(String(it.id)) ? 14 : 0);
 
         if (author && author === a) score -= 12;
@@ -3789,7 +3821,7 @@
       }
     }
 
-    return Number.isFinite(limit) ? ordered : [...ordered, ...pool];
+    return Number.isFinite(limit) ? ordered : [...ordered, ...pool, ...unmatched];
   }
 
   async function fetchBookmarkRelatedCandidates(id) {
@@ -3936,7 +3968,7 @@
   }
 
   // 検索専用: 検索API候補のみを検索ワード一致優先で並べ替える。
-  async function buildSearchRankedBatch(rawSearch, word, previous = [], excludeIds = [], signal) {
+  async function buildSearchRankedBatch(rawSearch, word, previous = [], excludeIds = [], signal, relatedTags = []) {
     const exclusions = [...seenTimes.keys(), ...excludeIds];
     const prepared = await prepareCandidates(rawSearch, {
       excludeIds: exclusions, enrichTop: 0, rank: tasteScore
@@ -3946,7 +3978,9 @@
       !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
     );
     if (signal?.aborted || !searchItems.length) return [];
-    return searchPrioritize(searchItems, word, previous);
+    return searchPrioritize(
+      searchItems, word, previous, new Set(), null, Infinity, relatedTags
+    );
   }
 
   function searchGridDiversify(items) {
@@ -4285,6 +4319,7 @@
     const controller = new AbortController();
     g.controller = controller;
     const collected = [];
+    const relatedTags = new Set();
     let page = g.page, finished = false, error = null;
     try {
       for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
@@ -4309,6 +4344,7 @@
           renderGridTags(body);
           g.tagsReady = true;
         }
+        searchRelatedTags(body).forEach(tag => relatedTags.add(tag));
         collected.push(...data);
         const total = Number(body?.illustManga?.total);
         if (!data.length || (Number.isFinite(total) && total >= 0 &&
@@ -4320,7 +4356,8 @@
       if (collected.length) {
         const previous = g.items.slice(-2);
         const ranked = await buildSearchRankedBatch(
-          collected, g.config.word, previous, [...g.ids], controller.signal
+          collected, g.config.word, previous, [...g.ids], controller.signal,
+          [...relatedTags]
         );
         if (!g.open || token !== g.token) return false;
         appendGridCards(ranked); // 今あるカードは移動しない
@@ -4676,6 +4713,7 @@
     searchLastFailure = 0;
     const generation = feedGeneration;
     const collected = [];
+    const relatedTags = new Set();
     let page = searchPage, nextPage = searchPage, reachedEnd = false, failure = null;
     try {
       for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
@@ -4701,6 +4739,7 @@
           searchTagCandidates = findSearchTagCandidates(body, searchConfig.word);
           renderSearchTagCandidates();
         }
+        searchRelatedTags(body).forEach(tag => relatedTags.add(tag));
         collected.push(...data);
         nextPage = page + 1;
         const total = Number(body?.illustManga?.total);
@@ -4714,7 +4753,7 @@
       if (collected.length) {
         const previous = slides.slice(-2);
         const ranked = await buildSearchRankedBatch(
-          collected, searchConfig.word, previous
+          collected, searchConfig.word, previous, [], undefined, [...relatedTags]
         );
         if (generation !== feedGeneration || mode !== 'search') return;
         const ids = new Set(slides.map(s => String(s.id)));

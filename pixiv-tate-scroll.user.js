@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.7
+// @version      3.13.8
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -3511,19 +3511,33 @@
     cards: null, chips: null, title: null, status: null, retry: null
   };
 
+  let gridTap = null;
+
+  function clearGridTap() {
+    if (gridTap?.timer) clearTimeout(gridTap.timer);
+    gridTap = null;
+  }
+
   function closeSearchGrid(resume = true) {
     const wasOpen = searchGrid.open;
+    clearGridTap();
     searchGrid.token++;
     searchGrid.controller?.abort();
     searchGrid.controller = null;
     searchGrid.busy = false;
     searchGrid.open = false;
+
     if (searchGrid.root) searchGrid.root.hidden = true;
     overlay?.classList.remove('pts-grid-open');
-    if (wasOpen && activeView) activeView.last = performance.now();
+
+    if (wasOpen && activeView) {
+      activeView.last = performance.now();
+    }
+
     if (wasOpen && resume) {
       const s = slides[currentIndex()];
-      if (s?.isCurrent && s.kind === 'ugoira' && s.frameUrls?.length) {
+      if (s?.isCurrent && s.kind === 'ugoira' &&
+          s.frameUrls?.length) {
         startUgoira(s);
       }
     }
@@ -3532,58 +3546,220 @@
   function openSearchGrid(value) {
     const word = String(value || '').trim();
     if (!word || !overlay || !searchGrid.root) return;
+
     closeSearchGrid(false);
+
     const current = slides[currentIndex()];
     if (current?.kind === 'ugoira') stopUgoira(current);
+
     const from = getSearchPageConfig();
     searchGrid.config = {
-      word, order: from?.order || 'popular_d',
+      word,
+      order: from?.order || 'popular_d',
       searchMode: from?.searchMode || 'all',
       matchMode: from?.matchMode || 's_tag'
     };
+
     searchGrid.page = 1;
     searchGrid.finished = false;
+    searchGrid.searchBoosted = false;
     searchGrid.items = [];
     searchGrid.ids.clear();
     searchGrid.tagsReady = false;
     searchGrid.cards.replaceChildren();
     searchGrid.chips.replaceChildren();
     searchGrid.scroll.scrollTop = 0;
-    searchGrid.title.textContent = `${word} の検索結果`;
+
+    searchGrid.title.textContent = `「${word}」の検索結果`;
     searchGrid.status.textContent = '読み込み中…';
     searchGrid.retry.hidden = true;
     searchGrid.open = true;
     searchGrid.root.hidden = false;
-    overlay.classList.add('pts-grid-open');
+
+    if (overlay) {
+      overlay.classList.add('pts-grid-open');
+    }
+
     const input = overlay.querySelector('.pts-global-search input');
     if (input) input.value = word;
+
     const token = searchGrid.token;
     void (async () => {
       for (let n = 0; n < 2 && searchGrid.open &&
-        searchGrid.token === token && !searchGrid.finished &&
-        !searchGrid.items.length; n++) {
+          searchGrid.token === token && !searchGrid.finished &&
+          !searchGrid.items.length; n++) {
         const ok = await searchGridLoadMore();
         if (!ok) break;
       }
     })();
   }
 
+  function searchWordTier(it, word) {
+    const query = String(word || '').normalize('NFKC')
+      .trim().toLocaleLowerCase();
+    if (!query) return 0;
+    const tags = normTags(it.tags).map(t =>
+      String(t).normalize('NFKC').toLocaleLowerCase());
+    if (tags.includes(query)) return 2;
+    return tags.some(t => t.includes(query)) ? 1 : 0;
+  }
+
+  function searchPrioritize(items, word, previous = [], boosts = new Set()) {
+    const pool = items.slice();
+    const ordered = [];
+    while (pool.length) {
+      const tail = [...previous.slice(-2), ...ordered];
+      const a = String(tail.at(-1)?.userId || '');
+      const b = String(tail.at(-2)?.userId || '');
+      let best = 0, bestScore = -Infinity;
+      for (let i = 0; i < pool.length; i++) {
+        const it = pool[i];
+        const id = String(it.id);
+        const author = String(it.userId || '');
+        const normalized = {
+          ...it, illustType: it.illustType ?? it.rawType
+        };
+        let score = searchWordTier(it, word) * 1000 +
+          tasteScore(normalized) + (boosts.has(id) ? 14 : 0);
+        if (author && author === a) score -= 12;
+        if (author && author === b) score -= 5;
+        if (score > bestScore) {
+          bestScore = score;
+          best = i;
+        }
+      }
+      ordered.push(pool.splice(best, 1)[0]);
+    }
+    return ordered;
+  }
+
+  async function fetchSearchRelatedCandidates(id) {
+    const body = await fetchJson(
+      `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
+    );
+
+    let candidates = customCandidateArray(body);
+
+    if (!candidates.length && Array.isArray(body?.nextIds) &&
+        body.nextIds.length) {
+      const ids = body.nextIds.slice(0, 60).map(String);
+      const more = await fetchJson(
+        '/ajax/illust/recommend/illusts?illustIds=' +
+        encodeURIComponent(ids.join(',')) + '&lang=ja'
+      );
+      candidates = customCandidateArray(more);
+    }
+
+    return candidates;
+  }
+
+  function reorderSearchFeedTail(anchor, word) {
+    if (mode !== 'search' || !slides.includes(anchor) || !feedEl) return;
+
+    const pos = slides.indexOf(anchor);
+    const slots = [];
+
+    for (let i = pos + 1; i < slides.length; i++) {
+      const s = slides[i];
+      if (!s.isCurrent && !viewedThisSession.has(String(s.id))) {
+        slots.push(i);
+      }
+    }
+    if (!slots.length) return;
+
+    const boosts = anchor.searchInsertedIds || new Set();
+    const candidates = slots.map(i => slides[i]);
+    const sorted = searchPrioritize(candidates, word, [anchor], boosts);
+
+    slots.forEach((i, j) => { slides[i] = sorted[j]; });
+
+    const top = feedEl.scrollTop;
+    for (let i = slides.length - 1; i > pos; i--) {
+      const node = slides[i].sectionEl;
+      const following = slides[i + 1]?.sectionEl || null;
+      if (node && node.nextElementSibling !== following) {
+        feedEl.insertBefore(node, following);
+      }
+    }
+    feedEl.scrollTop = top;
+  }
+
+  async function improveSearchFeedAfterBookmark(s) {
+    if (!s || mode !== 'search' || !slides.includes(s) ||
+        !searchConfig?.word || s.searchImprovePromise) return;
+
+    const generation = feedGeneration;
+    const word = s.gridSearchWord || searchConfig.word;
+    const work = (async () => {
+      try {
+        const raw = await fetchSearchRelatedCandidates(s.id);
+        const prepared = await prepareCandidates(raw, {
+          excludeIds: [s.id, s.seriesNextId, ...seenTimes.keys()],
+          enrichTop: 0, rank: tasteScore
+        });
+
+        if (generation !== feedGeneration || mode !== 'search' ||
+            !slides.includes(s)) return;
+
+        const ranked = searchPrioritize(
+          prepared.filter(it => !skipStrong(it.id) && !isSeen(it.id)),
+          word, [s]
+        );
+        const chosen = ranked.slice(0, 12);
+        s.searchInsertedIds = new Set(chosen.map(it => String(it.id)));
+        if (chosen.length) {
+          const current = slides[currentIndex()];
+          const oldTop = feedEl.scrollTop;
+          const height = Math.max(1, feedEl.clientHeight);
+          insertSlidesAfter(slides.indexOf(s), candidatesToSlides(chosen));
+          if (current && current !== s && slides.includes(current)) {
+            feedEl.scrollTop =
+              slides.indexOf(current) * height + oldTop % height;
+          }
+        }
+      } catch (e) {
+        console.warn('[PTS search] 保存後の関連取得失敗', e);
+      } finally {
+        if (generation === feedGeneration && mode === 'search' &&
+            slides.includes(s)) {
+          reorderSearchFeedTail(s, word);
+          markCurrentFromScroll();
+        }
+      }
+    })();
+
+    s.searchImprovePromise = work;
+    return work;
+  }
+
   function searchGridDiversify(items) {
+    if (searchGrid.searchBoosted && searchGrid.config?.word) {
+      return searchPrioritize(
+        items, searchGrid.config.word, searchGrid.items.slice(-2)
+      );
+    }
+
     const pool = items.map(it => ({ it, base: tasteScore(it) }));
     const output = [];
     const previous = searchGrid.items.slice(-2);
+
     while (pool.length) {
       const tail = [...previous, ...output];
       const last = String(tail.at(-1)?.userId || '');
       const second = String(tail.at(-2)?.userId || '');
       let best = 0, high = -Infinity;
+
       for (let i = 0; i < pool.length; i++) {
         const author = String(pool[i].it.userId || '');
         let score = pool[i].base;
         if (author && author === last) score -= 12;
         if (author && author === second) score -= 5;
-        if (score > high) { high = score; best = i; }
+        if (score > high) {
+          high = score;
+          best = i;
+        }
       }
+
       output.push(pool.splice(best, 1)[0].it);
     }
     return output;
@@ -3611,32 +3787,253 @@
     bar.hidden = !tags.length;
   }
 
-  function appendGridCards(items) {
+  function installGridSaveCSS() {
+    if (document.getElementById('pts-grid-save-style')) return;
+    const style = document.createElement('style');
+    style.id = 'pts-grid-save-style';
+    style.textContent = `
+  #pts-overlay .pts-grid-item{position:relative;overflow:hidden}
+  #pts-overlay .pts-grid-open{
+    display:block;width:100%;height:100%;padding:0;margin:0;
+    border:0;background:transparent;touch-action:manipulation
+  }
+  #pts-overlay .pts-grid-open img{
+    display:block;width:100%;height:100%;object-fit:cover
+  }
+  #pts-overlay .pts-grid-save{
+    position:absolute;top:6px;right:6px;z-index:2;
+    min-width:30px;min-height:30px;border:1px solid #ffffff55;
+    border-radius:999px;background:#000b;color:#fff;
+    font-size:15px;touch-action:manipulation
+  }
+  #pts-overlay .pts-grid-bookmarked .pts-grid-save{
+    background:#993653ee
+  }
+  #pts-overlay .pts-grid-heart{
+    position:absolute;left:50%;top:50%;z-index:3;
+    pointer-events:none;font-size:44px;
+    animation:ptsHeart .85s ease-out forwards
+  }
+  `;
+    document.head.appendChild(style);
+  }
+
+  function createSearchGridCard(it) {
+    installGridSaveCSS();
+    const id = String(it.id);
+    const card = document.createElement('div');
+    card.className = 'pts-grid-item';
+    card.dataset.ptsId = id;
+
+    const thumb = document.createElement('button');
+    thumb.type = 'button';
+    thumb.className = 'pts-grid-open';
+    thumb.setAttribute('aria-label', it.title || `作品 ${id}`);
+
+    const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = '';
+    const src = searchGridThumbnail(it);
+    const fallback = it.url || it.urls?.small || '';
+    if (src) img.src = src;
+    if (fallback && fallback !== src) {
+      img.addEventListener('error', () => {
+        img.src = fallback;
+      }, { once: true });
+    }
+    thumb.appendChild(img);
+
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'pts-grid-save';
+    save.textContent = '♡';
+    save.setAttribute('aria-label', '作品を保存');
+    save.addEventListener('click', e => {
+      e.stopPropagation();
+      clearGridTap();
+      void saveGridArtwork(it, card, false);
+    });
+
+    thumb.addEventListener('click', () => {
+      const now = performance.now();
+      if (gridTap && gridTap.id === id && now - gridTap.time <= LIKE_TAP_WINDOW) {
+        clearGridTap();
+        void saveGridArtwork(it, card, true);
+        return;
+      }
+      clearGridTap();
+      const token = searchGrid.token;
+      gridTap = {
+        id, time: now,
+        timer: setTimeout(() => {
+          gridTap = null;
+          if (searchGrid.open && token === searchGrid.token) {
+            openGridArtwork(it);
+          }
+        }, LIKE_TAP_WINDOW)
+      };
+    });
+
+    card.append(thumb, save);
+    return card;
+  }
+
+  function appendGridCards(items, afterId = null) {
+    const g = searchGrid;
     const fragment = document.createDocumentFragment();
+    const accepted = [];
+
     for (const it of items) {
       const id = String(it.id);
-      if (searchGrid.ids.has(id)) continue;
-      searchGrid.ids.add(id);
-      searchGrid.items.push(it);
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'pts-grid-item';
-      button.setAttribute('aria-label', it.title || `作品 ${id}`);
-      const img = document.createElement('img');
-      img.loading = 'lazy';
-      img.decoding = 'async';
-      img.alt = '';
-      const src = searchGridThumbnail(it);
-      const fallback = it.url || it.urls?.small || '';
-      if (src) img.src = src;
-      if (fallback && fallback !== src) {
-        img.addEventListener('error', () => { img.src = fallback; }, { once: true });
-      }
-      button.appendChild(img);
-      button.addEventListener('click', () => openGridArtwork(it));
-      fragment.appendChild(button);
+      if (!/^\d+$/.test(id) || g.ids.has(id) ||
+          isSeen(id) || knownBookmarkedIds.has(id) ||
+          it.bookmarked) continue;
+
+      g.ids.add(id);
+      accepted.push(it);
+      fragment.appendChild(createSearchGridCard(it));
     }
-    searchGrid.cards.appendChild(fragment);
+
+    if (!accepted.length) return;
+
+    const anchor = afterId == null ? null :
+      [...g.cards.children].find(el =>
+        el.dataset.ptsId === String(afterId));
+
+    if (anchor) {
+      const index = g.items.findIndex(it =>
+        String(it.id) === String(afterId));
+      g.cards.insertBefore(fragment, anchor.nextSibling);
+      g.items.splice(index + 1, 0, ...accepted);
+    } else {
+      g.cards.appendChild(fragment);
+      g.items.push(...accepted);
+    }
+  }
+
+  async function saveGridArtwork(it, card, byLike = false) {
+    if (!searchGrid.open || card.dataset.saving === '1') return;
+
+    const token = searchGrid.token;
+    const badge = card.querySelector('.pts-grid-save');
+    card.dataset.saving = '1';
+    badge.disabled = true;
+    badge.textContent = '…';
+
+    if (byLike) {
+      const heart = document.createElement('span');
+      heart.className = 'pts-grid-heart';
+      heart.textContent = '❤️';
+      card.appendChild(heart);
+      setTimeout(() => heart.remove(), 1100);
+    }
+
+    try {
+      const s = candidatesToSlides([it])[0];
+      if (!s) return;
+
+      if (byLike) {
+        learnFromWork(s.tags, s.userId, s.rawType, 3);
+        s.tasteLearned = true;
+      }
+
+      const newlySaved = await ensureBookmarked(s);
+      if (!searchGrid.open || token !== searchGrid.token) return;
+
+      badge.textContent = '✓';
+      card.classList.add('pts-grid-bookmarked');
+
+      if (newlySaved || (byLike &&
+          card.dataset.improved !== '1')) {
+        await improveSearchGridAfterBookmark(it, card, token);
+      }
+    } catch (e) {
+      console.warn('[PTS grid] 保存失敗', e);
+      if (searchGrid.open && token === searchGrid.token) {
+        badge.textContent = '♡';
+      }
+    } finally {
+      delete card.dataset.saving;
+      badge.disabled = card.classList.contains('pts-grid-bookmarked');
+    }
+  }
+
+  function reorderSearchGridTail(anchorId, word, boosts = new Set()) {
+    const g = searchGrid;
+    if (!g.open || !g.cards) return;
+
+    const pos = g.items.findIndex(it =>
+      String(it.id) === String(anchorId));
+    if (pos < 0) return;
+
+    const head = g.items.slice(0, pos + 1);
+    const tail = searchPrioritize(
+      g.items.slice(pos + 1), word, head.slice(-2), boosts
+    );
+
+    const nodes = new Map(
+      [...g.cards.children].map(el => [el.dataset.ptsId, el])
+    );
+
+    const fragment = document.createDocumentFragment();
+    for (const it of tail) {
+      const el = nodes.get(String(it.id));
+      if (el) fragment.appendChild(el);
+    }
+
+    const scrollTop = g.scroll.scrollTop;
+    g.cards.appendChild(fragment);
+    g.items = [...head, ...tail];
+    g.scroll.scrollTop = scrollTop;
+  }
+
+  async function improveSearchGridAfterBookmark(it, card, token) {
+    const g = searchGrid;
+    if (card.dataset.improved === '1' || !g.config?.word) return;
+
+    card.dataset.improved = '1';
+    g.searchBoosted = true;
+
+    const word = g.config.word;
+    const id = String(it.id);
+    const recommended = new Set();
+
+    try {
+      const raw = await fetchSearchRelatedCandidates(id);
+      const prepared = await prepareCandidates(raw, {
+        excludeIds: [id, ...g.ids, ...seenTimes.keys()],
+        enrichTop: 0, rank: tasteScore
+      });
+
+      if (!g.open || token !== g.token) return;
+
+      const pos = g.items.findIndex(x => String(x.id) === id);
+      const previous = pos >= 0
+        ? g.items.slice(Math.max(0, pos - 1), pos + 1)
+        : [];
+
+      const ranked = searchPrioritize(
+        prepared.filter(x => !skipStrong(x.id) && !isSeen(x.id)),
+        word, previous
+      );
+
+      const selected = ranked.slice(0, 12);
+      for (const item of selected) {
+        recommended.add(String(item.id));
+      }
+
+      appendGridCards(selected, id);
+
+    } catch (e) {
+      console.warn('[PTS grid] 関連取得失敗', e);
+      delete card.dataset.improved;
+    } finally {
+      if (g.open && token === g.token) {
+        reorderSearchGridTail(id, word, recommended);
+        g.status.textContent = `${g.items.length}件表示中`;
+      }
+    }
   }
 
   async function searchGridLoadMore() {
@@ -3721,21 +4118,38 @@
 
   function openGridArtwork(it) {
     if (!searchGrid.open || !feedEl) return;
+
     const id = String(it?.id || '');
     if (!/^\d+$/.test(id)) return;
+
+    const word = searchGrid.config?.word || '';
     closeSearchGrid();
+
     let idx = slides.findIndex(s => String(s.id) === id);
+
     if (idx < 0) {
       const selected = candidatesToSlides([it])[0];
       if (!selected) return;
+
+      selected.gridSearchWord = word;
+
       if (slides.length) {
-        insertSlidesAfter(Math.min(currentIndex(), slides.length - 1), [selected]);
+        insertSlidesAfter(
+          Math.min(currentIndex(), slides.length - 1),
+          [selected]
+        );
       } else {
         addItems([selected]);
       }
+
       idx = slides.indexOf(selected);
-      if (mode === 'custom') customSeenIds.add(id);
     }
+
+    if (mode === 'custom') customSeenIds.add(id);
+    else {
+      slides[idx].gridSearchWord = word;
+    }
+
     navIntent = { reason: 'other', until: 0 };
     feedEl.scrollTop = idx * feedEl.clientHeight;
     markCurrentFromScroll();
@@ -4267,38 +4681,54 @@
   // おすすめ差し込みは呼び出し側の責務とする
   async function ensureBookmarked(s) {
     const id = String(s.id);
-    // 同じ作品の保存処理が進行中なら、そのPromiseを共有する
     if (s.bookmarkPromise) return s.bookmarkPromise;
-    // 既に保存済みなら再POSTしない
+
     if (s.bookmarked || knownBookmarkedIds.has(id)) {
       s.bookmarked = true;
       knownBookmarkedIds.add(id);
       paintBookmarkBtn(s);
-      return false; // 新規保存ではない
+      return false;
     }
+
     const promise = (async () => {
       const token = await getCsrfToken();
       if (!token) throw new Error('token取得失敗');
+
       const res = await fetch('/ajax/illusts/bookmarks/add', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json', 'x-csrf-token': token },
-        body: JSON.stringify({ illust_id: id, restrict: 0, comment: '', tags: [] }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-csrf-token': token
+        },
+        body: JSON.stringify({
+          illust_id: id, restrict: 0, comment: '', tags: []
+        })
       });
+
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const json = await res.json();
       if (json.error) throw new Error(json.message || 'api error');
-      // 保存成功後にのみ状態更新
+
       s.bookmarked = true;
       knownBookmarkedIds.add(id);
       paintBookmarkBtn(s);
-      // 作品情報が取得済みなら、1回だけ学習
-      if (!s.tasteLearned && s.tags && s.tags.length) {
+
+      if (!s.tasteLearned && s.tags?.length) {
         learnFromWork(s.tags, s.userId, s.rawType, 3);
         s.tasteLearned = true;
       }
-      return true; // 新規保存成功
+
+      // 検索フィードだけ保存成立後に改善。
+      // グリッドは専用の保存処理で対応する。
+      if (mode === 'search' && slides.includes(s) &&
+          !searchGrid.open) {
+        void improveSearchFeedAfterBookmark(s);
+      }
+
+      return true;
     })();
+
     s.bookmarkPromise = promise;
     try {
       return await promise;

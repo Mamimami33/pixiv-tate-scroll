@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.13
+// @version      3.13.14
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -2181,7 +2181,8 @@
     const slots = [];
 
     for (let i = idx + 1; i < slides.length; i++) {
-      if (!viewedThisSession.has(String(slides[i].id))) {
+      if (slides[i].seriesParentId !== String(liked.id) &&
+        !viewedThisSession.has(String(slides[i].id))) {
         slots.push(i);
       }
     }
@@ -2212,6 +2213,9 @@
   }
 
   /* ---------- v3.13.9: 関連差し込みのタグ分散 ---------- */
+  const INSERT_IDENTITY_CAP = 2;
+  const INSERT_RECOMMENDATION_LIMIT = 12;
+
   const REC_GENERIC_TAGS = new Set([
     'r-18', 'r-18g', 'オリジナル', '創作',
     '一次創作', '二次創作', 'イラスト', '漫画',
@@ -2269,24 +2273,27 @@
   }
 
   function diversifyBookmarkRecommendations(
-    items, source, previous = [source]
+    items, source, previous = [source], limit = Infinity
   ) {
     const pool = items.slice();
     const output = [];
     let repeated = 0;
 
-    while (pool.length) {
+    while (pool.length && output.length < limit) {
       const tail = [...previous, ...output];
       const last = tail.at(-1);
       const second = tail.at(-2);
       const a = String(last?.userId || '');
       const b = String(second?.userId || '');
 
-      let best = 0;
+      let best = -1;
       let bestScore = -Infinity;
 
       for (let i = 0; i < pool.length; i++) {
         const it = pool[i];
+        if (output.length < INSERT_RECOMMENDATION_LIMIT &&
+          repeated >= INSERT_IDENTITY_CAP &&
+          commonIdentityTags(it, source)) continue;
         const author = String(it.userId || '');
 
         let score = customBaseScore(it);
@@ -2304,6 +2311,7 @@
         }
       }
 
+      if (best < 0) break;
       const chosen = pool.splice(best, 1)[0];
       output.push(chosen);
 
@@ -2311,7 +2319,9 @@
 
     }
 
-    return output;
+    // 差し込みは不足時も上限厳守。並べ替えは非共有候補を先に使い、
+    // 12件に満たない場合も既存作品を失わないよう残りを末尾へ退避する。
+    return Number.isFinite(limit) ? output : [...output, ...pool];
   }
 
   function customDiversify(items) {
@@ -3725,24 +3735,28 @@
   }
 
   function searchPrioritize(
-    items, word, previous = [], boosts = new Set(), source = null
+    items, word, previous = [], boosts = new Set(), source = null,
+    limit = Infinity
   ) {
     const pool = items.slice();
     const ordered = [];
     let repeated = 0;
 
-    while (pool.length) {
+    while (pool.length && ordered.length < limit) {
       const tail = [...previous.slice(-2), ...ordered];
       const last = tail.at(-1);
       const second = tail.at(-2);
       const a = String(last?.userId || '');
       const b = String(second?.userId || '');
 
-      let best = 0;
+      let best = -1;
       let highest = -Infinity;
 
       for (let i = 0; i < pool.length; i++) {
         const it = pool[i];
+        if (source && ordered.length < INSERT_RECOMMENDATION_LIMIT &&
+          repeated >= INSERT_IDENTITY_CAP &&
+          commonIdentityTags(it, source)) continue;
         const author = String(it.userId || '');
         const normalized = {
           ...it, illustType: it.illustType ?? it.rawType
@@ -3766,6 +3780,7 @@
         }
       }
 
+      if (best < 0) break;
       const chosen = pool.splice(best, 1)[0];
       ordered.push(chosen);
 
@@ -3774,27 +3789,41 @@
       }
     }
 
-    return ordered;
+    return Number.isFinite(limit) ? ordered : [...ordered, ...pool];
   }
 
-  async function fetchSearchRelatedCandidates(id) {
-    const body = await fetchJson(
-      `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
-    );
-
-    let candidates = customCandidateArray(body);
-
-    if (!candidates.length && Array.isArray(body?.nextIds) &&
-        body.nextIds.length) {
-      const ids = body.nextIds.slice(0, 60).map(String);
-      const more = await fetchJson(
-        '/ajax/illust/recommend/illusts?illustIds=' +
-        encodeURIComponent(ids.join(',')) + '&lang=ja'
+  async function fetchBookmarkRelatedCandidates(id) {
+    // recommend の既存取得に discovery を1回だけ追加する。
+    const related = (async () => {
+      const body = await fetchJson(
+        `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
       );
-      candidates = customCandidateArray(more);
-    }
 
-    return candidates;
+      let candidates = customCandidateArray(body);
+
+      if (!candidates.length && Array.isArray(body?.nextIds) &&
+          body.nextIds.length) {
+        const ids = body.nextIds.slice(0, 60).map(String);
+        const more = await fetchJson(
+          '/ajax/illust/recommend/illusts?illustIds=' +
+          encodeURIComponent(ids.join(',')) + '&lang=ja'
+        );
+        candidates = customCandidateArray(more);
+      }
+
+      return candidates;
+    })();
+    const results = await Promise.allSettled([
+      related,
+      fetchJson('/ajax/discovery/artworks?mode=all&limit=60')
+        .then(customCandidateArray)
+    ]);
+    if (results.every(result => result.status === 'rejected')) {
+      throw results[0].reason;
+    }
+    return results.flatMap(result =>
+      result.status === 'fulfilled' ? result.value : []
+    );
   }
 
   function reorderSearchFeedTail(anchor, word) {
@@ -3806,7 +3835,7 @@
 
     for (let i = pos + 1; i < slides.length; i++) {
       const s = slides[i];
-      if (!s.isCurrent &&
+      if (!s.isCurrent && s.seriesParentId !== String(anchor.id) &&
         !viewedThisSession.has(String(s.id))) {
         slots.push(i);
       }
@@ -3847,7 +3876,7 @@
 
     const work = (async () => {
       try {
-        const raw = await fetchSearchRelatedCandidates(s.id);
+        const raw = await fetchBookmarkRelatedCandidates(s.id);
 
         if (generation !== feedGeneration ||
           !slides.includes(s)) return;
@@ -3865,7 +3894,7 @@
         );
 
         const ranked = searchPrioritize(
-          available, word, [s], new Set(), s
+          available, word, [s], new Set(), s, INSERT_RECOMMENDATION_LIMIT
         );
         const chosen = ranked.slice(0, 12);
 
@@ -4199,7 +4228,7 @@
     const recommended = new Set();
 
     try {
-      const raw = await fetchSearchRelatedCandidates(id);
+      const raw = await fetchBookmarkRelatedCandidates(id);
 
       if (!g.open || token !== g.token) return;
 
@@ -4224,7 +4253,8 @@
       );
 
       const ranked = searchPrioritize(
-        available, word, previous, new Set(), anchor
+        available, word, previous, new Set(), anchor,
+        INSERT_RECOMMENDATION_LIMIT
       );
 
       const selected = ranked.slice(0, 12);
@@ -5304,23 +5334,7 @@
 
       if (generation !== feedGeneration || !slides.includes(s)) return;
 
-      const body = await fetchJson(
-        `/ajax/illust/${s.id}/recommend/init?limit=60&lang=ja`
-      );
-
-      let candidates = Array.isArray(body.illusts)
-        ? body.illusts : [];
-
-      if (!candidates.length &&
-        Array.isArray(body.nextIds) && body.nextIds.length) {
-        const ids = body.nextIds.slice(0, 60).map(String);
-        const more = await fetchJson(
-          '/ajax/illust/recommend/illusts?illustIds=' +
-          encodeURIComponent(ids.join(',')) + '&lang=ja'
-        );
-        candidates = Array.isArray(more.illusts)
-          ? more.illusts : [];
-      }
+      const candidates = await fetchBookmarkRelatedCandidates(s.id);
 
       const ranked = await prepareCandidates(candidates, {
         excludeIds: [s.id, s.seriesNextId, ...seenTimes.keys()]
@@ -5348,7 +5362,8 @@
         ? next : null;
 
       const sorted = diversifyBookmarkRecommendations(
-        available, s, seriesNext ? [s, seriesNext] : [s]
+        available, s, seriesNext ? [s, seriesNext] : [s],
+        INSERT_RECOMMENDATION_LIMIT
       );
 
       const selected = sorted.slice(0, 12);

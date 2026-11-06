@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.8.1
+// @version      3.9.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -965,51 +965,246 @@
     scheduleAutoAdvance(idx);
   }
 
-  /* ---------- 自前レコメンド（本人のブックマークから好みを学習して並べ替える） ---------- */
+  /* ---------- 自前レコメンド v2（履歴500件＋永続化） ---------- */
+  const PROFILE_KEY = 'PTS_PROFILE_V2';
+  const HISTORY_LIMIT = 500;
+  const HISTORY_PAGE_SIZE = 48;
+  const HISTORY_REFRESH_MS = 6 * 60 * 60 * 1000;
+  const HISTORY_HALF_LIFE = 100;
+  // 自分のpixivユーザーID（自動検出の誤認を防ぐため固定。ChatGPT案のMY_USER_ID_OVERRIDE）
+  const MY_USER_ID_OVERRIDE = '50590090';
 
   const profile = { tags: {}, authors: {}, ugoira: 0 };
-  try {
-    const saved = JSON.parse(sessionStorage.getItem('pts-profile') || 'null');
-    if (saved && saved.tags) { profile.tags = saved.tags; profile.authors = saved.authors || {}; profile.ugoira = saved.ugoira || 0; }
-  } catch (e) {}
-
-  function saveProfile() {
-    try { sessionStorage.setItem('pts-profile', JSON.stringify(profile)); } catch (e) {}
-  }
+  let bookmarkHistory = { userId: '', works: [], initialized: false, updatedAt: 0 };
+  let historyProfile = { tags: {}, authors: {}, ugoira: 0 };
+  let historyInitPromise = null;
 
   function normTags(tags) {
     if (!tags) return [];
-    const arr = Array.isArray(tags) ? tags : (tags.tags || []);
-    return arr.map((t) => (typeof t === 'string' ? t : (t && t.tag) || '')).filter(Boolean);
+    const arr = Array.isArray(tags) ? tags : (Array.isArray(tags.tags) ? tags.tags : []);
+    return [...new Set(arr.map(t => typeof t === 'string' ? t : (t && t.tag) || '').filter(Boolean))];
   }
 
-  // ブックマーク済み作品から好みを学習する（重みつき）
-  function learnFromWork(tags, userId, illustType, weight) {
-    (tags || []).forEach((t) => { profile.tags[t] = (profile.tags[t] || 0) + weight; });
-    if (userId) profile.authors[String(userId)] = (profile.authors[String(userId)] || 0) + weight;
-    if (illustType === 2) profile.ugoira += weight;
+  function readProfile() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null'); } catch (e) {}
+    if (!saved || saved.version !== 2) {
+      try {
+        const old = JSON.parse(sessionStorage.getItem('pts-profile') || 'null');
+        if (old && old.tags) saved = { version: 2, live: old };
+      } catch (e) {}
+    }
+    if (saved && saved.live) {
+      const p = saved.live;
+      if (p.tags && typeof p.tags === 'object') profile.tags = p.tags;
+      if (p.authors && typeof p.authors === 'object') profile.authors = p.authors;
+      profile.ugoira = Number(p.ugoira) || 0;
+    }
+    if (saved && saved.history && typeof saved.history === 'object') {
+      const h = saved.history;
+      if (Array.isArray(h.works)) {
+        bookmarkHistory = {
+          userId: String(h.userId || ''),
+          works: h.works.slice(0, HISTORY_LIMIT),
+          initialized: h.initialized === true,
+          updatedAt: Number(h.updatedAt) || 0
+        };
+      }
+    }
+  }
+
+  function saveProfile() {
+    try {
+      localStorage.setItem(PROFILE_KEY, JSON.stringify({
+        version: 2,
+        live: profile,
+        history: bookmarkHistory
+      }));
+    } catch (e) { console.warn('[PTS] profile保存失敗', e); }
+  }
+
+  // ビューア内での保存操作・既存の表示解決時の学習に使う
+  function learnFromWork(tags, userId, illustType, weight = 1) {
+    const w = Number(weight) || 0;
+    if (w <= 0) return;
+    for (const tag of normTags(tags)) profile.tags[tag] = (profile.tags[tag] || 0) + w;
+    if (userId != null && userId !== '') {
+      const id = String(userId);
+      profile.authors[id] = (profile.authors[id] || 0) + w;
+    }
+    if (Number(illustType) === 2) profile.ugoira += w;
     saveProfile();
   }
 
-  // 候補作品の「好み一致度」。pixivの並び順は同点のときの tiebreak として残る
+  function getMyUserId() {
+    if (MY_USER_ID_OVERRIDE) return String(MY_USER_ID_OVERRIDE);
+    // 1. 自分のブックマークページURL
+    const path = location.pathname.match(/^\/users\/(\d+)\/bookmarks(?:\/|$)/);
+    if (path) return path[1];
+    // 2. meta[name="global-data"]
+    const meta = document.querySelector('meta[name="global-data"]');
+    if (meta) {
+      try {
+        const data = JSON.parse(meta.getAttribute('content') || '{}');
+        const id = data.userData?.id ?? data.userData?.userId ??
+          data.user?.id ?? data.user?.userId ??
+          data.loginUser?.id ?? data.loginUser?.userId ??
+          data.loginUserId;
+        if (id != null && /^\d+$/.test(String(id))) return String(id);
+      } catch (e) { /* 次の経路を試す */ }
+    }
+    // 3. ページ内の自分のブックマークへのリンク
+    for (const a of document.querySelectorAll('a[href*="/bookmarks/artworks"]')) {
+      const href = a.getAttribute('href') || '';
+      const m = href.match(/\/users\/(\d+)\/bookmarks\/artworks(?:[/?#]|$)/);
+      if (m) return m[1];
+    }
+    return '';
+  }
+
+  function parseBookmarkPage(body) {
+    if (!body || !Array.isArray(body.works)) throw new Error('bookmarks API: body.worksがありません');
+    return body.works.map(w => {
+      const id = w && (w.id ?? w.illustId);
+      if (id == null) return null;
+      return {
+        id: String(id),
+        userId: w.userId == null ? '' : String(w.userId),
+        tags: normTags(w.tags),
+        illustType: Number(w.illustType),
+        pageCount: Number(w.pageCount) || 1
+      };
+    }).filter(Boolean);
+  }
+
+  function learnFromBookmarks(works) {
+    const next = { tags: {}, authors: {}, ugoira: 0 };
+    (works || []).slice(0, HISTORY_LIMIT).forEach((work, index) => {
+      const weight = Math.pow(0.5, index / HISTORY_HALF_LIFE);
+      for (const tag of normTags(work.tags)) {
+        next.tags[tag] = (next.tags[tag] || 0) + weight;
+      }
+      if (work.userId) {
+        const id = String(work.userId);
+        next.authors[id] = (next.authors[id] || 0) + weight;
+      }
+      if (Number(work.illustType) === 2) next.ugoira += weight;
+    });
+    historyProfile = next;
+  }
+
+  function applyBookmarkHistory() {
+    learnFromBookmarks(bookmarkHistory.works);
+    for (const work of bookmarkHistory.works) knownBookmarkedIds.add(String(work.id));
+  }
+
+  async function fetchBookmarkPage(userId, offset) {
+    const url = `/ajax/user/${encodeURIComponent(userId)}/bookmarks/artworks` +
+      `?tag=&offset=${offset}&limit=${HISTORY_PAGE_SIZE}&rest=show`;
+    return parseBookmarkPage(await fetchJson(url));
+  }
+
+  async function initProfileFromBookmarks(force = false) {
+    if (historyInitPromise) return historyInitPromise;
+    const userId = getMyUserId();
+    if (!userId) {
+      console.warn('[PTS] 自分のユーザーIDを取得できず履歴学習をスキップ');
+      return;
+    }
+    // 別アカウントの履歴を絶対に混ぜない
+    if (bookmarkHistory.userId && bookmarkHistory.userId !== userId) {
+      bookmarkHistory = { userId, works: [], initialized: false, updatedAt: 0 };
+      historyProfile = { tags: {}, authors: {}, ugoira: 0 };
+    }
+    bookmarkHistory.userId = userId;
+    applyBookmarkHistory();
+    if (!force && bookmarkHistory.initialized &&
+        Date.now() - bookmarkHistory.updatedAt < HISTORY_REFRESH_MS) return;
+
+    historyInitPromise = (async () => {
+      const previous = bookmarkHistory.initialized ? bookmarkHistory.works : [];
+      const oldIds = new Set(previous.map(w => String(w.id)));
+      const fresh = [];
+      const seen = new Set();
+      let overlap = false;
+      let exhausted = false;
+
+      for (let offset = 0; offset < HISTORY_LIMIT; offset += HISTORY_PAGE_SIZE) {
+        const page = await fetchBookmarkPage(userId, offset);
+        if (page.length === 0) { exhausted = true; break; }
+        for (const work of page) {
+          if (seen.has(work.id)) continue;
+          seen.add(work.id);
+          fresh.push(work);
+          if (oldIds.has(work.id)) overlap = true;
+        }
+        if (page.length < HISTORY_PAGE_SIZE) { exhausted = true; break; }
+        if (previous.length && overlap) break;
+      }
+
+      // 取得が最後まで正常に終了した時だけcommitする。
+      // 初回途中失敗時はinitialized=falseのままで次回やり直せる。
+      const freshIds = new Set(fresh.map(w => w.id));
+      const merged = previous.length && overlap && !exhausted
+        ? [...fresh, ...previous.filter(w => !freshIds.has(w.id))]
+        : fresh;
+      const completed = fresh.length >= HISTORY_LIMIT || exhausted ||
+        (previous.length > 0 && overlap);
+      if (!completed) throw new Error('履歴取得が完了していません');
+
+      bookmarkHistory = {
+        userId,
+        works: merged.slice(0, HISTORY_LIMIT),
+        initialized: true,
+        updatedAt: Date.now()
+      };
+      applyBookmarkHistory();
+      saveProfile();
+      console.info('[PTS] 履歴学習完了', bookmarkHistory.works.length, '件');
+    })().catch(e => {
+      console.warn('[PTS] 履歴学習失敗（次回再試行）', e);
+    }).finally(() => { historyInitPromise = null; });
+    return historyInitPromise;
+  }
+
+  // 数値を返す完成版。タグ×3、作者×9、うごイラ、R-18を評価。
   function tasteScore(it) {
-    let sc = 0;
-    normTags(it.tags).forEach((t) => { sc += Math.min(profile.tags[t] || 0, 10); });
-    if (it.userId && profile.authors[String(it.userId)]) sc += 8;
-    if (it.illustType === 2 && profile.ugoira >= 3) sc += 3;
-    return sc;
+    let score = 0;
+    let tagScore = 0;
+    const tags = normTags(it.tags);
+    for (const tag of tags) {
+      const count = Math.max(0, (Number(historyProfile.tags[tag]) || 0) +
+        (Number(profile.tags[tag]) || 0) * 1.5);
+      tagScore += Math.log1p(count);
+    }
+    score += Math.min(30, tagScore * 3);
+
+    const authorId = it.userId == null ? '' : String(it.userId);
+    if (authorId) {
+      const count = Math.max(0, (Number(historyProfile.authors[authorId]) || 0) +
+        (Number(profile.authors[authorId]) || 0) * 1.5);
+      score += Math.min(27, Math.log1p(count) * 9);
+    }
+
+    const hasUgoira = Number(it.illustType) === 2;
+    if (hasUgoira && historyProfile.ugoira + profile.ugoira > 0) score += 4;
+    if (tags.includes('R-18')) score += 3;
+    return Number.isFinite(score) ? score : 0;
   }
 
   function sortByTaste(items) {
-    return items
-      .map((it, i) => ({ it, i, sc: tasteScore(it) }))
+    return items.map((it, i) => ({ it, i, sc: tasteScore(it) }))
       .sort((a, b) => (b.sc - a.sc) || (a.i - b.i))
-      .map((x) => x.it);
+      .map(x => x.it);
   }
+
+  readProfile();
 
   /* ---------- 候補の共通処理（ChatGPT実装案を検証・調整して採用） ---------- */
 
   const knownBookmarkedIds = new Set();
+  applyBookmarkHistory();
+  initProfileFromBookmarks();
   let feedGeneration = 0;
   let relatedSwitchBusy = false;
 

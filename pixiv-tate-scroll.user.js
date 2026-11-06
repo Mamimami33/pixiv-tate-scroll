@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      2.0.1
+// @version      2.1.0
 // @description  今開いているpixivのページに並んでいる作品を、TikTok風の縦スクロール（全画面スナップ）で眺めるビューアです。ブックマーク連携なし・ページ内スキャン方式。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -72,13 +72,20 @@
     return candidates[0] || '';
   }
 
-  // square1200 / custom1200 サムネイル → master1200 に変換を試みる（ダメなら表示時にサムネへ差し戻す）
+  // サムネイルURL → 大きい画像（master1200）に変換する。
+  // /c/<サイズ指定>/ を取り除くと原寸系のパスになる。square/custom サムネは末尾も差し替える。
   function upgradeUrl(url) {
-    const m = url.match(/^https:\/\/i\.pximg\.net\/c\/[^/]+\/(img-master\/.+?)_(?:square1200|custom1200)\.(\w+)$/);
-    if (m) {
-      return `https://i.pximg.net/${m[1]}_p0_master1200.jpg`;
-    }
-    return url;
+    let u = url.replace(/^https:\/\/i\.pximg\.net\/c\/[^/]+\//, 'https://i.pximg.net/');
+    u = u.replace(/_(square1200|custom1200)\.(\w+)$/, '_p0_master1200.jpg');
+    return u;
+  }
+
+  // 先読み：次の数枚を裏で読み込んでおき、スクロールで待たせない
+  function preload(urls) {
+    urls.forEach((u) => {
+      const im = new Image();
+      im.src = u;
+    });
   }
 
   function renderSlide(s, idx) {
@@ -120,6 +127,7 @@
     slides = scanPage();
     feedEl.innerHTML = '';
     slides.forEach((s, i) => renderSlide(s, i));
+    preload(slides.slice(0, 6).map((s) => s.full));
     const c = overlay.querySelector('.pts-counter');
     if (slides.length === 0) {
       c.textContent = 'このページに作品が見つかりませんでした。検索結果・ランキング・作品ページ等で開いてください';
@@ -147,6 +155,7 @@
       slides.push(s);
       renderSlide(s, slides.length - 1);
     });
+    preload(items.slice(0, 6).map((s) => s.full));
     const c = overlay.querySelector('.pts-counter');
     c.textContent = `${slides.length} 件`;
   }

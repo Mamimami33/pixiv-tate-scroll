@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.12.0
+// @version      3.13.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -21,9 +21,7 @@
   let overlay = null;
   let feedEl = null;
   let slides = [];
-  let pageLoadBusy = false;
-  let pageLoadMisses = 0;
-  let mode = 'page'; // 'page' | 'related' | 'custom'
+  let mode = 'custom'; // 'custom' | 'search'
   let nearObs = null;
   // 画像サーバーへの接続を先に温めておく（初回表示の高速化）
   const pc = document.createElement('link');
@@ -32,7 +30,6 @@
   pc.crossOrigin = 'anonymous';
   document.head.appendChild(pc);
 
-  let quality = 'orig'; // 表示中の1枚は元画像、近くの先読みは1200px。'fast' にすると全体1200px止まり
 
   function pickPair(urls) {
     if (!urls) return { r: '', o: '' };
@@ -41,29 +38,7 @@
 
   /* ---------- ページ内スキャン（3段構え） ---------- */
 
-  function idFromImgUrl(u) {
-    if (!u) return null;
-    const m = u.match(/\/(\d{5,})_(?:p\d+_|square1200|custom1200|master1200|ugoira)/);
-    return m ? m[1] : null;
-  }
 
-  function pickBestSrc(img) {
-    const candidates = [];
-    const ds = img.getAttribute('data-src');
-    if (ds) candidates.push(ds);
-    const ss = img.getAttribute('srcset');
-    if (ss) {
-      const parts = ss.split(',').map((p) => p.trim().split(/\s+/)).filter((p) => p[0]);
-      parts.sort((x, y) => (parseInt(y[1]) || 0) - (parseInt(x[1]) || 0));
-      if (parts.length) candidates.push(parts[0][0]);
-    }
-    if (img.currentSrc) candidates.push(img.currentSrc);
-    if (img.src) candidates.push(img.src);
-    for (const c of candidates) {
-      if (c && c.includes('i.pximg.net')) return c;
-    }
-    return '';
-  }
 
   function newSlide(id, thumb, title, author) {
     return {
@@ -78,47 +53,6 @@
     };
   }
 
-  function scanPage() {
-    const seen = new Set(slides.map((s) => s.id));
-    const items = [];
-    const push = (id, thumb, title) => {
-      if (!id || seen.has(id)) return;
-      seen.add(id);
-      items.push(newSlide(id, thumb, title, ''));
-    };
-
-    document.querySelectorAll('img').forEach((img) => {
-      if (overlay && overlay.contains(img)) return;
-      const src = pickBestSrc(img);
-      const id = idFromImgUrl(src);
-      if (id) push(id, src, (img.alt || '').trim());
-    });
-
-    document.querySelectorAll('a[href*="/artworks/"]').forEach((a) => {
-      if (overlay && overlay.contains(a)) return;
-      const m = (a.getAttribute('href') || '').match(/\/artworks\/(\d+)/);
-      if (!m) return;
-      let img = a.querySelector('img');
-      if (!img) {
-        let node = a;
-        for (let i = 0; i < 4 && node && !img; i++) {
-          node = node.parentElement;
-          if (node) img = node.querySelector('img');
-        }
-      }
-      push(m[1], img ? pickBestSrc(img) : '', img ? (img.alt || '').trim() : '');
-    });
-
-    if (items.length < 3) {
-      const html = document.documentElement.innerHTML;
-      const re = /artworks\/(\d{5,})/g;
-      let mm;
-      while ((mm = re.exec(html)) !== null && items.length < 60) {
-        push(mm[1], '', '');
-      }
-    }
-    return items;
-  }
 
   /* ---------- 作品情報の解決（元画像・複数枚・うごイラ） ---------- */
 
@@ -129,10 +63,35 @@
     return u;
   }
 
-  async function fetchJson(url, signal) {
-    const res = await fetch(url, { credentials: 'same-origin', signal });
+  async function fetchJson(url, signal, cacheMode) {
+    const options = {
+      method: 'GET',
+      credentials: 'same-origin',
+      signal
+    };
+
+    if (cacheMode) options.cache = cacheMode;
+
+    const res = await fetch(url, options);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
     const json = await res.json();
-    if (json.error) throw new Error(json.message || 'api error');
+
+    if (!json || typeof json !== 'object') {
+      throw new Error('JSON形式が不正');
+    }
+
+    if (json.error) {
+      throw new Error(json.message || 'api error');
+    }
+
+    if (json.body == null) {
+      throw new Error('API bodyがありません');
+    }
+
     return json.body;
   }
 
@@ -177,26 +136,33 @@
   }
 
   async function resolveSlideImpl(s, signal) {
-    try {
-      const body = await fetchJson(
-        `/ajax/illust/${s.id}`, signal
-      );
+    const cacheMode = s.forceRefetch ? 'no-store' : undefined;
+    const get = (path, sig) =>
+      fetchJson(path, sig, cacheMode);
 
-      s.seriesNextId = seriesNextId(body?.seriesNavData);
+    try {
+      const body = await get(`/ajax/illust/${s.id}`, signal);
+
+      if (signal?.aborted) return;
+
+      s.seriesNextId = seriesNextId(body.seriesNavData);
       s.seriesInfoChecked = true;
-      s.rawType = body.illustType;
+      s.rawType = Number(body.illustType);
       s.tags = normTags(body.tags);
-      s.userId = body.userId ? String(body.userId) : null;
+      s.userId = body.userId == null
+        ? null : String(body.userId);
+
       s.bookmarked = s.bookmarked ||
         knownBookmarkedIds.has(String(s.id)) ||
         !!body.bookmarkData;
 
       if (s.bookmarked) {
         knownBookmarkedIds.add(String(s.id));
+
         if (!s.tasteLearned &&
             !bookmarkHistory.works.some(w =>
               String(w.id) === String(s.id))) {
-          learnFromWork(s.tags, s.userId, body.illustType, 3);
+          learnFromWork(s.tags, s.userId, s.rawType, 3);
           s.tasteLearned = true;
         }
       }
@@ -207,6 +173,7 @@
         s.title = body.title;
         if (s.titleEl) s.titleEl.textContent = s.title;
       }
+
       if (body.userName) {
         s.author = body.userName;
         if (s.authorEl) s.authorEl.textContent = s.author;
@@ -214,70 +181,104 @@
 
       const pageCount = Number(body.pageCount) || 1;
 
-      if (Number(body.illustType) === 2) {
+      if (s.rawType === 2) {
         s.kind = 'ugoira';
+        setUgoiraStatus(s, 'loading');
+
         try {
-          let meta = s.metaPromise
-            ? await s.metaPromise : null;
-          if (!meta) {
-            meta = await fetchJson(
-              `/ajax/illust/${s.id}/ugoira_meta`
-            );
-          }
+          const meta = await get(
+            `/ajax/illust/${s.id}/ugoira_meta`,
+            signal
+          );
+
+          if (signal?.aborted) return;
+
           s.zipSmall = meta.src || null;
           s.zipFull = meta.originalSrc || null;
           s.zipUrl = s.zipSmall || s.zipFull;
-          s.frames = meta.frames || null;
-          if (!s.zipUrl) s.ugoiraError = 'メタにZIPなし';
+          s.frames = Array.isArray(meta.frames)
+            ? meta.frames : null;
+
+          if (!s.zipUrl) s.ugoiraError = 'ZIPなし';
           else if (!s.frames?.length) {
             s.ugoiraError = 'フレーム情報なし';
           }
         } catch (e) {
-          s.ugoiraError =
-            'メタ取得失敗: ' + (e?.message || String(e));
+          if (signal?.aborted) return;
+          s.ugoiraError = 'メタ取得失敗: ' +
+            (e?.message || String(e));
         }
 
         const pair = pickPair(body.urls);
         s.pairs = [pair];
+
         const m = (pair.o || '')
           .match(/^(.*_ugoira)0(\.\w+)$/);
+
         if (m) {
           s.frameBase = m[1];
           s.frameExt = m[2];
         }
+
+        if (s.ugoiraError) {
+          setUgoiraStatus(s, 'error', s.ugoiraError);
+        }
+
       } else if (pageCount > 1) {
         s.kind = 'multi';
+        setUgoiraStatus(s, 'none');
+
         try {
-          const pages = await fetchJson(
-            `/ajax/illust/${s.id}/pages`
+          const pages = await get(
+            `/ajax/illust/${s.id}/pages`,
+            signal
           );
+
+          if (signal?.aborted) return;
+
           s.pairs = pages.map(p => pickPair(p.urls));
+
         } catch (e) {
+          if (signal?.aborted) return;
           s.pairs = [pickPair(body.urls)];
           s.kind = 'single';
         }
+
       } else {
         s.kind = 'single';
         s.pairs = [pickPair(body.urls)];
+        setUgoiraStatus(s, 'none');
       }
+
     } catch (e) {
       if (signal?.aborted) return;
-      s.kind = 'single';
+
       s.resolveError = e?.message || String(e);
+
+      if (Number(s.rawType) === 2 || s.kind === 'ugoira') {
+        setUgoiraStatus(s, 'error', s.resolveError);
+      } else {
+        setUgoiraStatus(s, 'none');
+      }
+
+      s.kind = 'single';
       const u = upgradeUrl(s.thumb) || s.thumb;
       s.pairs = [{ r: u, o: u }];
     }
+
+    if (signal?.aborted) return;
 
     s.resolved = true;
     applyResolved(s);
     upgradeSlide(s);
   }
 
-  // 表示レベルに応じて画像を差し替える：表示中は元画像（quality=orig時）、近くは1200px
+  // 表示レベルに応じて画像を差し替える：表示中は元画像、近くは1200px
   function levelUrl(s, pair) {
     if (!pair) return s.thumb;
-    if (s.isCurrent && quality === 'orig') return pair.o || pair.r;
-    return pair.r || pair.o;
+    return s.isCurrent
+      ? (pair.o || pair.r)
+      : (pair.r || pair.o);
   }
 
   // 複数枚作品：表示中ページの前後だけ画像を読み込む
@@ -315,31 +316,44 @@
 
   function upgradeSlide(s, force) {
     if (!s.resolved || !s.pairs) return;
-    const holder = s.sectionEl && s.sectionEl.querySelector('.pts-holder');
+
+    const holder = s.sectionEl?.querySelector('.pts-holder');
     if (!holder) return;
+
     if (s.kind === 'multi') {
       const imgs = holder.querySelectorAll('.pts-page img');
+
       imgs.forEach((im, i) => {
         const pair = s.pairs[i];
         if (!pair) return;
+
         if (force) {
           const target = levelUrl(s, pair);
-          if (target && !(im.getAttribute('src') || '').includes(target)) im.src = target;
-        } else if (s.isCurrent && quality === 'orig' && i === (s.pageIdx || 0)) {
+          if (target && im.getAttribute('src') !== target) {
+            im.src = target;
+          }
+        } else if (s.isCurrent && i === (s.pageIdx || 0)) {
           swapToOriginal(s, im, pair);
         }
       });
-      s.mainImg = imgs[s.pageIdx || 0] || imgs[0] || s.mainImg;
+
+      s.mainImg =
+        imgs[s.pageIdx || 0] || imgs[0] || s.mainImg;
+
     } else {
       const pair = s.pairs[0];
+
       if (s.mainImg && pair) {
         if (force) {
           const target = levelUrl(s, pair);
-          if (target && !(s.mainImg.getAttribute('src') || '').includes(target)) s.mainImg.src = target;
-        } else if (s.isCurrent && quality === 'orig') {
+          if (target && s.mainImg.getAttribute('src') !== target) {
+            s.mainImg.src = target;
+          }
+        } else if (s.isCurrent) {
           swapToOriginal(s, s.mainImg, pair);
         }
       }
+
       if (s.kind === 'ugoira') prepareUgoira(s);
     }
   }
@@ -493,38 +507,84 @@
     return urls;
   }
 
+  function setUgoiraStatus(s, state, message = '') {
+    const el = s?.ugoiraStatusEl;
+    if (!el) return;
+
+    if (state === 'none' || state === 'playing') {
+      el.hidden = true;
+      el.textContent = '';
+      return;
+    }
+
+    el.hidden = false;
+    el.classList.toggle('pts-ugoira-error', state === 'error');
+
+    el.textContent = state === 'error'
+      ? `⚠ うごイラ読み込み失敗: ${message || '不明なエラー'}`
+      : '◌ うごイラ読み込み中…';
+  }
+
   function startUgoira(s) {
-    if (s.animTimer || !s.frameUrls?.length || !s.frames?.length) return;
+    if (s.animTimer || !s.frameUrls?.length ||
+        !s.frames?.length || !s.isCurrent) return;
+
+    setUgoiraStatus(s, 'playing');
     upgradeUgoiraHiRes(s);
+
     if (s.pageChip) {
       s.pageChip.style.display = 'block';
       s.pageChip.textContent = 'うごイラ再生中';
     }
-    const total = s.frames.reduce((a, f) => a + (f.delay || 100), 0);
+
+    const total = s.frames.reduce(
+      (sum, f) => sum + (f.delay || 100), 0
+    );
+
     s.animTotal = total;
     if (s.seekEl) s.seekEl.style.display = 'block';
+
     const step = () => {
-      if (!s.frameUrls?.length || !s.isCurrent) { s.animTimer = null; return; }
+      if (!s.frameUrls?.length || !s.isCurrent) {
+        s.animTimer = null;
+        return;
+      }
+
       const i = s.animIdx % s.frameUrls.length;
       const url = s.frameUrls[i];
-      if (url && s.mainImg && s.mainImg.src !== url) s.mainImg.src = url;
+
+      if (url && s.mainImg && s.mainImg.src !== url) {
+        s.mainImg.src = url;
+      }
+
       let elapsed = 0;
-      for (let k = 0; k < i; k++) elapsed += s.frames[k]?.delay || 100;
+      for (let k = 0; k < i; k++) {
+        elapsed += s.frames[k]?.delay || 100;
+      }
+
       const pct = total > 0 ? elapsed / total * 100 : 0;
+
       if (s.seekFill) s.seekFill.style.width = pct + '%';
       if (s.seekKnob) s.seekKnob.style.left = pct + '%';
+
       const delay = s.frames[i]?.delay || 100;
+
       s.animIdx++;
       s.loopSteps = (s.loopSteps || 0) + 1;
+
       s.animTimer = setTimeout(() => {
         s.animTimer = null;
         if (!s.isCurrent) return;
+
         if (s.loopSteps >= s.frameUrls.length) {
-          s.loopSteps = 0; onUgoiraLoop(s);
+          s.loopSteps = 0;
+          onUgoiraLoop(s);
         }
+
         step();
       }, delay);
     };
+
     step();
   }
 
@@ -563,51 +623,68 @@
 
   async function prepareUgoira(s) {
     if (s.frameUrls || s.preparingUgoira) return;
-    if (s.ugoiraError) { if (s.isCurrent) setChip(s, 'うごイラ: ' + s.ugoiraError); return; }
-    if (!s.frames) { if (s.isCurrent) setChip(s, 'うごイラ: フレーム情報なし'); return; }
+
+    if (s.ugoiraError || !s.frames?.length) {
+      setUgoiraStatus(
+        s, 'error', s.ugoiraError || 'フレーム情報なし'
+      );
+      return;
+    }
+
     s.preparingUgoira = true;
     s.ugoiraAbort = new AbortController();
-    if (s.isCurrent) setChip(s, 'うごイラ準備中…');
+    setUgoiraStatus(s, 'loading');
+
     try {
-      // 第1候補：ZIPを自前で展開する（pixiv公式と同じ方式）
       if (s.zipUrl) {
-        try {
-          s.frameUrls = await unzipFrames(s.zipUrl, s.frames, s.ugoiraAbort.signal);
-        } catch (e) {
-          if (e && e.name === 'AbortError') throw e;
-          throw new Error('ZIP展開失敗: ' + (e && e.message ? e.message : e));
+        s.frameUrls = await unzipFrames(
+          s.zipUrl, s.frames, s.ugoiraAbort.signal
+        );
+
+        if (!s.frameUrls.some(Boolean)) {
+          throw new Error('フレーム0枚');
         }
-        const valid = s.frameUrls.filter(Boolean).length;
-        if (valid === 0) throw new Error('フレーム0枚');
+
         if (s.isCurrent) startUgoira(s);
         upgradeUgoiraHiRes(s);
         return;
       }
-      // 第2候補：個別フレームURL（_ugoira0, _ugoira1, ...）
+
       if (s.frameBase && s.frameExt) {
-        const urls = s.frames.map((f, i) => `${s.frameBase}${i}${s.frameExt}`);
-        const ok = await new Promise((done) => {
+        const urls = s.frames.map(
+          (f, i) => `${s.frameBase}${i}${s.frameExt}`
+        );
+
+        const available = await new Promise(done => {
           const probe = new Image();
           probe.onload = () => done(true);
           probe.onerror = () => done(false);
           probe.src = urls[Math.min(1, urls.length - 1)];
         });
-        if (ok) {
-          s.frameUrls = urls;
-          urls.forEach((u) => { const im = new Image(); im.src = u; });
-          if (s.isCurrent) startUgoira(s);
-          return;
+
+        if (!available) {
+          throw new Error('個別フレーム取得不可');
         }
-        throw new Error('個別フレーム不可');
+
+        s.frameUrls = urls;
+
+        urls.forEach(url => {
+          const img = new Image();
+          img.src = url;
+        });
+
+        if (s.isCurrent) startUgoira(s);
+        return;
       }
+
       throw new Error('再生手段なし');
+
     } catch (e) {
-      if (e && e.name === 'AbortError') {
-        // 優先度付け替えで中断されただけ。エラー扱いしない
-      } else {
-        if (s.isCurrent) setChip(s, 'うごイラ: ' + (e && e.message ? e.message : e));
-        s.ugoiraError = (e && e.message) ? e.message : String(e);
+      if (e?.name !== 'AbortError') {
+        s.ugoiraError = e?.message || String(e);
+        setUgoiraStatus(s, 'error', s.ugoiraError);
       }
+
     } finally {
       s.preparingUgoira = false;
       s.ugoiraAbort = null;
@@ -652,16 +729,21 @@
     const now = Date.now();
     reloadTimes = reloadTimes.filter(t => now - t < 60000);
     reloadTimes.push(now);
+
     if (reloadTimes.length >= 3) {
       effectsReduced = true;
       overlay?.classList.add('pts-low-effects');
     }
+
     const img = s.mainImg;
-    if (!img || !s.pairs?.[0]) return;
-    const pair = s.pairs[0];
-    const url = quality === 'orig' && pair.o ? pair.o : (pair.r || pair.o);
+    const pair = s.pairs?.[s.pageIdx || 0] || s.pairs?.[0];
+
+    if (!img || !pair) return;
+
+    const url = pair.o || pair.r;
     if (!url) return;
-    img.src = '';
+
+    img.removeAttribute('src');
     img.src = url;
   }
 
@@ -826,22 +908,27 @@
 
     const holder = document.createElement('div');
     holder.className = 'pts-holder';
+
     const ph = document.createElement('img');
     ph.className = 'pts-img';
     ph.decoding = 'async';
-    // 先頭の数枚は、サムネイルURLから変換した1200px画像を即表示する（API応答を待たない）
-    // それ以外は近づくまで読み込まない（帯域を先頭と表示中に譲る）
+    ph.loading = idx < 2 ? 'eager' : 'lazy';
+
     if (idx < 3) {
       ph.src = upgradeUrl(s.thumb) || s.thumb;
-      ph.onerror = () => { if (s.thumb && ph.src !== s.thumb) ph.src = s.thumb; };
+      ph.onerror = () => {
+        if (s.thumb && ph.src !== s.thumb) {
+          ph.src = s.thumb;
+        }
+      };
     } else {
       ph.dataset.ptsPh = '1';
     }
+
     ph.alt = s.title || '';
-    ph.loading = idx < 2 ? 'eager' : 'lazy';
     holder.appendChild(ph);
-    s.mainImg = ph;
     sec.appendChild(holder);
+    s.mainImg = ph;
 
     const chip = document.createElement('div');
     chip.className = 'pts-pagechip';
@@ -849,22 +936,42 @@
     sec.appendChild(chip);
     s.pageChip = chip;
 
-    // うごイラ用シークバー（上部バー直下・ドラッグで操作できる）
+    const status = document.createElement('div');
+    status.className = 'pts-ugoira-status';
+    status.hidden = true;
+    status.setAttribute('role', 'status');
+    sec.appendChild(status);
+    s.ugoiraStatusEl = status;
+
+    if (Number(s.rawType) === 2) {
+      setUgoiraStatus(s, 'loading');
+    }
+
     const seek = document.createElement('div');
     seek.className = 'pts-seek';
     seek.style.display = 'none';
-    const seekFill = document.createElement('div');
-    seekFill.className = 'pts-seek-fill';
-    seek.appendChild(seekFill);
+
+    const fill = document.createElement('div');
+    fill.className = 'pts-seek-fill';
+    seek.appendChild(fill);
+
     const knob = document.createElement('div');
     knob.className = 'pts-seek-knob';
     seek.appendChild(knob);
+
+    s.seekEl = seek;
+    s.seekFill = fill;
     s.seekKnob = knob;
-    const dragTo = (clientX) => {
+
+    const dragTo = clientX => {
       const r = seek.getBoundingClientRect();
-      dragUgoira(s, Math.min(1, Math.max(0, (clientX - r.left) / r.width)));
+      const ratio = Math.min(1, Math.max(
+        0, (clientX - r.left) / Math.max(1, r.width)
+      ));
+      dragUgoira(s, ratio);
     };
-    seek.addEventListener('pointerdown', (e) => {
+
+    seek.addEventListener('pointerdown', e => {
       seek.setPointerCapture(e.pointerId);
       s.seekDragging = true;
       stopUgoira(s);
@@ -872,72 +979,23 @@
       e.stopPropagation();
       e.preventDefault();
     });
-    seek.addEventListener('pointermove', (e) => {
+
+    seek.addEventListener('pointermove', e => {
       if (s.seekDragging) dragTo(e.clientX);
     });
-    const dragEnd = () => {
+
+    const endDrag = () => {
       if (!s.seekDragging) return;
       s.seekDragging = false;
-      if (s.isCurrent && s.frameUrls) startUgoira(s);
+
+      if (s.isCurrent && s.frameUrls) {
+        startUgoira(s);
+      }
     };
-    seek.addEventListener('pointerup', dragEnd);
-    seek.addEventListener('pointercancel', dragEnd);
+
+    seek.addEventListener('pointerup', endDrag);
+    seek.addEventListener('pointercancel', endDrag);
     sec.appendChild(seek);
-    s.seekEl = seek;
-    s.seekFill = seekFill;
-
-    const meta = document.createElement('div');
-    meta.className = 'pts-meta';
-    const t = document.createElement('div');
-    t.className = 'pts-title';
-    t.textContent = s.title || '';
-    const au = document.createElement('div');
-    au.className = 'pts-author';
-    au.textContent = s.author || '';
-    meta.appendChild(t);
-    meta.appendChild(au);
-    s.titleEl = t;
-    s.authorEl = au;
-    sec.appendChild(meta);
-
-    const link = document.createElement('a');
-    link.className = 'pts-open';
-    link.href = s.page;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    link.textContent = 'pixivで開く';
-    sec.appendChild(link);
-
-    const rel = document.createElement('button');
-    rel.className = 'pts-related';
-    rel.textContent = 'この作品の関連へ';
-    rel.addEventListener('click', () => switchToRelated(s, rel));
-    sec.appendChild(rel);
-
-    const bm = document.createElement('button');
-    bm.className = 'pts-bookmark';
-    bm.textContent = '🔖 保存';
-    bm.addEventListener('click', () => toggleBookmark(s, bm));
-    sec.appendChild(bm);
-    s.bookmarkBtn = bm;
-
-    // タップ送り（単一・うごイラのみ。左1/3=前、右=次）。スクロールや横スライドと誤認しないよう移動量で判定
-    let tapDown = null;
-    holder.addEventListener('pointerdown', (e) => {
-      tapDown = { x: e.clientX, y: e.clientY, t: Date.now() };
-    });
-    holder.addEventListener('pointerup', (e) => {
-      if (!tapDown) return;
-      const dx = e.clientX - tapDown.x;
-      const dy = e.clientY - tapDown.y;
-      const dt = Date.now() - tapDown.t;
-      tapDown = null;
-      if (s.kind === 'multi' || s.seekDragging) return;
-      if (Math.abs(dx) > 12 || Math.abs(dy) > 12 || dt > 350) return;
-      const r = holder.getBoundingClientRect();
-      const ratio = (e.clientX - r.left) / r.width;
-      gotoSlide(currentIndex() + (ratio < 0.33 ? -1 : 1));
-    });
 
     feedEl.appendChild(sec);
     if (nearObs) nearObs.observe(sec);
@@ -945,100 +1003,25 @@
 
   /* ---------- 関連作品への切り替え ---------- */
 
-  let relatedNextIds = [];
-  let relatedLoading = false;
 
-  async function switchToRelated(slide, btn) {
-    if (relatedSwitchBusy) return;
-    relatedSwitchBusy = true;
-    const generation = feedGeneration;
-    if (btn) { btn.textContent = '読み込み中…'; btn.disabled = true; }
-    // 関連へ進む操作もブックマークとして扱う。保存は裏で実行し、関連フィードの取得を待たせない
-    if (!slide.bookmarked) {
-      ensureBookmarked(slide).catch((e) => {
-        console.warn('[PTS] 関連切替時の自動保存失敗', e);
-      });
-    }
-    try {
-      // pixivのおすすめ（作品の関連）と、本人の行動ベースのおすすめ（ディスカバリー）を並列取得して統合
-      const [recResult, discResult] = await Promise.allSettled([
-        fetchJson(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`),
-        fetchJson('/ajax/discovery/artworks?mode=all&limit=60'),
-      ]);
-      if (generation !== feedGeneration || !slides.includes(slide)) return;
-      if (recResult.status === 'rejected' && discResult.status === 'rejected') {
-        throw new Error('候補取得に失敗');
-      }
-      const rec = recResult.status === 'fulfilled' ? recResult.value : {};
-      const disc = discResult.status === 'fulfilled' ? discResult.value : {};
-      let recItems = Array.isArray(rec.illusts) ? rec.illusts : [];
-      const discItems = Array.isArray(disc.illusts) ? disc.illusts : [];
-      let nextIds = Array.isArray(rec.nextIds) ? rec.nextIds.map(String) : [];
-      if (recItems.length === 0 && nextIds.length > 0) {
-        const batch = nextIds.slice(0, 60);
-        const more = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
-        recItems = more.illusts || [];
-        nextIds = nextIds.slice(batch.length);
-        if (Array.isArray(more.nextIds)) {
-          const queued = new Set(nextIds);
-          more.nextIds.map(String).forEach((id) => { if (!queued.has(id)) { nextIds.push(id); queued.add(id); } });
-        }
-      }
-      const ranked = await prepareCandidates([...recItems, ...discItems], { excludeIds: [slide.id] });
-      if (generation !== feedGeneration || !slides.includes(slide)) return;
-      if (ranked.length === 0) throw new Error('関連候補0件');
-      const idx = slides.indexOf(slide);
-      // 後続スライドは後片付けしてから外す（タイマーやBlobを残さない）
-      slides.slice(idx + 1).forEach((s) => {
-        cleanupSlide(s);
-        if (nearObs && s.sectionEl) nearObs.unobserve(s.sectionEl);
-        if (s.sectionEl) s.sectionEl.remove();
-      });
-      slides = slides.slice(0, idx + 1);
-      mode = 'related';
-      relatedNextIds = [];
-      mergeNextIds(nextIds);
-      addItems(candidatesToSlides(ranked));
-      markCurrentFromScroll();
-      if (btn) btn.textContent = '関連に切替済み';
-    } catch (e) {
-      if (btn) { btn.textContent = '失敗: ' + ((e && e.message) || e); btn.disabled = false; }
-    } finally {
-      relatedSwitchBusy = false;
-    }
-  }
 
   // 関連モードの続き読み込み（候補IDが残っている間は末尾に足していく）
-  async function relatedLoadMore() {
-    if (mode !== 'related' || relatedLoading || relatedSwitchBusy || relatedNextIds.length === 0) return;
-    relatedLoading = true;
-    const generation = feedGeneration;
-    try {
-      // IDは成功してから消費する（失敗時に候補が消えないように）
-      const batch = relatedNextIds.slice(0, 60);
-      const body = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
-      if (generation !== feedGeneration || mode !== 'related') return;
-      const ranked = await prepareCandidates(body.illusts || []);
-      if (generation !== feedGeneration || mode !== 'related') return;
-      relatedNextIds.splice(0, batch.length);
-      addItems(candidatesToSlides(ranked));
-      mergeNextIds(body.nextIds || []);
-    } catch (e) { /* 次のスクロールで再試行 */ }
-    relatedLoading = false;
-  }
 
   /* ---------- フィード管理 ---------- */
 
   function updateCounter() {
-    if (!overlay) return;
-    const c = overlay.querySelector('.pts-counter');
+    const c = overlay?.querySelector('.pts-counter');
     if (!c) return;
+
     if (!slides.length) {
-      c.textContent = mode === 'custom' ? '自前フィード準備中…' : '作品が見つかりません';
+      c.textContent = mode === 'search'
+        ? '検索結果を取得中…'
+        : '自前フィード準備中…';
     } else {
-      const name = {related:'関連',custom:'自前',saved:'保存分'}[mode];
-      c.textContent = `${slides.length} 件${name ? `（${name}）` : ''}`;
+      c.textContent =
+        `${slides.length}件（${mode === 'search' ? '検索' : '自前'}）`;
     }
+
     syncDock();
   }
 
@@ -1055,40 +1038,68 @@
   let curTimer = null;
   function markCurrentFromScroll() {
     if (!feedEl || !slides.length) return;
-    const idx = Math.max(0, Math.min(slides.length - 1, currentIndex()));
+
+    const idx = Math.max(
+      0, Math.min(slides.length - 1, currentIndex())
+    );
+
     slides.forEach((s, i) => {
       const current = i === idx;
       s.sectionEl?.classList.toggle('pts-current', current);
+
       if (current && !s.isCurrent) {
         s.isCurrent = true;
+
         if (s.resolved) upgradeSlide(s);
-        else resolveSlide(s);
+        else void resolveSlide(s);
+
         if (s.kind === 'ugoira') {
-          if (s.frameUrls) startUgoira(s);
-          else if (s.resolved) prepareUgoira(s);
+          if (s.frameUrls?.length) startUgoira(s);
+          else if (s.resolved) void prepareUgoira(s);
         }
+
         armWatchdog(s);
+
       } else if (!current && s.isCurrent) {
-        s.isCurrent = false; stopUgoira(s);
+        s.isCurrent = false;
+        stopUgoira(s);
         if (s.resolved) upgradeSlide(s);
       }
     });
+
     const s = slides[idx];
     onCurrentSlideChanged(s);
-    for (let i = Math.max(0, idx - 3); i <= Math.min(slides.length - 1, idx + 3); i++) {
+
+    for (
+      let i = Math.max(0, idx - 3);
+      i <= Math.min(slides.length - 1, idx + 3);
+      i++
+    ) {
       const x = slides[i];
-      if (x.mainImg?.dataset?.ptsPh && !x.mainImg.getAttribute('src') && x.thumb) x.mainImg.src = x.thumb;
-    }
-    if (quality === 'orig' && visibleReady(s)) {
-      for (const [step, field, urlKey] of [[1,'preloadedO','o'],[2,'preloadedR','r']]) {
-        const n = slides[idx + step];
-        if (n?.resolved && n.kind !== 'ugoira' && n.pairs?.[0]?.[urlKey] && !n[field]) {
-          n[field] = true;
-          const pre = new Image(); pre.decoding = 'async'; pre.src = n.pairs[0][urlKey];
-        }
+
+      if (x.mainImg?.dataset?.ptsPh &&
+          !x.mainImg.getAttribute('src') && x.thumb) {
+        x.mainImg.src = x.thumb;
       }
     }
-    scheduleAutoAdvance(idx);
+
+    for (const [step, field, urlKey] of [
+      [1, 'preloadedO', 'o'],
+      [2, 'preloadedR', 'r']
+    ]) {
+      const n = slides[idx + step];
+
+      if (n?.resolved &&
+          n.kind !== 'ugoira' &&
+          n.pairs?.[0]?.[urlKey] &&
+          !n[field]) {
+        n[field] = true;
+        const pre = new Image();
+        pre.decoding = 'async';
+        pre.src = n.pairs[0][urlKey];
+      }
+    }
+
     syncDock();
   }
 
@@ -1846,7 +1857,6 @@
   applyBookmarkHistory();
   initProfileFromBookmarks();
   let feedGeneration = 0;
-  let relatedSwitchBusy = false;
 
   function candidateId(it) {
     const id = it && (it.id != null ? it.id : it.illustId);
@@ -1982,11 +1992,6 @@
   let customBatchNumber = 0;
 
   // 既存フィードの表示済み作品も記録する（同一ページ内では再表示しない）
-  function rememberDisplayedSlides() {
-    for (const s of slides) {
-      if (s.id) customSeenIds.add(String(s.id));
-    }
-  }
 
   function customPageArtworkId() {
     const match = location.pathname.match(/^\/artworks\/(\d+)(?:\/|$)/);
@@ -2401,37 +2406,67 @@
     customAuthorOffset = 0;
   }
 
-  async function switchToCustom() {
-    if (!overlay || !feedEl || customBusy) return;
+  async function startCustomFeed() {
+    if (!overlay || !feedEl) return;
+
     feedGeneration++;
     const generation = feedGeneration;
+
     if (zoomedSlide) clearZoom();
-    resetAutoAdvance();
-    slides.forEach(cleanupSlide); slides = [];
-    feedEl.innerHTML = ''; feedEl.scrollTop = 0;
+
+    slides.forEach(cleanupSlide);
+    slides = [];
+
+    feedEl.replaceChildren();
+    feedEl.scrollTop = 0;
+
     mode = 'custom';
-    relatedNextIds = []; relatedLoading = false; relatedSwitchBusy = false;
-    customResetState(); customBusy = true; updateCounter();
-    const btn = overlay.querySelector('.pts-custom');
-    if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+    activeView = null;
+
+    customResetState();
+    customSeenIds = new Set();
+    customBusy = true;
+    updateCounter();
+
     try {
       const items = await customFetchBatch();
-      if (generation !== feedGeneration || mode !== 'custom' || overlay.style.display === 'none') return;
-      if (!items.length) throw new Error('表示可能な候補がありません');
-      addItems(candidatesToSlides(items));
-      for (const it of items) customSeenIds.add(String(it.id)); // 提示済み。既読は別
-      customBatchNumber++;
-      if (slides[0]) resolveSlide(slides[0]);
-      markCurrentFromScroll();
-    } catch (e) {
-      if (generation === feedGeneration && mode === 'custom') {
-        console.warn('[PTS custom]', e);
-        overlay.querySelector('.pts-counter').textContent = '自前フィード失敗: ' + (e.message || e);
+
+      if (generation !== feedGeneration ||
+          mode !== 'custom' ||
+          overlay.style.display === 'none') return;
+
+      if (!items.length) {
+        throw new Error('表示できる候補がありません');
       }
+
+      addItems(candidatesToSlides(items));
+
+      for (const item of items) {
+        customSeenIds.add(String(item.id));
+      }
+
+      customBatchNumber++;
+
+      if (slides[0]) {
+        void resolveSlide(slides[0]);
+      }
+
+      markCurrentFromScroll();
+
+    } catch (e) {
+      if (generation === feedGeneration) {
+        console.warn('[PTS custom]', e);
+
+        const c = overlay.querySelector('.pts-counter');
+        if (c) {
+          c.textContent =
+            '自前フィード失敗: ' + (e?.message || e);
+        }
+      }
+
     } finally {
-      if (generation === feedGeneration && mode === 'custom') {
+      if (generation === feedGeneration) {
         customBusy = false;
-        if (btn) { btn.disabled = false; btn.textContent = '自前フィード'; }
       }
     }
   }
@@ -2462,16 +2497,6 @@
     }
   }
 
-  function mergeNextIds(ids) {
-    const queued = new Set(relatedNextIds);
-    const displayed = new Set(slides.map((s) => String(s.id)));
-    for (const value of ids || []) {
-      const id = String(value);
-      if (!id || queued.has(id) || displayed.has(id) || knownBookmarkedIds.has(id)) continue;
-      relatedNextIds.push(id);
-      queued.add(id);
-    }
-  }
 
   // スライド群を指定位置の直後に差し込む（ブックマーク時のおすすめ差し込み用）
   function insertSlidesAfter(posIdx, newSlides) {
@@ -2493,7 +2518,6 @@
   const SEEN_MAX = 5000;
   const seenTimes = new Map();
   const sessionTrail = [];
-  const sessionSaved = [];
   const POSITIVE_KEY = 'PTS_POSITIVE_V1';
   const positiveSignals = new Set();
 
@@ -2515,7 +2539,6 @@
   let sessionBackTarget = '';
   let activeView = null;
   let activeTick = null;
-  let keepCurrent = false;
   let immersive = false;
   let uiHideTimer = null;
   let zoomedSlide = null;
@@ -2523,7 +2546,6 @@
   let effectsReduced = false;
   let closeConfirmTimer = null;
   let experienceInstalled = false;
-  let autoKey = '';
   let touchStart = null;
   let lastTap = null;
   let singleTapTimer = null;
@@ -2599,49 +2621,17 @@
     const img = s.mainImg;
     return !!(img && img.complete && img.naturalWidth > 0);
   }
-  function resetAutoAdvance() {
-    autoKey = '';
-    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-  }
-    function syncDock() {
+
+  function syncDock() {
     if (!overlay || !experienceInstalled) return;
 
-    const s = slides[currentIndex()];
-
-    const set = (selector, label) => {
-      const el = overlay.querySelector(selector);
-      if (el) el.textContent = label;
-    };
-
-    set(
-      '.pts-dock-save',
-      s && (s.bookmarked ||
-        knownBookmarkedIds.has(String(s.id)))
-        ? '✓ 保存済'
-        : '🔖 保存'
+    const btn = overlay.querySelector(
+      '.pts-dock-immersive'
     );
 
-    set(
-      '.pts-dock-auto',
-      autoSec ? '⏸ 自動ON' : '▶ 自動OFF'
-    );
-
-    set(
-      '.pts-dock-immersive',
-      immersive ? 'UI表示' : '没入'
-    );
-
-    set(
-      '.pts-tool-keep',
-      keepCurrent ? '📌 キープ中' : '📌 キープ'
-    );
-
-    set(
-      '.pts-tool-fit',
-      overlay.classList.contains('pts-fit-contain')
-        ? '全体表示'
-        : '画面充填'
-    );
+    if (btn) {
+      btn.textContent = immersive ? 'UI表示' : '没入';
+    }
   }
   function noteSessionVisit(s) {
     if (!s || !s.id) return;
@@ -2661,7 +2651,8 @@
         old.generation === feedGeneration &&
         slides.includes(old.slide)) {
 
-      const manual = navIntent.reason === 'user' &&
+      const manual =
+        navIntent.reason === 'user' &&
         performance.now() <= navIntent.until;
 
       if (manual && old.readySeen &&
@@ -2689,7 +2680,6 @@
 
     if (zoomedSlide && zoomedSlide !== s) clearZoom();
 
-    resetAutoAdvance();
     syncDock();
   }
   function applyPositive(s, kind, weight) {
@@ -2777,37 +2767,50 @@
     );
   }
   function onUgoiraLoop(s) {
-    if (activeView?.slide === s) activeView.loopCompleted = true;
-    if (s.isCurrent && autoSec && !keepCurrent && !zoomedSlide && !document.hidden) {
-      void advanceWhenReady(s);
+    if (activeView?.slide === s) {
+      activeView.loopCompleted = true;
     }
   }
 
   function clearZoom() {
     if (!zoomedSlide) return;
+
     if (zoomedSlide.mainImg) {
       zoomedSlide.mainImg.style.transform = '';
       zoomedSlide.mainImg.style.transformOrigin = '';
     }
+
     zoomedSlide.sectionEl?.classList.remove('pts-zoomed');
     zoomedSlide = null;
+
     if (feedEl) feedEl.style.overflowY = '';
-    resetAutoAdvance();
-    scheduleAutoAdvance(currentIndex());
   }
   function toggleZoom(s, x, y) {
     if (!s?.mainImg) return;
-    if (zoomedSlide === s) { clearZoom(); return; }
+
+    if (zoomedSlide === s) {
+      clearZoom();
+      return;
+    }
+
     clearZoom();
+
     const rect = s.mainImg.getBoundingClientRect();
-    const px = Math.min(100, Math.max(0, ((x - rect.left) / Math.max(1, rect.width)) * 100));
-    const py = Math.min(100, Math.max(0, ((y - rect.top) / Math.max(1, rect.height)) * 100));
+
+    const px = Math.min(100, Math.max(
+      0, ((x - rect.left) / Math.max(1, rect.width)) * 100
+    ));
+
+    const py = Math.min(100, Math.max(
+      0, ((y - rect.top) / Math.max(1, rect.height)) * 100
+    ));
+
     s.mainImg.style.transformOrigin = `${px}% ${py}%`;
     s.mainImg.style.transform = 'scale(2)';
     s.sectionEl?.classList.add('pts-zoomed');
+
     zoomedSlide = s;
     feedEl.style.overflowY = 'hidden';
-    resetAutoAdvance();
   }
   function showControlsTemporarily() {
     if (!overlay) return;
@@ -2867,8 +2870,7 @@
     const generation = feedGeneration;
 
     try {
-      if (!s.resolved &&
-          (!s.tags?.length || !s.userId)) {
+      if (!s.resolved && (!s.tags?.length || !s.userId)) {
         await resolveSlide(s);
       }
 
@@ -2880,20 +2882,19 @@
       }
 
       if (generation === feedGeneration &&
+          mode === 'custom' &&
           slides.includes(s)) {
-        void insertSeriesAfter(s);
 
-        if (mode === 'custom') {
-          reorderUnviewedAfterLike(s);
-          void insertRecommendationsAfterBookmark(s);
-        }
+        reorderUnviewedAfterLike(s);
+        void insertSeriesAfter(s);
+        void insertRecommendationsAfterBookmark(s);
       }
 
-      const newlySaved = await ensureBookmarked(s);
-      if (newlySaved) recordSessionSave(s);
+      // 既に保存済みならensureBookmarkedは再POSTしない。
+      await ensureBookmarked(s);
 
     } catch (e) {
-      console.warn('[PTS like] ブックマーク処理失敗', e);
+      console.warn('[PTS like]', e);
     } finally {
       syncDock();
     }
@@ -3074,16 +3075,7 @@
     }, true);
   }
 
-  function historyBack() {
-    if (!sessionTrail.length) return;
-    if (sessionTrail.at(-1)?.id === String(slides[currentIndex()]?.id)) {
-      if (sessionTrail.length < 2) return;
-      sessionTrail.pop();
-    }
-    const prev = sessionTrail.at(-1);
-    const idx = slides.findIndex(s => String(s.id) === prev.id);
-    if (idx >= 0) { sessionBackTarget = prev.id; gotoSlide(idx); }
-  }
+
   function showSessionHistory() {
     const panel = overlay.querySelector('.pts-history-panel');
     const list = panel.querySelector('.pts-history-list');
@@ -3103,33 +3095,7 @@
     if (!list.childElementCount) list.textContent = '閲覧履歴はまだありません';
     panel.hidden = false;
   }
-  function recordSessionSave(s) {
-    if (!s || sessionSaved.some(x => x.id === String(s.id))) return;
-    sessionSaved.push({ id: String(s.id), title: s.title, url: s.thumb,
-      userName: s.author, userId: s.userId, tags: s.tags || [],
-      illustType: s.rawType, bookmarkData: { id: s.id } });
-  }
-  function switchToSaved() {
-    if (!overlay || !feedEl) return;
-    if (!sessionSaved.length) {
-      const n = overlay.querySelector('.pts-counter');
-      if (n) n.textContent = 'このセッションで保存した作品はまだありません';
-      return;
-    }
-    feedGeneration++;
-    clearZoom(); resetAutoAdvance();
-    slides.forEach(cleanupSlide);
-    slides = []; feedEl.replaceChildren(); feedEl.scrollTop = 0;
-    mode = 'saved';
-    const items = sessionSaved.map(it => {
-      const s = newSlide(it.id, it.url, it.title, it.userName);
-      s.tags = it.tags; s.userId = it.userId; s.rawType = it.illustType;
-      s.bookmarked = true; return s;
-    });
-    addItems(items);
-    items.forEach(paintBookmarkBtn);
-    markCurrentFromScroll();
-  }
+
   function confirmCloseViewer() {
     const btn = overlay?.querySelector('.pts-close');
     if (!btn) return;
@@ -3144,55 +3110,31 @@
     }, 2500);
   }
 
-    function handleExperienceAction(act, fromTools = false) {
+  function handleExperienceAction(act, fromTools = false) {
     if (!act || !overlay) return;
 
-    const s = slides[currentIndex()];
     const tools = overlay.querySelector('.pts-tools');
-
-    showControlsTemporarily();
-
-    if (act === 'save' && s) {
-      void toggleBookmark(s, s.bookmarkBtn);
-    }
-
-    if (act === 'auto') {
-      autoSec = autoSec ? 0 : 5;
-
-      const select = overlay.querySelector('.pts-auto');
-      if (select) select.value = String(autoSec);
-
-      resetAutoAdvance();
-      scheduleAutoAdvance(currentIndex());
-    }
 
     if (act === 'immersive') {
       setImmersive(!immersive);
+      return;
     }
 
-    if (act === 'keep') {
-      keepCurrent = !keepCurrent;
-      resetAutoAdvance();
-      scheduleAutoAdvance(currentIndex());
+    if (act === 'tools') {
+      if (tools) tools.hidden = !tools.hidden;
+      showControlsTemporarily();
+      return;
     }
 
-    if (act === 'back') historyBack();
-    if (act === 'history') showSessionHistory();
-    if (act === 'saved') switchToSaved();
-
-    if (act === 'related' && s) {
-      void switchToRelated(s, null);
+    if (act === 'history') {
+      showSessionHistory();
     }
 
-    if (act === 'page') buildFeed();
-
-    if (act === 'fit') {
-      overlay.classList.toggle('pts-fit-contain');
+    if (act === 'refresh') {
+      void refreshCurrentSlide();
     }
 
-    if (act === 'tools' && tools) {
-      tools.hidden = !tools.hidden;
-    } else if (fromTools && tools) {
+    if (fromTools && tools) {
       tools.hidden = true;
     }
 
@@ -3203,45 +3145,194 @@
     const style = document.createElement('style');
 
     style.textContent = `
-      #pts-overlay .pts-bar{pointer-events:none;justify-content:center;background:linear-gradient(#0009,transparent);transition:opacity .2s}
+      #pts-overlay .pts-bar{
+        pointer-events:none;justify-content:center;
+        background:linear-gradient(#0009,transparent);
+        transition:opacity .2s
+      }
       #pts-overlay.pts-top-hidden .pts-bar{opacity:0}
-      #pts-overlay .pts-meta,#pts-overlay .pts-related,#pts-overlay .pts-bookmark,#pts-overlay .pts-open{display:none!important}
-      #pts-overlay .pts-img{display:block;width:100%;height:100%;max-width:none;max-height:none;object-fit:cover}
-      #pts-overlay.pts-fit-contain .pts-img{object-fit:contain}
 
-      #pts-overlay .pts-dock{position:absolute;bottom:0;left:0;right:0;z-index:19;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;padding:8px 8px calc(8px + env(safe-area-inset-bottom));background:linear-gradient(transparent,#000c 20%,#000d);transition:opacity .2s}
-      #pts-overlay .pts-dock button{min-height:48px;border:1px solid #ffffff28;background:#202020a8;color:#fff;border-radius:12px;font-size:13px;touch-action:manipulation}
+      #pts-overlay .pts-meta,
+      #pts-overlay .pts-related,
+      #pts-overlay .pts-bookmark,
+      #pts-overlay .pts-open{display:none!important}
 
-      #pts-overlay .pts-tools{position:absolute;bottom:calc(68px + env(safe-area-inset-bottom));left:8px;right:8px;z-index:21;background:#151515eb;border:1px solid #5558;border-radius:12px;padding:10px;display:flex;flex-wrap:wrap;gap:8px;max-height:55vh;overflow:auto}
-      #pts-overlay .pts-tools[hidden],#pts-overlay .pts-history-panel[hidden]{display:none!important}
-      #pts-overlay .pts-tools button,#pts-overlay .pts-tools select{margin:0;padding:9px;color:white;background:#444;border:0;border-radius:8px;min-height:42px}
+      #pts-overlay .pts-img{
+        display:block;width:100%;height:100%;
+        max-width:none;max-height:none;object-fit:cover
+      }
 
-      #pts-overlay .pts-history-panel{position:absolute;inset:0;z-index:35;background:#000d;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}
-      #pts-overlay .pts-history-sheet{width:100%;max-width:900px;height:80dvh;background:#151515;color:white;border:1px solid #555;border-radius:12px;display:flex;flex-direction:column;padding:12px;box-sizing:border-box}
-      #pts-overlay .pts-history-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px}
-      #pts-overlay .pts-history-head button{padding:10px;border-radius:8px;background:#444;color:white;border:0}
-      #pts-overlay .pts-history-list{display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0}
-      #pts-overlay .pts-history-list button{padding:11px;text-align:left;background:#303030;color:#fff;border:0;border-radius:7px}
+      #pts-overlay .pts-dock{
+        position:absolute;bottom:0;left:0;right:0;z-index:19;
+        display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:8px;padding:8px 8px calc(8px + env(safe-area-inset-bottom));
+        background:linear-gradient(transparent,#000c 20%,#000d);
+        transition:opacity .2s
+      }
+      #pts-overlay .pts-dock button{
+        min-height:48px;border:1px solid #ffffff28;
+        background:#202020a8;color:white;border-radius:12px;
+        font-size:14px;touch-action:manipulation
+      }
+
+      #pts-overlay .pts-tools{
+        position:absolute;bottom:calc(68px + env(safe-area-inset-bottom));
+        left:8px;right:8px;z-index:21;
+        background:#151515eb;border:1px solid #5558;
+        border-radius:12px;padding:10px;
+        display:flex;flex-wrap:wrap;gap:8px;
+        max-height:55vh;overflow:auto
+      }
+      #pts-overlay .pts-tools[hidden],
+      #pts-overlay .pts-history-panel[hidden],
+      #pts-overlay .pts-search-tags[hidden]{display:none!important}
+      #pts-overlay .pts-tools button{
+        padding:10px;color:#fff;background:#444;
+        border:0;border-radius:8px;min-height:42px
+      }
+
+      #pts-overlay .pts-history-panel{
+        position:absolute;inset:0;z-index:35;background:#000d;
+        display:flex;align-items:center;justify-content:center;
+        padding:12px;box-sizing:border-box
+      }
+      #pts-overlay .pts-history-sheet{
+        width:100%;max-width:900px;height:80dvh;background:#151515;
+        color:white;border:1px solid #555;border-radius:12px;
+        display:flex;flex-direction:column;padding:12px;box-sizing:border-box
+      }
+      #pts-overlay .pts-history-head{
+        display:flex;align-items:center;justify-content:space-between;
+        padding-bottom:10px
+      }
+      #pts-overlay .pts-history-head button{
+        padding:10px;border-radius:8px;background:#444;color:white;border:0
+      }
+      #pts-overlay .pts-history-list{
+        display:flex;flex-direction:column;gap:6px;
+        overflow:auto;min-height:0
+      }
+      #pts-overlay .pts-history-list button{
+        padding:11px;text-align:left;background:#303030;
+        color:#fff;border:0;border-radius:7px
+      }
       #pts-overlay .pts-history-list button:disabled{opacity:.4}
 
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-dock,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-bar,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-tools,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-pagechip,#pts-overlay.pts-immersive:not(.pts-controls-show) .pts-seek{opacity:0;pointer-events:none}
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-dock,
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-bar,
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-tools,
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-pagechip{
+        opacity:0;pointer-events:none
+      }
 
-      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-slide.pts-current.pts-multi .pts-pagechip{opacity:.42;pointer-events:none;top:calc(10px + env(safe-area-inset-top));right:9px;font-size:10px;padding:2px 6px;background:rgba(0,0,0,.35);color:#fff}
+      #pts-overlay.pts-immersive:not(.pts-controls-show)
+        .pts-slide.pts-current.pts-multi .pts-pagechip{
+        opacity:.42;pointer-events:none;
+        top:calc(10px + env(safe-area-inset-top));right:9px;
+        font-size:10px;padding:2px 6px;
+        background:rgba(0,0,0,.35);color:#fff
+      }
+    `;
 
-      #pts-overlay .pts-slide.pts-current .pts-holder{animation:ptsIn .16s ease-out}
+    const extra = document.createElement('style');
+
+    extra.textContent = `
+      #pts-overlay .pts-seek{
+        position:absolute;left:12px;right:12px;
+        top:auto;bottom:calc(73px + env(safe-area-inset-bottom));
+        height:32px;z-index:27;background:none;
+        touch-action:none
+      }
+      #pts-overlay .pts-seek::before{
+        content:"";position:absolute;left:0;right:0;top:50%;
+        height:4px;transform:translateY(-50%);
+        background:rgba(255,255,255,.30);border-radius:4px
+      }
+      #pts-overlay .pts-seek-fill{
+        position:absolute;left:0;top:50%;height:4px;
+        transform:translateY(-50%);background:#0096fa;
+        border-radius:4px
+      }
+      #pts-overlay .pts-seek-knob{
+        position:absolute;top:50%;left:0%;
+        width:16px;height:16px;margin-left:0;
+        transform:translate(-50%,-50%);border-radius:50%;
+        background:#fff;box-shadow:0 1px 5px #0009
+      }
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-seek{
+        opacity:1!important;pointer-events:auto!important
+      }
+
+      #pts-overlay .pts-ugoira-status{
+        position:absolute;left:50%;top:43%;z-index:17;
+        transform:translate(-50%,-50%);
+        padding:10px 15px;border-radius:12px;
+        background:rgba(0,0,0,.78);color:#fff;
+        font-size:13px;text-align:center;pointer-events:none;
+        max-width:85vw
+      }
+      #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
+      #pts-overlay .pts-ugoira-error{color:#ffd6d6}
+
+      #pts-overlay .pts-search-tags{
+        position:absolute;left:0;right:0;z-index:20;
+        top:calc(39px + env(safe-area-inset-top));
+        display:flex;gap:6px;padding:4px 10px;
+        overflow-x:auto;scrollbar-width:none;
+        background:linear-gradient(#000a,#0003);
+        transition:opacity .2s
+      }
+      #pts-overlay .pts-search-tags::-webkit-scrollbar{display:none}
+      #pts-overlay .pts-search-tags button{
+        flex-shrink:0;white-space:nowrap;color:#fff;
+        background:#333b;border:1px solid #ffffff30;
+        border-radius:999px;padding:7px 11px;font-size:12px
+      }
+      #pts-overlay.pts-top-hidden .pts-search-tags,
+      #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-search-tags{
+        opacity:0;pointer-events:none
+      }
+
+      #pts-overlay .pts-slide.pts-current .pts-holder{
+        animation:ptsIn .16s ease-out
+      }
       @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
-      #pts-overlay .pts-slide.pts-slow:not(.pts-zoomed) .pts-img{animation:ptsSlow 5s ease-out both}
-      @keyframes ptsSlow{from{transform:scale(1)}to{transform:scale(1.025)}}
-      #pts-overlay .pts-zoomed .pts-img{transition:transform .18s ease-out!important;animation:none!important}
+      #pts-overlay .pts-slide.pts-slow:not(.pts-zoomed) .pts-img{
+        animation:ptsSlow 5s ease-out both
+      }
+      @keyframes ptsSlow{
+        from{transform:scale(1)}to{transform:scale(1.025)}
+      }
+      #pts-overlay .pts-zoomed .pts-img{
+        transition:transform .18s ease-out!important;
+        animation:none!important
+      }
       #pts-overlay .pts-holder{touch-action:manipulation}
       #pts-overlay .pts-zoomed .pts-holder{touch-action:none}
-      #pts-overlay.pts-low-effects .pts-current .pts-holder{animation:none!important}
-
-      #pts-overlay .pts-like-heart{position:absolute;z-index:18;pointer-events:none;transform:translate(-50%,-50%);font-size:clamp(70px,20vw,120px);line-height:1;filter:drop-shadow(0 4px 16px #0009);animation:ptsHeart .85s ease-out forwards}
-      @keyframes ptsHeart{0%{opacity:0;transform:translate(-50%,-40%) scale(.35)}24%{opacity:1;transform:translate(-50%,-55%) scale(1.18)}65%{opacity:.95;transform:translate(-50%,-65%) scale(1)}100%{opacity:0;transform:translate(-50%,-100%) scale(1.14)}}
-
-      @media(prefers-reduced-motion:reduce){#pts-overlay .pts-img,#pts-overlay .pts-holder{animation:none!important;transition:none!important}#pts-overlay .pts-like-heart{animation-duration:.2s}}
+      #pts-overlay.pts-low-effects .pts-current .pts-holder{
+        animation:none!important
+      }
+      #pts-overlay .pts-like-heart{
+        position:absolute;z-index:18;pointer-events:none;
+        font-size:clamp(70px,20vw,120px);
+        filter:drop-shadow(0 4px 16px #0009);
+        animation:ptsHeart .85s ease-out forwards
+      }
+      @keyframes ptsHeart{
+        0%{opacity:0;transform:translate(-50%,-40%) scale(.35)}
+        24%{opacity:1;transform:translate(-50%,-55%) scale(1.18)}
+        65%{opacity:.95;transform:translate(-50%,-65%) scale(1)}
+        100%{opacity:0;transform:translate(-50%,-100%) scale(1.14)}
+      }
+      @media(prefers-reduced-motion:reduce){
+        #pts-overlay .pts-img,#pts-overlay .pts-holder{
+          animation:none!important;transition:none!important
+        }
+        #pts-overlay .pts-like-heart{animation-duration:.2s}
+      }
     `;
+
+    document.head.appendChild(extra);
 
     document.head.appendChild(style);
   }
@@ -3254,14 +3345,14 @@
     dock.className = 'pts-dock';
     dock.setAttribute('aria-label', 'ビューア操作');
 
-    dock.innerHTML = [
-      ['save', '🔖 保存'],
-      ['auto', '⏸ 自動ON'],
-      ['immersive', '没入'],
-      ['tools', 'その他']
-    ].map(([k, t]) =>
-      `<button type="button" class="pts-dock-${k}" data-act="${k}">${t}</button>`
-    ).join('');
+    dock.innerHTML = `
+      <button type="button"
+        class="pts-dock-immersive"
+        data-act="immersive">没入</button>
+      <button type="button"
+        class="pts-dock-tools"
+        data-act="tools">その他</button>
+    `;
 
     overlay.appendChild(dock);
 
@@ -3269,33 +3360,18 @@
     tools.className = 'pts-tools';
     tools.hidden = true;
 
-    for (const [k, t] of [
-      ['keep', '📌 キープ'],
-      ['back', '↩ 戻る'],
-      ['history', '履歴'],
-      ['saved', '保存分'],
-      ['related', '関連へ'],
-      ['page', 'ページ'],
-      ['fit', '画面充填']
-    ]) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = `pts-tool-${k}`;
-      btn.dataset.act = k;
-      btn.textContent = t;
-      tools.appendChild(btn);
-    }
+    const history = document.createElement('button');
+    history.type = 'button';
+    history.dataset.act = 'history';
+    history.textContent = '履歴';
+    tools.appendChild(history);
 
     overlay.appendChild(tools);
 
-    // イベント登録済みの要素をDOM移動。
-    // 診断・画質・自前フィード等の機能を保持。
+    // 診断・更新はイベント登録済みの要素を移動。
     for (const sel of [
-      '.pts-quality',
-      '.pts-auto',
-      '.pts-custom',
-      '.pts-rescan',
-      '.pts-diagnostic'
+      '.pts-diagnostic',
+      '.pts-rescan'
     ]) {
       const el = overlay.querySelector('.pts-bar ' + sel);
       if (el) tools.appendChild(el);
@@ -3325,7 +3401,17 @@
     const panel = document.createElement('div');
     panel.className = 'pts-history-panel';
     panel.hidden = true;
-    panel.innerHTML = '<div class="pts-history-sheet"><div class="pts-history-head">閲覧履歴（最新50件）<button type="button" class="pts-history-close">閉じる</button></div><div class="pts-history-list"></div></div>';
+
+    panel.innerHTML = `
+      <div class="pts-history-sheet">
+        <div class="pts-history-head">
+          閲覧履歴（最新50件）
+          <button type="button"
+            class="pts-history-close">閉じる</button>
+        </div>
+        <div class="pts-history-list"></div>
+      </div>
+    `;
 
     overlay.appendChild(panel);
 
@@ -3347,10 +3433,8 @@
     bindExperienceGestures();
 
     document.addEventListener('keydown', e => {
-      if (
-        e.key !== 'Escape' ||
-        overlay.style.display === 'none'
-      ) return;
+      if (e.key !== 'Escape' ||
+          overlay.style.display === 'none') return;
 
       e.stopImmediatePropagation();
       e.preventDefault();
@@ -3362,10 +3446,6 @@
     }
 
     installExperienceCSS();
-
-    const sel = overlay.querySelector('.pts-auto');
-    if (sel) sel.value = String(autoSec);
-
     syncDock();
   }
 
@@ -3388,66 +3468,310 @@
     }
     return [];
   }
+
+  function getSearchPageConfig() {
+    const path = location.pathname;
+
+    const match = path.match(
+      /^\/tags\/([^/]+)(?:\/(?:artworks|illustrations|manga))?\/?$/
+    );
+
+    if (!match) return null;
+
+    let word;
+
+    try {
+      word = decodeURIComponent(match[1]);
+    } catch (e) {
+      return null;
+    }
+
+    word = word.trim();
+    if (!word) return null;
+
+    const params = new URLSearchParams(location.search);
+
+    const order = ['popular_d', 'date_d'].includes(
+      params.get('order')
+    ) ? params.get('order') : 'popular_d';
+
+    const searchMode = ['all', 'safe', 'r18'].includes(
+      params.get('mode')
+    ) ? params.get('mode') : 'all';
+
+    const matchMode = ['s_tag', 's_tag_full'].includes(
+      params.get('s_mode')
+    ) ? params.get('s_mode') : 's_tag';
+
+    const requestedPage = Number(params.get('p'));
+    const page = Number.isInteger(requestedPage) &&
+      requestedPage >= 1 && requestedPage <= 1000
+        ? requestedPage : 1;
+
+    return { word, order, searchMode, matchMode, page };
+  }
+
+  let searchConfig = null;
+  let searchPage = 1;
+  let searchBusy = false;
+  let searchFinished = false;
+  let searchLastFailure = 0;
+  let searchTagCandidates = [];
+
+  function findSearchTagCandidates(body, currentWord) {
+    const result = [];
+    const used = new Set([currentWord]);
+
+    const add = value => {
+      const tag = String(value || '').trim();
+
+      if (!tag || used.has(tag) || tag.length > 80) return;
+      used.add(tag);
+      result.push(tag);
+    };
+
+    const read = items => {
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          if (typeof item === 'string') add(item);
+          else if (item && typeof item === 'object') {
+            add(item.tag ?? item.name ?? item.word);
+          }
+        }
+      }
+    };
+
+    read(body?.relatedTags);
+    read(body?.illustManga?.relatedTags);
+    read(body?.tagSuggestions);
+    read(body?.suggestTags);
+
+    if (!result.length) {
+      document.querySelectorAll(
+        'a[href^="/tags/"]'
+      ).forEach(a => {
+        if (result.length >= 12) return;
+        if (overlay?.contains(a)) return;
+
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/^\/tags\/([^/?#]+)/);
+        if (!m) return;
+
+        try {
+          add(decodeURIComponent(m[1]));
+        } catch (e) {}
+      });
+    }
+
+    if (!result.length) {
+      const values = new Map();
+
+      for (const source of [
+        historyProfile.tags,
+        profile.tags
+      ]) {
+        for (const [tag, score] of Object.entries(source || {})) {
+          const weight = Number(score);
+          if (tag && Number.isFinite(weight) && weight > 0) {
+            values.set(tag, (values.get(tag) || 0) + weight);
+          }
+        }
+      }
+
+      for (const [tag] of [...values].sort(
+        (a, b) => b[1] - a[1]
+      )) {
+        add(tag);
+        if (result.length >= 12) break;
+      }
+    }
+
+    return result.slice(0, 12);
+  }
+
+  function renderSearchTagCandidates() {
+    let bar = overlay?.querySelector('.pts-search-tags');
+    if (!overlay) return;
+
+    if (!bar) {
+      bar = document.createElement('nav');
+      bar.className = 'pts-search-tags';
+      bar.setAttribute('aria-label', '検索ワード候補');
+      overlay.appendChild(bar);
+    }
+
+    bar.replaceChildren();
+
+    if (mode !== 'search' || !searchTagCandidates.length) {
+      bar.hidden = true;
+      return;
+    }
+
+    for (const tag of searchTagCandidates) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.textContent = `# ${tag}`;
+
+      chip.addEventListener('click', () => {
+        const url =
+          '/tags/' + encodeURIComponent(tag) + '/artworks';
+        window.location.assign(url);
+      });
+
+      bar.appendChild(chip);
+    }
+
+    bar.hidden = false;
+    showControlsTemporarily();
+  }
+
+  async function searchLoadMore() {
+    if (mode !== 'search' || !searchConfig ||
+        searchBusy || searchFinished ||
+        overlay?.style.display === 'none') return;
+
+    if (Date.now() - searchLastFailure < 4000) return;
+
+    searchBusy = true;
+    const generation = feedGeneration;
+    const page = searchPage;
+
+    try {
+      const params = new URLSearchParams({
+        word: searchConfig.word,
+        order: searchConfig.order,
+        mode: searchConfig.searchMode,
+        s_mode: searchConfig.matchMode,
+        p: String(page)
+      });
+
+      const url =
+        '/ajax/search/artworks/' +
+        encodeURIComponent(searchConfig.word) +
+        '?' + params.toString();
+
+      const body = await fetchJson(url);
+
+      if (generation !== feedGeneration ||
+          mode !== 'search') return;
+
+      const data = body?.illustManga?.data;
+
+      if (!Array.isArray(data)) {
+        throw new Error('検索APIのdataが配列ではありません');
+      }
+
+      if (page === searchConfig.page) {
+        searchTagCandidates = findSearchTagCandidates(
+          body, searchConfig.word
+        );
+        renderSearchTagCandidates();
+      }
+
+      const displayed = new Set(
+        slides.map(s => String(s.id))
+      );
+
+      const selected = [];
+
+      for (const raw of data) {
+        if (!raw || typeof raw !== 'object') continue;
+
+        const it = normalizeCandidate(raw);
+
+        if (!/^\d+$/.test(it.id) ||
+            displayed.has(it.id) ||
+            isSeen(it.id) ||
+            knownBookmarkedIds.has(it.id) ||
+            it.bookmarked) continue;
+
+        displayed.add(it.id);
+        selected.push(it);
+      }
+
+      if (selected.length) {
+        addItems(candidatesToSlides(selected));
+        if (slides.length === selected.length) {
+          markCurrentFromScroll();
+        }
+      }
+
+      const total = Number(body?.illustManga?.total);
+      const size = 36;
+
+      searchPage = page + 1;
+
+      if (!data.length ||
+          (Number.isFinite(total) && total >= 0 &&
+           page * size >= total)) {
+        searchFinished = true;
+      }
+
+      if (!slides.length && searchFinished) {
+        overlay.querySelector('.pts-counter').textContent =
+          '表示可能な検索結果がありません';
+      }
+
+    } catch (e) {
+      searchLastFailure = Date.now();
+      console.warn('[PTS search]', e);
+
+      if (!slides.length) {
+        overlay.querySelector('.pts-counter').textContent =
+          '検索取得失敗: ' + (e?.message || e);
+      }
+
+    } finally {
+      if (generation === feedGeneration) searchBusy = false;
+    }
+  }
+
+  async function startSearchFeed() {
+    if (!overlay || !feedEl || !searchConfig) return;
+
+    feedGeneration++;
+    const generation = feedGeneration;
+
+    if (zoomedSlide) clearZoom();
+
+    slides.forEach(cleanupSlide);
+    slides = [];
+
+    feedEl.replaceChildren();
+    feedEl.scrollTop = 0;
+
+    mode = 'search';
+    activeView = null;
+
+    searchPage = searchConfig.page;
+    searchBusy = false;
+    searchFinished = false;
+    searchLastFailure = 0;
+    searchTagCandidates = [];
+
+    updateCounter();
+
+    // 先頭ページが全件既読でも次ページを試せるようにする。
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (generation !== feedGeneration ||
+          searchFinished || slides.length) break;
+
+      await searchLoadMore();
+
+      if (searchLastFailure) break;
+    }
+
+    if (generation === feedGeneration && slides.length) {
+      markCurrentFromScroll();
+    }
+  }
   let customTagOffset = 0;
   let customFollowPage = 1;
   let customFollowFinished = false;
   let customAuthorOffset = 0;
 
-  /* ---------- v3.11: advanceWhenReady 最終版（24/24） ---------- */
-  async function advanceWhenReady(s) {
-    if (!slides.includes(s) || !s.isCurrent || !autoSec ||
-        keepCurrent || zoomedSlide || document.hidden || s.advancePending) return;
-    s.advancePending = true;
-    const generation = feedGeneration;
-    try {
-      const idx = slides.indexOf(s);
-      if (idx === slides.length - 1) {
-        if (mode === 'custom' && !customBusy && !customExhausted &&
-            Date.now() - (s.lastFetchAttempt || 0) > 8000) {
-          s.lastFetchAttempt = Date.now();
-          await customLoadMore();
-        } else if (mode === 'related' && relatedNextIds.length) {
-          await relatedLoadMore();
-        } else if (mode === 'page' && !pageLoadBusy && pageLoadMisses < 4) {
-          pageLoadMore();
-        }
-      }
-      if (generation !== feedGeneration || slides[idx] !== s ||
-          !s.isCurrent || !autoSec || keepCurrent || zoomedSlide) return;
-      const next = slides[idx + 1];
-      if (!next) {
-        if (mode === 'saved' && slides.length > 1) gotoSlide(0);
-        else if ((mode === 'custom' && !customExhausted) ||
-                 (mode === 'related' && relatedNextIds.length) ||
-                 (mode === 'page' && pageLoadMisses < 4)) {
-          setTimeout(() => { if (s.isCurrent) void advanceWhenReady(s); }, 1200);
-        }
-        return;
-      }
-      if (!next.resolved) void resolveSlide(next);
-      if (!visibleReady(next)) {
-        setTimeout(() => { if (s.isCurrent) void advanceWhenReady(s); }, 550);
-        return;
-      }
-      gotoSlide(idx + 1);
-    } finally {
-      s.advancePending = false;
-    }
-  }
-
-  // 非表示中の経過時間を自動送りへ持ち越さない。
-  document.addEventListener('visibilitychange', () => {
-    resetAutoAdvance();
-    if (activeView) activeView.last = performance.now();
-    if (document.visibilityState === 'visible' && overlay?.style.display !== 'none') {
-      scheduleAutoAdvance(currentIndex());
-    }
-  });
-
   /* ---------- 片手・ハンズフリー向け機能 ---------- */
 
-  let autoSec = 5;
-  let autoTimer = null;
   let wakeLock = null;
   let csrfToken = null;
 
@@ -3473,25 +3797,6 @@
   }
 
   // 自動送り：表示が落ち着いたらタイマーを張り直す。うごイラは1ループ分は最低待つ
-  function scheduleAutoAdvance(idx) {
-    const s = slides[idx];
-    if (!s || !autoSec || keepCurrent || zoomedSlide ||
-        !overlay || overlay.style.display === 'none' || document.hidden) {
-      resetAutoAdvance(); return;
-    }
-    const key = `${mode}/${idx}/${s.id}/${autoSec}`;
-    if (autoKey === key) return;
-    resetAutoAdvance(); autoKey = key;
-    const poll = () => {
-      if (autoKey !== key || !s.isCurrent || keepCurrent || !autoSec || zoomedSlide) return;
-      if (!visibleReady(s)) { autoTimer = setTimeout(poll, 250); return; }
-      if (s.kind === 'ugoira') { if (!s.animTimer) startUgoira(s); return; }
-      autoTimer = setTimeout(() => {
-        if (autoKey === key && s.isCurrent) void advanceWhenReady(s);
-      }, autoSec * 1000);
-    };
-    autoTimer = setTimeout(poll, 250);
-  }
 
   // 画面が消えないようにする（対応ブラウザのみ）
   async function keepAwake(on) {
@@ -3720,39 +4025,6 @@
     }
   }
 
-  async function toggleBookmark(s, btn) {
-    if (!s || !btn) return;
-
-    if (s.bookmarked) {
-      paintBookmarkBtn(s);
-      syncDock();
-      return;
-    }
-
-    btn.disabled = true;
-    btn.textContent = '保存中…';
-
-    try {
-      const newlySaved = await ensureBookmarked(s);
-
-      if (newlySaved) {
-        recordSessionSave(s);
-        void insertSeriesAfter(s);
-
-        if (mode !== 'custom' && mode !== 'saved') {
-          void insertRecommendationsAfterBookmark(s);
-        }
-      }
-    } catch (e) {
-      if (!s.bookmarked) {
-        console.warn('[PTS] ブックマーク失敗', e);
-        btn.textContent = '保存失敗 もう一度タップ';
-      }
-    } finally {
-      btn.disabled = false;
-      syncDock();
-    }
-  }
 
   // スライドの後片付け（タイマー・通信・Blobを残さない。長時間閲覧でのメモリ圧迫対策）
   function cleanupSlide(s) {
@@ -3766,44 +4038,153 @@
     }
   }
 
-  function buildFeed() {
-    feedGeneration++;
-    if (zoomedSlide) clearZoom();
-    resetAutoAdvance();
-    customResetState();
-    relatedNextIds = []; relatedLoading = false; relatedSwitchBusy = false;
-    slides.forEach(cleanupSlide); slides = []; mode = 'page';
-    pageLoadMisses = 0; feedEl.innerHTML = ''; feedEl.scrollTop = 0;
-    addItems(scanPage());
-    if (slides[0]) {
-      slides[0].isCurrent = true;
-      resolveSlide(slides[0]); armWatchdog(slides[0]);
+  async function refreshCurrentSlide() {
+    const s = slides[currentIndex()];
+    if (!s || s.refreshBusy) return;
+
+    s.refreshBusy = true;
+    const generation = feedGeneration;
+    const btn = overlay?.querySelector('.pts-rescan');
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '更新中…';
     }
-    slides.slice(1, 4).forEach((s, i) => setTimeout(() => {
-      if (slides.includes(s)) resolveSlide(s);
-    }, 350 * (i + 1)));
-    setTimeout(markCurrentFromScroll, 400);
+
+    const oldPage = s.pageIdx || 0;
+    const oldFrames = [...(s.frameUrls || [])];
+
+    try {
+      if (s.resolveAbort) s.resolveAbort.abort();
+      if (s.ugoiraAbort) s.ugoiraAbort.abort();
+
+      if (s.resolvePromise) {
+        await s.resolvePromise.catch(() => {});
+      }
+
+      // 中断したZIP展開の終了を短時間待つ。
+      for (let i = 0; i < 20 && s.preparingUgoira; i++) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      if (generation !== feedGeneration ||
+          !slides.includes(s)) return;
+
+      stopUgoira(s);
+
+      if (s.loadWatch) clearTimeout(s.loadWatch);
+      s.loadWatch = null;
+
+      s.resolved = false;
+      s.resolving = false;
+      s.resolveError = null;
+      s.ugoiraError = null;
+      s.resolvePromise = null;
+      s.resolveAbort = null;
+      s.metaPromise = null;
+
+      s.frameUrls = null;
+      s.frames = null;
+      s.pairs = null;
+      s.zipUrl = null;
+      s.zipSmall = null;
+      s.zipFull = null;
+      s.hiDone = false;
+      s.animIdx = 0;
+      s.loopSteps = 0;
+      s.origLoading = false;
+      s.forceRefetch = true;
+
+      if (Number(s.rawType) === 2 || s.kind === 'ugoira') {
+        setUgoiraStatus(s, 'loading');
+      }
+
+      await resolveSlide(s);
+
+      if (generation !== feedGeneration ||
+          !slides.includes(s)) return;
+
+      s.forceRefetch = false;
+
+      if (s.kind === 'multi' && s.pairs?.length) {
+        const pager = s.sectionEl?.querySelector('.pts-pager');
+        const idx = Math.min(oldPage, s.pairs.length - 1);
+
+        s.pageIdx = idx;
+        loadHorizontalNeighbors(s, idx);
+
+        if (pager) {
+          pager.scrollLeft = idx * pager.clientWidth;
+        }
+
+        upgradeSlide(s);
+      }
+
+      if (s.kind === 'single' && s.isCurrent) {
+        const oldImg = s.mainImg;
+        const url = s.pairs?.[0]?.o || s.pairs?.[0]?.r;
+
+        if (oldImg?.isConnected && url) {
+          const fresh = new Image();
+          fresh.className = 'pts-img';
+          fresh.decoding = 'async';
+          fresh.alt = s.title || '';
+          fresh.src = url;
+
+          const replace = () => {
+            if (s.isCurrent && oldImg.isConnected &&
+                generation === feedGeneration) {
+              oldImg.replaceWith(fresh);
+              s.mainImg = fresh;
+            }
+          };
+
+          if (fresh.decode) {
+            fresh.decode().then(replace).catch(() => {});
+          } else {
+            fresh.onload = replace;
+          }
+        }
+      }
+
+      if (s.kind === 'ugoira' && s.isCurrent &&
+          !s.frameUrls && !s.preparingUgoira) {
+        void prepareUgoira(s);
+      }
+
+      armWatchdog(s);
+      markCurrentFromScroll();
+
+    } catch (e) {
+      console.warn('[PTS refresh]', e);
+      setUgoiraStatus(s, 'error', e?.message || String(e));
+
+    } finally {
+      s.forceRefetch = false;
+      s.refreshBusy = false;
+
+      // 旧Blobがまだ画像に使われていれば解放しない。
+      setTimeout(() => {
+        for (const url of oldFrames) {
+          if (url?.startsWith('blob:') &&
+              s.mainImg?.src !== url &&
+              !s.frameUrls?.includes(url)) {
+            URL.revokeObjectURL(url);
+          }
+        }
+      }, 12000);
+
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '更新';
+      }
+    }
   }
 
-  function appendNew() {
-    if (!overlay || overlay.style.display === 'none') return;
-    addItems(scanPage());
-  }
+
 
   /* ---------- 背後ページの無限読み込みと連動 ---------- */
 
-  function pageLoadMore() {
-    if (mode !== 'page') return;
-    if (pageLoadBusy || pageLoadMisses >= 4) return;
-    pageLoadBusy = true;
-    const before = slides.length;
-    window.scrollBy(0, Math.max(2000, window.innerHeight * 3));
-    setTimeout(() => {
-      appendNew();
-      pageLoadMisses = (slides.length === before) ? pageLoadMisses + 1 : 0;
-      pageLoadBusy = false;
-    }, 1300);
-  }
 
   /* ---------- オーバーレイ ---------- */
 
@@ -5047,6 +5428,8 @@
   }
 
   function openViewer() {
+    if (overlay && overlay.style.display !== 'none') return;
+
     buildOverlay();
     installDiagnosticUI();
     installExperienceUI();
@@ -5055,152 +5438,200 @@
     skippedThisSession.clear();
     viewedThisSession.clear();
 
-    navIntent = {
-      reason: 'other',
-      until: 0
-    };
+    navIntent = { reason: 'other', until: 0 };
+
+    sessionTrail.length = 0;
+    activeView = null;
+
+    searchConfig = getSearchPageConfig();
+    mode = searchConfig ? 'search' : 'custom';
 
     overlay.style.display = 'block';
     keepAwake(true);
     setImmersive(false);
-    keepCurrent = false;
 
-    sessionTrail.length = 0;
-    sessionSaved.length = 0;
-    activeView = null;
-
-    buildFeed();
-
-    setTimeout(() => pageLoadMore(), 800);
-    setTimeout(() => pageLoadMore(), 2500);
+    if (mode === 'search') {
+      void startSearchFeed();
+    } else {
+      renderSearchTagCandidates();
+      void startCustomFeed();
+    }
   }
 
   function closeViewer() {
+    if (!overlay) return;
+
     closeDiagnosticPanel();
-    clearTimeout(uiHideTimer); clearTimeout(singleTapTimer);
+
+    clearTimeout(uiHideTimer);
+    clearTimeout(singleTapTimer);
     clearTimeout(closeConfirmTimer);
-    overlay.querySelector('.pts-history-panel')?.setAttribute('hidden', '');
+
+    overlay.querySelector('.pts-history-panel')
+      ?.setAttribute('hidden', '');
+
     if (zoomedSlide) clearZoom();
-    resetAutoAdvance();
+
     feedGeneration++;
     customResetState();
-    overlay.style.display = 'none';
-    keepAwake(false);
-    slides.forEach(cleanupSlide); slides = [];
-    if (feedEl) feedEl.innerHTML = '';
+    searchBusy = false;
+
+    slides.forEach(cleanupSlide);
+    slides = [];
+
+    if (feedEl) feedEl.replaceChildren();
+
     activeView = null;
+    overlay.style.display = 'none';
+
+    keepAwake(false);
     saveSeenTimes();
   }
 
   function buildOverlay() {
     if (overlay) return;
+
     setupObservers();
+
     overlay = document.createElement('div');
     overlay.id = 'pts-overlay';
+
     overlay.innerHTML = `
       <div class="pts-bar">
         <span class="pts-counter">…</span>
-        <select class="pts-quality">
-          <option value="fast">速い</option>
-          <option value="orig" selected>元画像</option>
-        </select>
-        <select class="pts-auto">
-          <option value="0" selected>自動なし</option>
-          <option value="5">自動5秒</option>
-          <option value="10">自動10秒</option>
-          <option value="15">自動15秒</option>
-          <option value="30">自動30秒</option>
-        </select>
-        <button class="pts-custom">自前フィード</button>
-        <button class="pts-rescan">再スキャン</button>
-        <button class="pts-close" title="閉じる">✕</button>
+        <button type="button" class="pts-rescan">更新</button>
+        <button type="button" class="pts-close">閉じる</button>
       </div>
       <div class="pts-feed"></div>
     `;
+
     feedEl = overlay.querySelector('.pts-feed');
-    overlay.querySelector('.pts-close').addEventListener('click', closeViewer);
-    overlay.querySelector('.pts-rescan').addEventListener('click', buildFeed);
-    overlay.querySelector('.pts-custom').addEventListener('click', switchToCustom);
-    overlay.querySelector('.pts-quality').addEventListener('change', (e) => {
-      quality = e.target.value;
-      // 画質を変えたら、解決済みスライドの表示レベルだけ付け替える（取り直しはしない）
-      slides.forEach((s) => { if (s.resolved) upgradeSlide(s, true); });
-    });
-    overlay.querySelector('.pts-auto').addEventListener('change', (e) => {
-      autoSec = parseInt(e.target.value, 10) || 0;
-      markCurrentFromScroll();
-    });
+
+    overlay.querySelector('.pts-close')
+      .addEventListener('click', closeViewer);
+
+    overlay.querySelector('.pts-rescan')
+      .addEventListener('click', () => {
+        void refreshCurrentSlide();
+      });
+
     feedEl.addEventListener('scroll', () => {
-      const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
-      if (remain < feedEl.clientHeight * 2) {
-        if (mode === 'custom') customLoadMore();
-        else if (mode === 'related') relatedLoadMore();
-        else if (mode === 'page') pageLoadMore();
+      const remaining =
+        feedEl.scrollHeight -
+        feedEl.scrollTop -
+        feedEl.clientHeight;
+
+      if (remaining < feedEl.clientHeight * 2) {
+        if (mode === 'custom') {
+          void customLoadMore();
+        } else if (mode === 'search') {
+          void searchLoadMore();
+        }
       }
+
       clearTimeout(curTimer);
       curTimer = setTimeout(markCurrentFromScroll, 130);
     }, { passive: true });
-    document.addEventListener('keydown', (e) => {
-      if (!overlay || overlay.style.display === 'none') return;
-      if (e.key === 'Escape') closeViewer();
-    });
 
     const style = document.createElement('style');
+
     style.textContent = `
-      #pts-overlay{position:fixed;inset:0;background:#000;z-index:99999;display:none;}
-      .pts-bar{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;gap:10px;
-        padding:10px 14px;color:#fff;background:linear-gradient(rgba(0,0,0,.65),transparent);font-size:13px;}
-      .pts-counter{opacity:.9}
-      .pts-rescan{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;
-        padding:7px 12px;cursor:pointer;font-size:12px;}
-      .pts-quality{margin-left:auto;background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:8px;padding:6px 8px;font-size:12px;}
-      .pts-quality option{color:#000;}
-      .pts-auto{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:8px;padding:6px 8px;font-size:12px;}
-      .pts-auto option{color:#000;}
-      .pts-bookmark{position:absolute;right:14px;bottom:160px;z-index:2;background:rgba(255,255,255,.16);color:#fff;border:0;
-        border-radius:999px;padding:10px 14px;font-size:13px;}
-      .pts-bookmark.pts-bookmarked{background:#1e9e6a;}
-      .pts-custom{background:#0096fa;color:#fff;border:0;border-radius:999px;padding:7px 12px;cursor:pointer;font-size:12px;white-space:nowrap;}
-      .pts-custom:disabled{opacity:.6;}
-      @media (max-width:480px){
-        .pts-bar{gap:5px;padding:8px 6px;}
-        .pts-custom{padding:7px 8px;font-size:11px;}
-        .pts-counter{font-size:11px;}
+      #pts-overlay{
+        position:fixed;inset:0;background:#000;
+        z-index:99999;display:none
       }
-      .pts-close{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;width:32px;height:32px;cursor:pointer;font-size:15px;}
-      .pts-feed{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;overscroll-behavior:contain;}
-      .pts-feed::-webkit-scrollbar{display:none;}
-      .pts-slide{position:relative;height:100%;scroll-snap-align:start;scroll-snap-stop:always;background:#000;}
-      .pts-holder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
-      .pts-img{max-width:100%;max-height:100%;object-fit:contain;}
-      .pts-pager{display:flex;height:100%;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;scrollbar-width:none;width:100%;overscroll-behavior:contain;}
-      .pts-pager::-webkit-scrollbar{display:none;}
-      .pts-page{min-width:100%;height:100%;scroll-snap-align:start;scroll-snap-stop:always;
-        display:flex;align-items:center;justify-content:center;}
-      .pts-pagechip{position:absolute;top:52px;right:14px;z-index:2;background:rgba(0,0,0,.55);color:#fff;
-        font-size:12px;padding:4px 9px;border-radius:999px;}
-      .pts-meta{position:absolute;left:0;right:0;bottom:0;z-index:2;padding:28px 16px 18px;color:#fff;pointer-events:none;
-        background:linear-gradient(transparent,rgba(0,0,0,.7));}
-      .pts-title{font-size:15px;font-weight:700;line-height:1.4;}
-      .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
-      .pts-seek{position:absolute;left:0;right:0;top:48px;height:26px;z-index:6;background:linear-gradient(to bottom, rgba(255,255,255,.25) 0 4px, transparent 4px);touch-action:none;}
-      .pts-seek-fill{height:4px;width:0%;background:#0096fa;}
-      .pts-seek-knob{position:absolute;top:2px;left:0%;width:16px;height:16px;margin-left:-8px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5);}
-      .pts-open{position:absolute;right:14px;bottom:64px;z-index:2;background:rgba(255,255,255,.16);color:#fff;
-        text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
-      .pts-related{position:absolute;right:14px;bottom:112px;z-index:2;background:#0096fa;color:#fff;border:0;
-        font-size:12px;font-weight:700;padding:9px 13px;border-radius:999px;cursor:pointer;}
-      .pts-related:disabled{opacity:.6;}
+      .pts-bar{
+        position:absolute;top:0;left:0;right:0;z-index:3;
+        display:flex;align-items:center;gap:8px;
+        padding:10px 14px;color:#fff;
+        background:linear-gradient(#000a,transparent);
+        font-size:13px
+      }
+      .pts-counter{opacity:.9}
+      .pts-rescan,.pts-close{
+        background:#ffffff26;color:white;border:0;
+        border-radius:9px;padding:9px 12px;font-size:12px
+      }
+      .pts-feed{
+        height:100%;overflow-y:auto;
+        scroll-snap-type:y mandatory;
+        scrollbar-width:none;overscroll-behavior:contain
+      }
+      .pts-feed::-webkit-scrollbar{display:none}
+      .pts-slide{
+        position:relative;height:100%;
+        scroll-snap-align:start;scroll-snap-stop:always;
+        background:#000
+      }
+      .pts-holder{
+        position:absolute;inset:0;
+        display:flex;align-items:center;justify-content:center
+      }
+      .pts-img{
+        max-width:100%;max-height:100%;object-fit:contain
+      }
+      .pts-pager{
+        display:flex;height:100%;width:100%;
+        overflow-x:auto;overflow-y:hidden;
+        scroll-snap-type:x mandatory;
+        scrollbar-width:none;overscroll-behavior:contain
+      }
+      .pts-pager::-webkit-scrollbar{display:none}
+      .pts-page{
+        min-width:100%;height:100%;
+        scroll-snap-align:start;scroll-snap-stop:always;
+        display:flex;align-items:center;justify-content:center
+      }
+      .pts-pagechip{
+        position:absolute;top:52px;right:14px;z-index:2;
+        background:#0009;color:#fff;
+        font-size:12px;padding:4px 9px;border-radius:999px
+      }
+      .pts-seek{
+        position:absolute;left:12px;right:12px;
+        bottom:75px;height:32px;z-index:27;
+        touch-action:none
+      }
     `;
+
     document.head.appendChild(style);
     document.body.appendChild(overlay);
   }
 
   const btn = document.createElement('button');
+
   btn.id = 'pts-launch';
   btn.textContent = '縦スクロール';
-  btn.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:99998;background:#0096fa;color:#fff;border:0;' +
-    'border-radius:999px;padding:12px 18px;font-size:14px;font-weight:700;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.35);';
+
+  btn.style.cssText = [
+    'position:fixed',
+    'right:16px',
+    'bottom:16px',
+    'z-index:99998',
+    'background:#0096fa',
+    'color:#fff',
+    'border:0',
+    'border-radius:999px',
+    'padding:12px 18px',
+    'font-size:14px',
+    'font-weight:700',
+    'cursor:pointer',
+    'box-shadow:0 4px 16px #0006'
+  ].join(';');
+
   btn.addEventListener('click', openViewer);
   document.body.appendChild(btn);
+
+  // 作品ページまたはタグ検索結果ページでは自動起動。
+  const artworkPage = /^\/artworks\/\d+(?:\/|$)/
+    .test(location.pathname);
+
+  const searchPageDetected = !!getSearchPageConfig();
+
+  if (artworkPage || searchPageDetected) {
+    requestAnimationFrame(() => {
+      // すでに開いている場合はopenViewer側で再入を抑止。
+      openViewer();
+    });
+  }
 })();

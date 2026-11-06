@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.11
+// @version      3.13.12
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-(function () {
+(async function () {
   'use strict';
 
   if (window.__ptsLoaded) {
@@ -1102,75 +1102,103 @@
   /* ---------- 自前レコメンド v2（履歴500件＋永続化） ---------- */
   /* ---------- v3.12 配布対応：アカウント識別 ---------- */
 
-  function detectLoggedInPixivId() {
-    const ids = [];
+  const LOGIN_ID_KEY = 'PTS_LOGIN_USER_ID';
+  const loginIdDetection = { source: '', saved: false, saveError: false };
+
+  async function detectLoggedInPixivId() {
     const valid = value => {
       const id = String(value ?? '');
       return /^[1-9]\d*$/.test(id) ? id : '';
     };
-    const add = value => {
-      const id = valid(value);
-      if (id) ids.push(id);
-    };
     const parse = text => {
-      if (!text || typeof text !== 'string') return null;
-      try { return JSON.parse(text); }
+      try { return JSON.parse(text || 'null'); }
       catch (e) { return null; }
     };
+    let saved = '';
+    try { saved = valid(localStorage.getItem(LOGIN_ID_KEY)); }
+    catch (e) { /* 保存不可でもページからの検出を続ける。 */ }
+    loginIdDetection.saved = !!saved;
 
-    // 方式1：pixivのサーバー埋め込みログイン情報
-    const meta = document.querySelector(
-      'meta[name="global-data"]'
-    );
-
-    const globalData = parse(meta?.content);
-
-    if (globalData?.isLoggedIn === false ||
-        globalData?.userData?.isLoggedIn === false) {
-      return '';
-    }
-
-    add(globalData?.userData?.id);
-    add(globalData?.userData?.userId);
-
-    // 方式2：Next.jsのページ埋め込み情報
-    const next = parse(
-      document.getElementById('__NEXT_DATA__')
-        ?.textContent
-    );
-
-    const props = next?.props?.pageProps;
-
-    if (props?.isLoggedIn === false ||
-        props?.gaUserData?.isLoggedIn === false) {
-      return '';
-    }
-
-    add(props?.gaUserData?.userId);
-
-    const state = props?.serverSerializedPreloadedState;
-    const parsedState = typeof state === 'string'
-      ? parse(state)
-      : state;
-
-    add(parsedState?.userData?.self?.id);
-    add(parsedState?.userData?.self?.userId);
-
-    // 取得元が矛盾した場合は使用しない。
-    const unique = [...new Set(ids)];
-
-    if (unique.length !== 1) {
-      console.warn(
-        '[PTS] ログインユーザーIDを確定できません',
-        unique.length > 1 ? '取得元が不一致' : '識別情報なし'
+    const detect = (doc, prefix) => {
+      const globalData = parse(
+        doc.querySelector('meta[name="global-data"]')?.content
       );
-      return '';
+      const next = parse(doc.getElementById('__NEXT_DATA__')?.textContent);
+      const props = next?.props?.pageProps;
+      const state = props?.serverSerializedPreloadedState;
+      const parsedState = typeof state === 'string' ? parse(state) : state;
+      const candidates = [
+        ['global-data.userData.id', globalData?.userData?.id],
+        ['global-data.userData.userId', globalData?.userData?.userId],
+        ['__NEXT_DATA__.gaUserData', props?.gaUserData?.userId],
+        ['__NEXT_DATA__.props.gaUserData', next?.props?.gaUserData?.userId],
+        ['__NEXT_DATA__.gaUserData.root', next?.gaUserData?.userId],
+        ['__NEXT_DATA__.userData.self.id', props?.userData?.self?.id],
+        ['__NEXT_DATA__.userData.self.userId', props?.userData?.self?.userId],
+        ['__NEXT_DATA__.self.id', parsedState?.userData?.self?.id],
+        ['__NEXT_DATA__.self.userId', parsedState?.userData?.self?.userId]
+      ];
+      for (const [source, value] of candidates) {
+        const id = valid(value);
+        if (id) return { id, source: prefix + '.' + source };
+      }
+
+      // 一覧の作者リンクは使わず、本人のプロフィールと明示されたリンクのみ。
+      for (const link of doc.querySelectorAll('a[href*="/users/"]')) {
+        const labels = [link.textContent, link.getAttribute('aria-label'),
+          link.getAttribute('title')];
+        if (!labels.some(label => /^(?:マイページ|自分のプロフィール|プロフィールを見る|my (?:page|profile)|your profile)$/i.test((label || '').trim()))) continue;
+        const url = new URL(link.getAttribute('href'), 'https://www.pixiv.net/');
+        const id = url.origin === 'https://www.pixiv.net'
+          ? valid(url.pathname.match(/^\/users\/(\d+)(?:\/|$)/)?.[1]) : '';
+        if (id) return { id, source: prefix + '.self-profile-link' };
+      }
+
+      // 任意のuserIdは作品作者にも現れるため、ログイン情報の範囲に限定。
+      const html = (doc.documentElement?.innerHTML || '')
+        .replace(/&quot;/g, '"').replace(/\\"/g, '"');
+      const patterns = [
+        /"gaUserData"\s*:\s*\{[^{}]*?"userId"\s*:\s*"?([1-9]\d*)"?/,
+        /"(?:loggedInUserId|loginUserId|currentUserId|myUserId)"\s*:\s*"?([1-9]\d*)"?/,
+        /"userData"\s*:\s*\{\s*"self"\s*:\s*\{[^{}]*?"(?:id|userId)"\s*:\s*"?([1-9]\d*)"?/
+      ];
+      for (let i = 0; i < patterns.length; i++) {
+        const id = valid(html.match(patterns[i])?.[1]);
+        if (id) return { id, source: prefix + '.login-regex-' + (i + 1) };
+      }
+      return null;
+    };
+
+    let result = detect(document, 'page');
+    if (!result) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('https://www.pixiv.net/', {
+          credentials: 'include', signal: controller.signal
+        });
+        if (response.ok) {
+          const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+          result = detect(doc, 'home-fetch');
+        }
+      } catch (e) { /* 通信失敗時も保存値にフォールバックする。 */ }
+      finally { clearTimeout(timer); }
     }
 
-    return unique[0];
+    if (result) {
+      loginIdDetection.source = result.source;
+      try {
+        localStorage.setItem(LOGIN_ID_KEY, result.id);
+        loginIdDetection.saved = true;
+      } catch (e) { loginIdDetection.saveError = true; }
+      return result.id;
+    }
+    loginIdDetection.source = saved ? 'localStorage' : '識別情報なし';
+    return saved;
   }
 
-  const ACTIVE_PIXIV_USER_ID = detectLoggedInPixivId();
+  // プロフィール読み込み・履歴初期化より先にアカウントを確定する。
+  const ACTIVE_PIXIV_USER_ID = await detectLoggedInPixivId();
 
   function accountStorageKey(base) {
     if (!ACTIVE_PIXIV_USER_ID) return '';
@@ -6088,6 +6116,12 @@
       '通信はGETのみ。APIの返答形式は実機で確認します。'
     );
     diagAppend(seq,bookmarkDiagnosticText());
+    diagAppend(seq,
+      `ログインID検出: ${getMyUserId() ? 'OK' : '失敗'}` +
+      ` / 取得元=${loginIdDetection.source}` +
+      ` / 保存値=${loginIdDetection.saved ? 'あり' : 'なし'}` +
+      (loginIdDetection.saveError ? ' / 保存失敗' : '')
+    );
 
     const recCache = new Map();
 

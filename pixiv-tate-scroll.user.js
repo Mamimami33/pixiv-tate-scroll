@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.10.1
+// @version      3.10.2
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -1103,10 +1103,182 @@
     for (const work of bookmarkHistory.works) knownBookmarkedIds.add(String(work.id));
   }
 
+  /* ---------- ブックマークAPI取得 v3.10.2 ---------- */
+
+  // 履歴学習で最後に成功した取得方式。
+  // 診断モードからは変更しない。
+  let bookmarkApiMethod = '';
+
+  // 通常の履歴取得でもHTTPステータスを確認する。
+  // 既存のfetchJson()には変更を加えない。
+  async function getBookmarkApiBody(url) {
+    const res = await fetch(url, {
+      method: 'GET',
+      credentials: 'same-origin'
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    let json;
+
+    try {
+      json = await res.json();
+    } catch (e) {
+      throw new Error(
+        `HTTP ${res.status} / JSON解釈失敗`
+      );
+    }
+
+    if (
+      !json ||
+      typeof json !== 'object' ||
+      Array.isArray(json)
+    ) {
+      throw new Error('JSON形式が想定外');
+    }
+
+    if (json.error) {
+      throw new Error(
+        `API error: ${String(json.message || '詳細なし')}`
+      );
+    }
+
+    if (
+      !json.body ||
+      typeof json.body !== 'object' ||
+      Array.isArray(json.body)
+    ) {
+      throw new Error(
+        'bodyがオブジェクトではない'
+      );
+    }
+
+    return json.body;
+  }
+
+  // 履歴学習と診断で共有するAPIフォールバック。
+  //
+  // A: /ajax/user/{id}/illusts/bookmarks
+  // B: /ajax/user/{id}/bookmarks/artworks
+  //
+  // AがHTTPエラー・形式不正ならBを試す。
+  // 両方失敗した場合は、両方の理由を返す。
+  //
+  // getBody:
+  //   履歴学習 → getBookmarkApiBody
+  //   診断     → diagGetを呼ぶ関数
+  async function fetchBookmarkBodyWithFallback(
+    userId,
+    offset,
+    limit,
+    getBody
+  ) {
+    const id = String(userId || '');
+
+    if (!/^\d+$/.test(id)) {
+      throw new Error(
+        'ユーザーIDが不正または不明'
+      );
+    }
+
+    if (
+      !Number.isInteger(offset) ||
+      offset < 0 ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    ) {
+      throw new Error(
+        'offsetまたはlimitが不正'
+      );
+    }
+
+    const params =
+      `?tag=&offset=${offset}` +
+      `&limit=${limit}&rest=show`;
+
+    const sources = [
+      {
+        method: 'illusts/bookmarks',
+        url:
+          `/ajax/user/${id}/illusts/bookmarks${params}`
+      },
+      {
+        method: 'bookmarks/artworks',
+        url:
+          `/ajax/user/${id}/bookmarks/artworks${params}`
+      }
+    ];
+
+    const failures = [];
+
+    for (const source of sources) {
+      try {
+        const body = await getBody(source.url);
+
+        if (
+          !body ||
+          !Array.isArray(body.works)
+        ) {
+          const keys =
+            body && typeof body === 'object'
+              ? Object.keys(body)
+                  .slice(0, 20)
+                  .join(', ')
+              : 'なし';
+
+          throw new Error(
+            `body.worksが配列でない` +
+            `（bodyキー: ${keys}）`
+          );
+        }
+
+        return {
+          body,
+          method: source.method,
+          fallbackReason:
+            failures.length
+              ? failures.join(' / ')
+              : ''
+        };
+
+      } catch (e) {
+        failures.push(
+          `${source.method}: ` +
+          (e && e.message
+            ? e.message
+            : String(e))
+        );
+      }
+    }
+
+    throw new Error(
+      `両方式失敗 / ${failures.join(' / ')}`
+    );
+  }
+
+  // 既存のinitProfileFromBookmarks()から呼ばれる関数。
+  // 返り値は従来どおり作品配列なので
+  // 既存のページング処理を変更する必要はない。
   async function fetchBookmarkPage(userId, offset) {
-    const url = `/ajax/user/${encodeURIComponent(userId)}/bookmarks/artworks` +
-      `?tag=&offset=${offset}&limit=${HISTORY_PAGE_SIZE}&rest=show`;
-    return parseBookmarkPage(await fetchJson(url));
+    const result =
+      await fetchBookmarkBodyWithFallback(
+        userId,
+        offset,
+        HISTORY_PAGE_SIZE,
+        getBookmarkApiBody
+      );
+
+    const works = parseBookmarkPage(
+      result.body
+    );
+
+    // パースまで成功した場合のみ記録。
+    bookmarkApiMethod = result.method;
+
+    return works;
   }
 
   async function initProfileFromBookmarks(force = false) {
@@ -2316,7 +2488,7 @@
 
     diagAppend(
       seq,
-      `pixiv診断 v3.10.1 / ${new Date().toLocaleString('ja-JP')}`
+      `pixiv診断 v3.10.2 / ${new Date().toLocaleString('ja-JP')}`
     );
 
     diagAppend(
@@ -2324,8 +2496,6 @@
       '通信はGETのみ。APIの返答形式は実機で確認します。'
     );
 
-    // 診断内だけで使う一時キャッシュ。
-    // 永続ストレージや既存の学習状態は変更しない。
     const recCache = new Map();
 
     let bookmarkWorks = [];
@@ -2347,24 +2517,27 @@
             );
           }
 
-          const body = await diagGet(
-            `/ajax/user/${encodeURIComponent(id)}/bookmarks/artworks` +
-            '?tag=&offset=0&limit=48&rest=show',
-            controller.signal
-          );
-
-          if (!Array.isArray(body.works)) {
-            throw new Error(
-              `body.worksなし（bodyキー: ${diagKeys(body)}）`
+          // A → Bの順で試す。
+          // 診断はbookmarkApiMethodを変更しない。
+          const result =
+            await fetchBookmarkBodyWithFallback(
+              id,
+              0,
+              48,
+              url => diagGet(
+                url,
+                controller.signal
+              )
             );
-          }
 
+          const body = result.body;
           bookmarkWorks = body.works;
 
           const first = bookmarkWorks[0];
 
           const tagged = bookmarkWorks.filter(
-            w => diagTagShape(w?.tags).count > 0
+            w =>
+              diagTagShape(w?.tags).count > 0
           ).length;
 
           const users = bookmarkWorks.filter(
@@ -2374,16 +2547,33 @@
           ).length;
 
           const ugoira = bookmarkWorks.filter(
-            w => Number(w?.illustType) === 2
+            w =>
+              Number(w?.illustType) === 2
           ).length;
 
+          const status = result.fallbackReason
+            ? (
+                ` / 第一候補NG: ` +
+                diagText(result.fallbackReason)
+              )
+            : '';
+
           return (
-            `OK / ${bookmarkWorks.length}件` +
+            `OK / 方式=${result.method}` +
+            ` / ${bookmarkWorks.length}件` +
             ` / tags ${tagged}/${bookmarkWorks.length}` +
-            `（先頭: ${diagTagShape(first?.tags).shape}）` +
+            `（先頭: ${
+              diagTagShape(first?.tags).shape
+            }）` +
             ` / userId ${users}/${bookmarkWorks.length}` +
             ` / うごイラ ${ugoira}` +
-            ` / total ${body.total ?? 'なし'}` +
+            ` / total ${
+              body.total ?? 'なし'
+            }` +
+            ` / 学習側方式=${
+              bookmarkApiMethod || '未取得'
+            }` +
+            status +
             `\n   先頭キー: ${diagKeys(first)}`
           );
         }
@@ -2407,7 +2597,6 @@
 
           const saved = JSON.parse(raw);
 
-          // v3.10.0はsaved.historyに保存している。
           const history =
             saved?.history ??
             saved?.bookmarkHistory;
@@ -2417,7 +2606,9 @@
             typeof history !== 'object'
           ) {
             throw new Error(
-              `historyなし（保存キー: ${diagKeys(saved)}）`
+              `historyなし（保存キー: ${
+                diagKeys(saved)
+              }）`
             );
           }
 
@@ -2429,12 +2620,16 @@
 
           storedHistoryWorks = history.works;
 
-          const tagged = storedHistoryWorks.filter(
-            w => diagTagShape(w?.tags).count > 0
-          ).length;
+          const tagged =
+            storedHistoryWorks.filter(
+              w =>
+                diagTagShape(w?.tags).count > 0
+            ).length;
 
           return (
-            `OK / initialized=${history.initialized === true}` +
+            `OK / initialized=${
+              history.initialized === true
+            }` +
             ` / 保存${storedHistoryWorks.length}件` +
             ` / tags ${tagged}/${storedHistoryWorks.length}`
           );
@@ -2449,16 +2644,26 @@
         async () => {
           const first =
             bookmarkWorks.find(
-              w => w &&
-                (w.id != null || w.illustId != null)
+              w =>
+                w &&
+                (
+                  w.id != null ||
+                  w.illustId != null
+                )
             ) ||
             storedHistoryWorks.find(
-              w => w &&
-                (w.id != null || w.illustId != null)
+              w =>
+                w &&
+                (
+                  w.id != null ||
+                  w.illustId != null
+                )
             );
 
           const id = String(
-            first?.id ?? first?.illustId ?? ''
+            first?.id ??
+            first?.illustId ??
+            ''
           );
 
           if (!/^\d+$/.test(id)) {
@@ -2468,8 +2673,9 @@
           }
 
           const body = await diagGet(
-            `/ajax/illust/${encodeURIComponent(id)}` +
-            '/recommend/init?limit=60&lang=ja',
+            `/ajax/illust/${
+              encodeURIComponent(id)
+            }/recommend/init?limit=60&lang=ja`,
             controller.signal
           );
 
@@ -2477,14 +2683,17 @@
 
           if (!Array.isArray(body.illusts)) {
             throw new Error(
-              `body.illustsなし（bodyキー: ${diagKeys(body)}）`
+              `body.illustsなし（bodyキー: ${
+                diagKeys(body)
+              }）`
             );
           }
 
           const a = body.illusts;
 
           const tagged = a.filter(
-            w => diagTagShape(w?.tags).count > 0
+            w =>
+              diagTagShape(w?.tags).count > 0
           ).length;
 
           const users = a.filter(
@@ -2493,8 +2702,6 @@
               String(w.userId) !== ''
           ).length;
 
-          // キーが存在するかを数える。
-          // bookmarkDataがnullでもキー有りに含む。
           const bookmarks = a.filter(
             w =>
               w &&
@@ -2508,13 +2715,17 @@
             `OK / illusts ${a.length}件` +
             ` / tags ${tagged}/${a.length}` +
             ` / userId ${users}/${a.length}` +
-            ` / bookmarkDataキー ${bookmarks}/${a.length}` +
+            ` / bookmarkDataキー ${
+              bookmarks
+            }/${a.length}` +
             ` / nextIds ${
               Array.isArray(body.nextIds)
                 ? body.nextIds.length
                 : '配列なし'
             }` +
-            `\n   先頭キー: ${diagKeys(a[0])}`
+            `\n   先頭キー: ${
+              diagKeys(a[0])
+            }`
           );
         }
       );
@@ -2532,7 +2743,9 @@
             ) || 'R-18';
 
           const url =
-            `/ajax/search/artworks/${encodeURIComponent(tag)}?` +
+            `/ajax/search/artworks/${
+              encodeURIComponent(tag)
+            }?` +
             new URLSearchParams({
               word: tag,
               order: 'popular_d',
@@ -2550,15 +2763,21 @@
 
           if (!found) {
             throw new Error(
-              `候補配列なし（bodyキー: ${diagKeys(body)}）`
+              `候補配列なし（bodyキー: ${
+                diagKeys(body)
+              }）`
             );
           }
 
           return (
             `OK / タグ「${diagText(tag)}」` +
             ` / popular_d指定（有効性未確認）` +
-            ` / ${found.path} ${found.data.length}件` +
-            `\n   先頭キー: ${diagKeys(found.data[0])}` +
+            ` / ${found.path} ${
+              found.data.length
+            }件` +
+            `\n   先頭キー: ${
+              diagKeys(found.data[0])
+            }` +
             ` / bodyキー: ${diagKeys(body)}`
           );
         }
@@ -2597,7 +2816,9 @@
           // 第1候補：profile/all
           try {
             const body = await diagGet(
-              `/ajax/user/${encodeURIComponent(userId)}/profile/all`,
+              `/ajax/user/${
+                encodeURIComponent(userId)
+              }/profile/all`,
               controller.signal
             );
 
@@ -2608,7 +2829,9 @@
               typeof il !== 'object'
             ) {
               throw new Error(
-                `illusts形式不明（bodyキー: ${diagKeys(body)}）`
+                `illusts形式不明（bodyキー: ${
+                  diagKeys(body)
+                }）`
               );
             }
 
@@ -2624,7 +2847,9 @@
               ? '配列'
               : keys.length === 0
                 ? '空オブジェクト'
-                : keys.every(k => /^\d+$/.test(k))
+                : keys.every(
+                    k => /^\d+$/.test(k)
+                  )
                   ? '数字IDキーのオブジェクト'
                   : 'キー形式不明のオブジェクト';
 
@@ -2634,7 +2859,9 @@
                 ? (
                     Array.isArray(body.manga)
                       ? body.manga.length
-                      : Object.keys(body.manga).length
+                      : Object.keys(
+                          body.manga
+                        ).length
                   )
                 : 'なし';
 
@@ -2652,7 +2879,9 @@
           // 第2候補：illusts
           try {
             const body = await diagGet(
-              `/ajax/user/${encodeURIComponent(userId)}/illusts` +
+              `/ajax/user/${
+                encodeURIComponent(userId)
+              }/illusts` +
               '?limit=30&tag=&lang=ja',
               controller.signal
             );
@@ -2661,21 +2890,29 @@
 
             if (!found) {
               throw new Error(
-                `候補配列なし（bodyキー: ${diagKeys(body)}）`
+                `候補配列なし（bodyキー: ${
+                  diagKeys(body)
+                }）`
               );
             }
 
             return (
               `OK / 代替illusts使用` +
-              ` / ${found.path} ${found.data.length}件` +
-              ` / 先頭キー: ${diagKeys(found.data[0])}` +
+              ` / ${found.path} ${
+                found.data.length
+              }件` +
+              ` / 先頭キー: ${
+                diagKeys(found.data[0])
+              }` +
               ` / 第一候補NG: ${reason}`
             );
 
           } catch (e) {
             throw new Error(
               `profile/all: ${reason}` +
-              ` / 代替illusts: ${diagError(e)}`
+              ` / 代替illusts: ${
+                diagError(e)
+              }`
             );
           }
         }
@@ -2696,13 +2933,19 @@
 
           if (!found) {
             throw new Error(
-              `候補配列なし（bodyキー: ${diagKeys(body)}）`
+              `候補配列なし（bodyキー: ${
+                diagKeys(body)
+              }）`
             );
           }
 
           return (
-            `OK / ${found.path} ${found.data.length}件` +
-            `\n   先頭キー: ${diagKeys(found.data[0])}` +
+            `OK / ${found.path} ${
+              found.data.length
+            }件` +
+            `\n   先頭キー: ${
+              diagKeys(found.data[0])
+            }` +
             ` / bodyキー: ${diagKeys(body)}`
           );
         }
@@ -2730,25 +2973,29 @@
             );
           }
 
-          // 3番と同じ作品なら、そのレスポンスを再利用。
           const body =
             recCache.get(id) ||
             await diagGet(
-              `/ajax/illust/${encodeURIComponent(id)}` +
-              '/recommend/init?limit=60&lang=ja',
+              `/ajax/illust/${
+                encodeURIComponent(id)
+              }/recommend/init?limit=60&lang=ja`,
               controller.signal
             );
 
           if (!Array.isArray(body.illusts)) {
             throw new Error(
-              `illustsなし（bodyキー: ${diagKeys(body)}）`
+              `illustsなし（bodyキー: ${
+                diagKeys(body)
+              }）`
             );
           }
 
           const ids = new Set(
             body.illusts.map(
               x => String(
-                x?.id ?? x?.illustId ?? ''
+                x?.id ??
+                x?.illustId ??
+                ''
               )
             )
           );
@@ -2758,7 +3005,9 @@
           ).length;
 
           return (
-            `OK / カルーセル${carousel.length}件中` +
+            `OK / カルーセル${
+              carousel.length
+            }件中` +
             ` recommend/initに${matched}件` +
             ` / DOM見出し探索（要確認）`
           );
@@ -2777,7 +3026,6 @@
       }
     }
   }
-
   /* ---------- 診断UIの設置 ---------- */
 
   function installDiagnosticUI() {

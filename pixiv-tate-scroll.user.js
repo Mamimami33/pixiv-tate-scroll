@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.2.0
+// @version      3.3.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -206,6 +206,93 @@
 
   /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
 
+  // raw deflate 解凍（SafariのDecompressionStreamがdeflate-raw非対応のため自前実装。検証済み）
+  function inflateRaw(bytes) {
+    let pos = 0;
+    const bit = () => { const b = (bytes[pos >> 3] >> (pos & 7)) & 1; pos++; return b; };
+    const bits = (n) => { let v = 0; for (let i = 0; i < n; i++) v |= bit() << i; return v; };
+    const buildHuff = (lengths) => {
+      const maxBits = Math.max(...lengths, 0);
+      const blCount = new Array(maxBits + 1).fill(0);
+      lengths.forEach((l) => { if (l) blCount[l]++; });
+      const nextCode = new Array(maxBits + 1).fill(0);
+      let code = 0;
+      for (let b = 1; b <= maxBits; b++) { code = (code + blCount[b - 1]) << 1; nextCode[b] = code; }
+      const map = new Map();
+      lengths.forEach((l, sym) => { if (l) { map.set(nextCode[l], { len: l, sym }); nextCode[l]++; } });
+      return { map, maxBits };
+    };
+    const decode = (huff) => {
+      let code = 0;
+      for (let len = 1; len <= huff.maxBits; len++) {
+        code = (code << 1) | bit();
+        const hit = huff.map.get(code);
+        if (hit && hit.len === len) return hit.sym;
+      }
+      throw new Error('bad huffman code');
+    };
+    const LEN_BASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+    const LEN_EXT = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+    const DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+    const DIST_EXT = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+    const out = [];
+    let last = 0;
+    while (!last) {
+      last = bits(1);
+      const type = bits(2);
+      if (type === 0) {
+        pos = (pos + 7) & ~7;
+        const len = bytes[pos >> 3] | (bytes[(pos >> 3) + 1] << 8);
+        pos += 32;
+        const start = pos >> 3;
+        for (let i = 0; i < len; i++) out.push(bytes[start + i]);
+        pos += len * 8;
+      } else {
+        let litHuff, distHuff;
+        if (type === 1) {
+          const lit = [];
+          for (let i = 0; i < 288; i++) lit.push(i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8);
+          litHuff = buildHuff(lit);
+          distHuff = buildHuff(new Array(30).fill(5));
+        } else if (type === 2) {
+          const hlit = bits(5) + 257;
+          const hdist = bits(5) + 1;
+          const hclen = bits(4) + 4;
+          const order = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+          const clen = new Array(19).fill(0);
+          for (let i = 0; i < hclen; i++) clen[order[i]] = bits(3);
+          const clHuff = buildHuff(clen);
+          const lens = [];
+          while (lens.length < hlit + hdist) {
+            const sym = decode(clHuff);
+            if (sym < 16) lens.push(sym);
+            else if (sym === 16) { const rep = bits(2) + 3; const prev = lens[lens.length - 1]; for (let i = 0; i < rep; i++) lens.push(prev); }
+            else if (sym === 17) { const rep = bits(3) + 3; for (let i = 0; i < rep; i++) lens.push(0); }
+            else { const rep = bits(7) + 11; for (let i = 0; i < rep; i++) lens.push(0); }
+          }
+          litHuff = buildHuff(lens.slice(0, hlit));
+          distHuff = buildHuff(lens.slice(hlit));
+        } else {
+          throw new Error('bad block type');
+        }
+        for (;;) {
+          const sym = decode(litHuff);
+          if (sym < 256) out.push(sym);
+          else if (sym === 256) break;
+          else {
+            const li = sym - 257;
+            const len = LEN_BASE[li] + bits(LEN_EXT[li]);
+            const dsym = decode(distHuff);
+            const dist = DIST_BASE[dsym] + bits(DIST_EXT[dsym]);
+            const start = out.length - dist;
+            for (let i = 0; i < len; i++) out.push(out[start + i]);
+          }
+        }
+      }
+    }
+    return new Uint8Array(out);
+  }
+
   async function unzipFrames(zipUrl, frames) {
     const buf = await (await fetch(zipUrl)).arrayBuffer();
     const view = new DataView(buf);
@@ -240,8 +327,7 @@
       const raw = new Uint8Array(buf, ent.dataOff, ent.compSize);
       let bytes = raw;
       if (ent.method === 8) {
-        const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-        bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+        bytes = inflateRaw(raw);
       }
       const mime = /\.png$/i.test(f.file) ? 'image/png' : 'image/jpeg';
       urls.push(URL.createObjectURL(new Blob([bytes], { type: mime })));
@@ -251,6 +337,10 @@
 
   function startUgoira(s) {
     if (s.animTimer || !s.frameUrls) return;
+    if (s.pageChip) {
+      s.pageChip.style.display = 'block';
+      s.pageChip.textContent = 'うごイラ再生中';
+    }
     const step = () => {
       if (!s.frameUrls) return;
       const url = s.frameUrls[s.animIdx % s.frameUrls.length];
@@ -270,7 +360,13 @@
     if (s.frameUrls || !s.frames || s.preparingUgoira) return;
     s.preparingUgoira = true;
     try {
-      // 第1候補：個別フレームURL（_ugoira0, _ugoira1, ...）を直接切り替える。ZIP不要で軽い
+      // 第1候補：ZIPを自前で展開する（pixiv公式と同じ方式）
+      if (s.zipUrl) {
+        s.frameUrls = await unzipFrames(s.zipUrl, s.frames);
+        if (s.isCurrent) startUgoira(s);
+        return;
+      }
+      // 第2候補：個別フレームURL（_ugoira0, _ugoira1, ...）
       if (s.frameBase && s.frameExt) {
         const urls = s.frames.map((f, i) => `${s.frameBase}${i}${s.frameExt}`);
         const ok = await new Promise((done) => {
@@ -283,16 +379,14 @@
           s.frameUrls = urls;
           urls.forEach((u) => { const im = new Image(); im.src = u; });
           if (s.isCurrent) startUgoira(s);
-          return;
         }
       }
-      // 第2候補：ZIPを展開する
-      if (s.zipUrl) {
-        s.frameUrls = await unzipFrames(s.zipUrl, s.frames);
-        if (s.isCurrent) startUgoira(s);
-      }
     } catch (e) {
-      // 失敗したら静止画のまま
+      // 失敗したら静止画のまま。失敗したことが分かるよう表示だけ出す
+      if (s.isCurrent && s.pageChip) {
+        s.pageChip.style.display = 'block';
+        s.pageChip.textContent = 'うごイラ再生できませんでした';
+      }
     } finally {
       s.preparingUgoira = false;
     }

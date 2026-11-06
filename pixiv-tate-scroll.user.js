@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.0
+// @version      3.13.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -12,8 +12,6 @@
   'use strict';
 
   if (window.__ptsLoaded) {
-    const existing = document.getElementById('pts-launch');
-    if (existing) existing.click();
     return;
   }
   window.__ptsLoaded = true;
@@ -1439,12 +1437,10 @@
     skipNavigationBound = true;
 
     const userIntent = () => {
-      if (!zoomedSlide) {
-        navIntent = {
-          reason: 'user',
-          until: performance.now() + 2500
-        };
-      }
+      navIntent = {
+        reason: 'user',
+        until: performance.now() + 2500
+      };
     };
 
     feedEl.addEventListener('touchstart', e => {
@@ -1455,9 +1451,9 @@
       if (e.isPrimary) userIntent();
     }, { passive: true, capture: true });
 
-    feedEl.addEventListener(
-      'wheel', userIntent, { passive: true }
-    );
+    feedEl.addEventListener('wheel', userIntent, {
+      passive: true
+    });
   }
 
   loadSkipProfile();
@@ -2412,8 +2408,6 @@
     feedGeneration++;
     const generation = feedGeneration;
 
-    if (zoomedSlide) clearZoom();
-
     slides.forEach(cleanupSlide);
     slides = [];
 
@@ -2431,9 +2425,11 @@
     try {
       const items = await customFetchBatch();
 
-      if (generation !== feedGeneration ||
-          mode !== 'custom' ||
-          overlay.style.display === 'none') return;
+      if (
+        generation !== feedGeneration ||
+        mode !== 'custom' ||
+        overlay.style.display === 'none'
+      ) return;
 
       if (!items.length) {
         throw new Error('表示できる候補がありません');
@@ -2541,7 +2537,6 @@
   let activeTick = null;
   let immersive = false;
   let uiHideTimer = null;
-  let zoomedSlide = null;
   let reloadTimes = [];
   let effectsReduced = false;
   let closeConfirmTimer = null;
@@ -2646,19 +2641,24 @@
 
     const old = activeView;
 
-    if (old && old.slide !== s &&
-        old.mode === mode &&
-        old.generation === feedGeneration &&
-        slides.includes(old.slide)) {
-
+    if (
+      old &&
+      old.slide !== s &&
+      old.mode === mode &&
+      old.generation === feedGeneration &&
+      slides.includes(old.slide)
+    ) {
       const manual =
         navIntent.reason === 'user' &&
         performance.now() <= navIntent.until;
 
-      if (manual && old.readySeen &&
-          old.elapsed < 2000 &&
-          !old.slide.bookmarked &&
-          !old.slide.likedThisSession) {
+      if (
+        manual &&
+        old.readySeen &&
+        old.elapsed < 2000 &&
+        !old.slide.bookmarked &&
+        !old.slide.likedThisSession
+      ) {
         learnSkip(old.slide);
       }
     }
@@ -2677,8 +2677,6 @@
       loop: false,
       loopCompleted: false
     };
-
-    if (zoomedSlide && zoomedSlide !== s) clearZoom();
 
     syncDock();
   }
@@ -2724,21 +2722,26 @@
   }
 
   function tickViewing() {
-    if (!overlay ||
-        overlay.style.display === 'none' ||
-        !activeView) return;
+    if (
+      !overlay ||
+      overlay.style.display === 'none' ||
+      !activeView
+    ) return;
 
     const v = activeView;
     const now = performance.now();
     const dt = Math.max(0, Math.min(1000, now - v.last));
 
     v.last = now;
+
     const s = v.slide;
 
-    if (document.hidden ||
-        slides[currentIndex()] !== s ||
-        !s.isCurrent ||
-        !visibleReady(s)) return;
+    if (
+      document.hidden ||
+      slides[currentIndex()] !== s ||
+      !s.isCurrent ||
+      !visibleReady(s)
+    ) return;
 
     v.readySeen = true;
     v.elapsed += dt;
@@ -2754,17 +2757,14 @@
       applyPositive(s, 'long', 0.25);
     }
 
-    if (!v.loop && v.loopCompleted && v.elapsed >= 5000) {
+    if (
+      !v.loop &&
+      v.loopCompleted &&
+      v.elapsed >= 5000
+    ) {
       v.loop = true;
       applyPositive(s, 'loop', 0.4);
     }
-
-    s.sectionEl?.classList.toggle(
-      'pts-slow',
-      !effectsReduced &&
-      s.kind !== 'ugoira' &&
-      !zoomedSlide
-    );
   }
   function onUgoiraLoop(s) {
     if (activeView?.slide === s) {
@@ -2772,46 +2772,8 @@
     }
   }
 
-  function clearZoom() {
-    if (!zoomedSlide) return;
 
-    if (zoomedSlide.mainImg) {
-      zoomedSlide.mainImg.style.transform = '';
-      zoomedSlide.mainImg.style.transformOrigin = '';
-    }
 
-    zoomedSlide.sectionEl?.classList.remove('pts-zoomed');
-    zoomedSlide = null;
-
-    if (feedEl) feedEl.style.overflowY = '';
-  }
-  function toggleZoom(s, x, y) {
-    if (!s?.mainImg) return;
-
-    if (zoomedSlide === s) {
-      clearZoom();
-      return;
-    }
-
-    clearZoom();
-
-    const rect = s.mainImg.getBoundingClientRect();
-
-    const px = Math.min(100, Math.max(
-      0, ((x - rect.left) / Math.max(1, rect.width)) * 100
-    ));
-
-    const py = Math.min(100, Math.max(
-      0, ((y - rect.top) / Math.max(1, rect.height)) * 100
-    ));
-
-    s.mainImg.style.transformOrigin = `${px}% ${py}%`;
-    s.mainImg.style.transform = 'scale(2)';
-    s.sectionEl?.classList.add('pts-zoomed');
-
-    zoomedSlide = s;
-    feedEl.style.overflowY = 'hidden';
-  }
   function showControlsTemporarily() {
     if (!overlay) return;
     overlay.classList.add('pts-controls-show');
@@ -2832,8 +2794,6 @@
     } else showControlsTemporarily();
     syncDock();
   }
-    let twoFingerTap = null;
-  let suppressTapUntil = 0;
   const LIKE_TAP_WINDOW = 240;
 
   function showLikeHeart(s, x, y) {
@@ -2904,18 +2864,18 @@
     const holder = e.target.closest?.('.pts-holder');
     if (!holder) return;
 
+    // 既存renderSlide側のタップ送りとの二重実行防止。
     e.stopImmediatePropagation();
 
-    if (twoFingerTap ||
-        performance.now() < suppressTapUntil ||
-        e.isPrimary === false) return;
+    if (e.isPrimary === false || !touchStart) return;
 
-    if (!touchStart ||
-        touchStart.pointerId !== e.pointerId ||
-        Math.hypot(
-          e.clientX - touchStart.x,
-          e.clientY - touchStart.y
-        ) > 12) return;
+    if (
+      touchStart.pointerId !== e.pointerId ||
+      Math.hypot(
+        e.clientX - touchStart.x,
+        e.clientY - touchStart.y
+      ) > 12
+    ) return;
 
     const s = slides[currentIndex()];
 
@@ -2925,14 +2885,15 @@
 
     const now = performance.now();
 
-    if (lastTap &&
-        lastTap.id === String(s.id) &&
-        now - lastTap.time <= LIKE_TAP_WINDOW &&
-        Math.hypot(
-          e.clientX - lastTap.x,
-          e.clientY - lastTap.y
-        ) <= 46) {
-
+    if (
+      lastTap &&
+      lastTap.id === String(s.id) &&
+      now - lastTap.time <= LIKE_TAP_WINDOW &&
+      Math.hypot(
+        e.clientX - lastTap.x,
+        e.clientY - lastTap.y
+      ) <= 46
+    ) {
       clearTimeout(singleTapTimer);
       singleTapTimer = null;
       lastTap = null;
@@ -2954,16 +2915,18 @@
       singleTapTimer = null;
       lastTap = null;
 
-      if (!slides.includes(s) ||
-          slides[currentIndex()] !== s ||
-          overlay?.style.display === 'none') return;
+      if (
+        !slides.includes(s) ||
+        slides[currentIndex()] !== s ||
+        overlay?.style.display === 'none'
+      ) return;
 
       if (immersive) {
         showControlsTemporarily();
         return;
       }
 
-      if (zoomedSlide || s.kind === 'multi') return;
+      if (s.kind === 'multi') return;
 
       const r = holder.getBoundingClientRect();
       const step =
@@ -2976,102 +2939,34 @@
 
   function bindExperienceGestures() {
     feedEl.addEventListener('pointerdown', e => {
-      if (
-        e.isPrimary &&
-        e.target.closest?.('.pts-holder')
-      ) {
-        touchStart = {
-          x: e.clientX,
-          y: e.clientY,
-          pointerId: e.pointerId
-        };
+      if (!e.target.closest?.('.pts-holder')) return;
+
+      if (!e.isPrimary) {
+        touchStart = null;
+        lastTap = null;
+        clearTimeout(singleTapTimer);
+        singleTapTimer = null;
+        return;
       }
+
+      touchStart = {
+        x: e.clientX,
+        y: e.clientY,
+        pointerId: e.pointerId
+      };
     }, true);
 
-    feedEl.addEventListener('pointerup', handleImageTap, true);
+    feedEl.addEventListener(
+      'pointerup',
+      handleImageTap,
+      true
+    );
 
     feedEl.addEventListener('pointercancel', () => {
       touchStart = null;
-    }, true);
-
-    feedEl.addEventListener('touchstart', e => {
-      if (e.touches.length !== 2) return;
-
-      const holder = e.target.closest?.('.pts-holder');
-      const s = slides[currentIndex()];
-
-      if (
-        !holder ||
-        holder.closest('.pts-slide') !== s?.sectionEl
-      ) return;
-
-      twoFingerTap = {
-        s,
-        time: performance.now(),
-        moved: false,
-        start: Array.from(e.touches).map(t => ({
-          x: t.clientX,
-          y: t.clientY
-        })),
-        x: (e.touches[0].clientX +
-            e.touches[1].clientX) / 2,
-        y: (e.touches[0].clientY +
-            e.touches[1].clientY) / 2
-      };
-
-      suppressTapUntil = performance.now() + 650;
-
+      lastTap = null;
       clearTimeout(singleTapTimer);
       singleTapTimer = null;
-      lastTap = null;
-
-      if (e.cancelable) e.preventDefault();
-    }, { capture: true, passive: false });
-
-    feedEl.addEventListener('touchmove', e => {
-      if (!twoFingerTap) return;
-
-      if (e.touches.length !== 2) {
-        twoFingerTap.moved = true;
-      } else {
-        for (let i = 0; i < 2; i++) {
-          if (
-            Math.hypot(
-              e.touches[i].clientX -
-                twoFingerTap.start[i].x,
-              e.touches[i].clientY -
-                twoFingerTap.start[i].y
-            ) > 16
-          ) {
-            twoFingerTap.moved = true;
-          }
-        }
-      }
-
-      if (e.cancelable) e.preventDefault();
-    }, { capture: true, passive: false });
-
-    feedEl.addEventListener('touchend', e => {
-      if (!twoFingerTap || e.touches.length) return;
-
-      const g = twoFingerTap;
-      twoFingerTap = null;
-
-      suppressTapUntil = performance.now() + 450;
-
-      if (
-        !g.moved &&
-        performance.now() - g.time <= 380 &&
-        slides.includes(g.s)
-      ) {
-        if (e.cancelable) e.preventDefault();
-        toggleZoom(g.s, g.x, g.y);
-      }
-    }, { capture: true, passive: false });
-
-    feedEl.addEventListener('touchcancel', () => {
-      twoFingerTap = null;
-      suppressTapUntil = performance.now() + 450;
     }, true);
   }
 
@@ -3146,7 +3041,8 @@
 
     style.textContent = `
       #pts-overlay .pts-bar{
-        pointer-events:none;justify-content:center;
+        pointer-events:none;
+        justify-content:center;
         background:linear-gradient(#0009,transparent);
         transition:opacity .2s
       }
@@ -3158,25 +3054,35 @@
       #pts-overlay .pts-open{display:none!important}
 
       #pts-overlay .pts-img{
-        display:block;width:100%;height:100%;
-        max-width:none;max-height:none;object-fit:cover
+        display:block;
+        width:100%;
+        height:100%;
+        max-width:100%;
+        max-height:100%;
+        object-fit:contain!important;
+        animation:none!important;
+        transform:none!important
       }
 
       #pts-overlay .pts-dock{
         position:absolute;bottom:0;left:0;right:0;z-index:19;
-        display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
-        gap:8px;padding:8px 8px calc(8px + env(safe-area-inset-bottom));
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:8px;
+        padding:8px 8px calc(8px + env(safe-area-inset-bottom));
         background:linear-gradient(transparent,#000c 20%,#000d);
         transition:opacity .2s
       }
       #pts-overlay .pts-dock button{
         min-height:48px;border:1px solid #ffffff28;
-        background:#202020a8;color:white;border-radius:12px;
-        font-size:14px;touch-action:manipulation
+        background:#202020a8;color:white;
+        border-radius:12px;font-size:14px;
+        touch-action:manipulation
       }
 
       #pts-overlay .pts-tools{
-        position:absolute;bottom:calc(68px + env(safe-area-inset-bottom));
+        position:absolute;
+        bottom:calc(68px + env(safe-area-inset-bottom));
         left:8px;right:8px;z-index:21;
         background:#151515eb;border:1px solid #5558;
         border-radius:12px;padding:10px;
@@ -3185,36 +3091,43 @@
       }
       #pts-overlay .pts-tools[hidden],
       #pts-overlay .pts-history-panel[hidden],
-      #pts-overlay .pts-search-tags[hidden]{display:none!important}
+      #pts-overlay .pts-search-tags[hidden]{
+        display:none!important
+      }
       #pts-overlay .pts-tools button{
         padding:10px;color:#fff;background:#444;
         border:0;border-radius:8px;min-height:42px
       }
 
       #pts-overlay .pts-history-panel{
-        position:absolute;inset:0;z-index:35;background:#000d;
-        display:flex;align-items:center;justify-content:center;
+        position:absolute;inset:0;z-index:35;
+        background:#000d;display:flex;
+        align-items:center;justify-content:center;
         padding:12px;box-sizing:border-box
       }
       #pts-overlay .pts-history-sheet{
-        width:100%;max-width:900px;height:80dvh;background:#151515;
-        color:white;border:1px solid #555;border-radius:12px;
-        display:flex;flex-direction:column;padding:12px;box-sizing:border-box
+        width:100%;max-width:900px;height:80dvh;
+        background:#151515;color:white;
+        border:1px solid #555;border-radius:12px;
+        display:flex;flex-direction:column;
+        padding:12px;box-sizing:border-box
       }
       #pts-overlay .pts-history-head{
-        display:flex;align-items:center;justify-content:space-between;
-        padding-bottom:10px
+        display:flex;align-items:center;
+        justify-content:space-between;padding-bottom:10px
       }
       #pts-overlay .pts-history-head button{
-        padding:10px;border-radius:8px;background:#444;color:white;border:0
+        padding:10px;border-radius:8px;
+        background:#444;color:white;border:0
       }
       #pts-overlay .pts-history-list{
-        display:flex;flex-direction:column;gap:6px;
-        overflow:auto;min-height:0
+        display:flex;flex-direction:column;
+        gap:6px;overflow:auto;min-height:0
       }
       #pts-overlay .pts-history-list button{
-        padding:11px;text-align:left;background:#303030;
-        color:#fff;border:0;border-radius:7px
+        padding:11px;text-align:left;
+        background:#303030;color:#fff;
+        border:0;border-radius:7px
       }
       #pts-overlay .pts-history-list button:disabled{opacity:.4}
 
@@ -3224,19 +3137,14 @@
       #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-pagechip{
         opacity:0;pointer-events:none
       }
-
       #pts-overlay.pts-immersive:not(.pts-controls-show)
         .pts-slide.pts-current.pts-multi .pts-pagechip{
         opacity:.42;pointer-events:none;
-        top:calc(10px + env(safe-area-inset-top));right:9px;
-        font-size:10px;padding:2px 6px;
+        top:calc(10px + env(safe-area-inset-top));
+        right:9px;font-size:10px;padding:2px 6px;
         background:rgba(0,0,0,.35);color:#fff
       }
-    `;
 
-    const extra = document.createElement('style');
-
-    extra.textContent = `
       #pts-overlay .pts-seek{
         position:absolute;left:12px;right:12px;
         top:auto;bottom:calc(73px + env(safe-area-inset-bottom));
@@ -3244,34 +3152,37 @@
         touch-action:none
       }
       #pts-overlay .pts-seek::before{
-        content:"";position:absolute;left:0;right:0;top:50%;
+        content:"";position:absolute;
+        left:0;right:0;top:50%;
         height:4px;transform:translateY(-50%);
         background:rgba(255,255,255,.30);border-radius:4px
       }
       #pts-overlay .pts-seek-fill{
-        position:absolute;left:0;top:50%;height:4px;
-        transform:translateY(-50%);background:#0096fa;
-        border-radius:4px
+        position:absolute;left:0;top:50%;
+        height:4px;transform:translateY(-50%);
+        background:#0096fa;border-radius:4px
       }
       #pts-overlay .pts-seek-knob{
         position:absolute;top:50%;left:0%;
         width:16px;height:16px;margin-left:0;
-        transform:translate(-50%,-50%);border-radius:50%;
-        background:#fff;box-shadow:0 1px 5px #0009
+        transform:translate(-50%,-50%);
+        border-radius:50%;background:#fff;
+        box-shadow:0 1px 5px #0009
       }
       #pts-overlay.pts-immersive:not(.pts-controls-show) .pts-seek{
         opacity:1!important;pointer-events:auto!important
       }
-
       #pts-overlay .pts-ugoira-status{
         position:absolute;left:50%;top:43%;z-index:17;
         transform:translate(-50%,-50%);
         padding:10px 15px;border-radius:12px;
         background:rgba(0,0,0,.78);color:#fff;
-        font-size:13px;text-align:center;pointer-events:none;
-        max-width:85vw
+        font-size:13px;text-align:center;
+        pointer-events:none;max-width:85vw
       }
-      #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
+      #pts-overlay .pts-ugoira-status[hidden]{
+        display:none!important
+      }
       #pts-overlay .pts-ugoira-error{color:#ffd6d6}
 
       #pts-overlay .pts-search-tags{
@@ -3282,7 +3193,9 @@
         background:linear-gradient(#000a,#0003);
         transition:opacity .2s
       }
-      #pts-overlay .pts-search-tags::-webkit-scrollbar{display:none}
+      #pts-overlay .pts-search-tags::-webkit-scrollbar{
+        display:none
+      }
       #pts-overlay .pts-search-tags button{
         flex-shrink:0;white-space:nowrap;color:#fff;
         background:#333b;border:1px solid #ffffff30;
@@ -3296,21 +3209,15 @@
       #pts-overlay .pts-slide.pts-current .pts-holder{
         animation:ptsIn .16s ease-out
       }
-      @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
-      #pts-overlay .pts-slide.pts-slow:not(.pts-zoomed) .pts-img{
-        animation:ptsSlow 5s ease-out both
+      @keyframes ptsIn{
+        from{opacity:.83}to{opacity:1}
       }
-      @keyframes ptsSlow{
-        from{transform:scale(1)}to{transform:scale(1.025)}
-      }
-      #pts-overlay .pts-zoomed .pts-img{
-        transition:transform .18s ease-out!important;
-        animation:none!important
-      }
-      #pts-overlay .pts-holder{touch-action:manipulation}
-      #pts-overlay .pts-zoomed .pts-holder{touch-action:none}
       #pts-overlay.pts-low-effects .pts-current .pts-holder{
         animation:none!important
+      }
+
+      #pts-overlay .pts-holder{
+        touch-action:pan-x pan-y
       }
       #pts-overlay .pts-like-heart{
         position:absolute;z-index:18;pointer-events:none;
@@ -3325,14 +3232,14 @@
         100%{opacity:0;transform:translate(-50%,-100%) scale(1.14)}
       }
       @media(prefers-reduced-motion:reduce){
-        #pts-overlay .pts-img,#pts-overlay .pts-holder{
+        #pts-overlay .pts-holder{
           animation:none!important;transition:none!important
         }
-        #pts-overlay .pts-like-heart{animation-duration:.2s}
+        #pts-overlay .pts-like-heart{
+          animation-duration:.2s
+        }
       }
     `;
-
-    document.head.appendChild(extra);
 
     document.head.appendChild(style);
   }
@@ -3732,8 +3639,6 @@
     feedGeneration++;
     const generation = feedGeneration;
 
-    if (zoomedSlide) clearZoom();
-
     slides.forEach(cleanupSlide);
     slides = [];
 
@@ -3751,17 +3656,22 @@
 
     updateCounter();
 
-    // 先頭ページが全件既読でも次ページを試せるようにする。
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (generation !== feedGeneration ||
-          searchFinished || slides.length) break;
+      if (
+        generation !== feedGeneration ||
+        searchFinished ||
+        slides.length
+      ) break;
 
       await searchLoadMore();
 
       if (searchLastFailure) break;
     }
 
-    if (generation === feedGeneration && slides.length) {
+    if (
+      generation === feedGeneration &&
+      slides.length
+    ) {
       markCurrentFromScroll();
     }
   }
@@ -3782,8 +3692,6 @@
       reason,
       until: performance.now() + 3000
     };
-
-    if (zoomedSlide) clearZoom();
 
     feedEl.scrollTo({
       top: i * feedEl.clientHeight,
@@ -5470,8 +5378,6 @@
     overlay.querySelector('.pts-history-panel')
       ?.setAttribute('hidden', '');
 
-    if (zoomedSlide) clearZoom();
-
     feedGeneration++;
     customResetState();
     searchBusy = false;
@@ -5598,6 +5504,116 @@
     document.body.appendChild(overlay);
   }
 
+  function shouldAutoOpenPixivView() {
+    if (location.hostname !== 'www.pixiv.net') {
+      return false;
+    }
+
+    const path = location.pathname;
+
+    const excludedPaths = [
+      // 設定・アカウント管理
+      /^\/(?:settings?|accounts?)(?:\/|$)/i,
+
+      // 認証・API
+      /^\/(?:login|logout|signup|register|auth|oauth|ajax|api)(?:\/|$)/i,
+
+      // 投稿・アップロード・管理・編集
+      /^\/(?:upload|uploads|editor|edit|create|dashboard|manage)(?:\/|$)/i,
+
+      // メッセージ・通知
+      /^\/(?:messages?|inbox|notifications?)(?:\/|$)/i,
+
+      // 決済・有料プラン
+      /^\/(?:premium|payment|payments|checkout|billing)(?:\/|$)/i,
+
+      // ユーザー情報や小説の編集
+      /^\/users\/[^/]+\/(?:edit|settings?|manage)(?:\/|$)/i,
+      /^\/novel\/(?:new|edit|create|upload)(?:\/|$)/i,
+
+      // 旧式PHPの設定・投稿ページ
+      /^\/(?:setting_[^/]*|upload[^/]*|edit[^/]*|new_illust)\.php$/i,
+
+      // 閲覧用途ではない案内ページ
+      /^\/(?:error|maintenance|help|terms|privacy|policy)(?:\/|$)/i
+    ];
+
+    if (excludedPaths.some(re => re.test(path))) {
+      return false;
+    }
+
+    // 旧式の作品編集・投稿画面
+    if (/^\/member_illust\.php$/i.test(path)) {
+      const mode = new URLSearchParams(
+        location.search
+      ).get('mode') || '';
+
+      if (/^(?:edit|upload|new)$/i.test(mode)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function installRouteAutoStart() {
+    let lastRoute =
+      location.pathname + location.search;
+
+    const openForRoute = route => {
+      requestAnimationFrame(() => {
+        const current =
+          location.pathname + location.search;
+
+        if (current !== route) return;
+        if (!shouldAutoOpenPixivView()) return;
+
+        if (
+          !overlay ||
+          overlay.style.display === 'none'
+        ) {
+          openViewer();
+        }
+      });
+    };
+
+    const checkRoute = () => {
+      const current =
+        location.pathname + location.search;
+
+      // 同一URLなら何もしない。
+      // 閉じたあとも自動再起動しない。
+      if (current === lastRoute) return;
+
+      lastRoute = current;
+
+      // 新しいURLに移った場合は旧フィードを終了。
+      if (
+        overlay &&
+        overlay.style.display !== 'none'
+      ) {
+        closeViewer();
+      }
+
+      // 設定・投稿画面などでは起動しない。
+      if (!shouldAutoOpenPixivView()) return;
+
+      openForRoute(current);
+    };
+
+    // 最初のページ読み込みで1回だけ起動する。
+    if (shouldAutoOpenPixivView()) {
+      openForRoute(lastRoute);
+    }
+
+    // 戻る・進む操作への即時対応。
+    window.addEventListener('popstate', checkRoute);
+
+    // SPAルーターによるURL変更を検知。
+    // pixiv本体のhistory APIは変更しない。
+    window.setInterval(checkRoute, 700);
+  }
+
   const btn = document.createElement('button');
 
   btn.id = 'pts-launch';
@@ -5622,16 +5638,7 @@
   btn.addEventListener('click', openViewer);
   document.body.appendChild(btn);
 
-  // 作品ページまたはタグ検索結果ページでは自動起動。
-  const artworkPage = /^\/artworks\/\d+(?:\/|$)/
-    .test(location.pathname);
-
-  const searchPageDetected = !!getSearchPageConfig();
-
-  if (artworkPage || searchPageDetected) {
-    requestAnimationFrame(() => {
-      // すでに開いている場合はopenViewer側で再入を抑止。
-      openViewer();
-    });
-  }
+  // 閲覧ページでは自動起動。
+  // SPA遷移も監視するが、同じURLでは再起動しない。
+  installRouteAutoStart();
 })();

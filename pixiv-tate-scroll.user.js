@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.4.1
+// @version      3.4.2
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -308,11 +308,12 @@
     return new Uint8Array(out);
   }
 
-  async function unzipFrames(zipUrl, frames) {
+  async function unzipFrames(zipUrl, frames, signal) {
     let res;
     try {
-      res = await fetch(zipUrl);
+      res = await fetch(zipUrl, { signal });
     } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
       throw new Error('ZIP取得失敗(通信/CORS): ' + (e && e.message ? e.message : e));
     }
     if (!res.ok) throw new Error('ZIP取得失敗: HTTP ' + res.status);
@@ -421,13 +422,15 @@
     if (s.ugoiraError) { if (s.isCurrent) setChip(s, 'うごイラ: ' + s.ugoiraError); return; }
     if (!s.frames) { if (s.isCurrent) setChip(s, 'うごイラ: フレーム情報なし'); return; }
     s.preparingUgoira = true;
+    s.ugoiraAbort = new AbortController();
     if (s.isCurrent) setChip(s, 'うごイラ準備中…');
     try {
       // 第1候補：ZIPを自前で展開する（pixiv公式と同じ方式）
       if (s.zipUrl) {
         try {
-          s.frameUrls = await unzipFrames(s.zipUrl, s.frames);
+          s.frameUrls = await unzipFrames(s.zipUrl, s.frames, s.ugoiraAbort.signal);
         } catch (e) {
+          if (e && e.name === 'AbortError') throw e;
           throw new Error('ZIP展開失敗: ' + (e && e.message ? e.message : e));
         }
         const valid = s.frameUrls.filter(Boolean).length;
@@ -454,11 +457,61 @@
       }
       throw new Error('再生手段なし');
     } catch (e) {
-      if (s.isCurrent) setChip(s, 'うごイラ: ' + (e && e.message ? e.message : e));
-      s.ugoiraError = (e && e.message) ? e.message : String(e);
+      if (e && e.name === 'AbortError') {
+        // 優先度付け替えで中断されただけ。エラー扱いしない
+      } else {
+        if (s.isCurrent) setChip(s, 'うごイラ: ' + (e && e.message ? e.message : e));
+        s.ugoiraError = (e && e.message) ? e.message : String(e);
+      }
     } finally {
       s.preparingUgoira = false;
+      s.ugoiraAbort = null;
     }
+  }
+
+  /* ---------- 閲覧中の読み込み優先（滞り検知つき） ---------- */
+
+  // 表示中のスライドを最優先にする：他のうごイラ準備を止め、未解決なら即解決し、画像の優先度を上げる
+  function prioritize(s) {
+    slides.forEach((o) => {
+      if (o !== s && o.ugoiraAbort) o.ugoiraAbort.abort();
+      if (o.mainImg) { try { o.mainImg.fetchPriority = (o === s) ? 'high' : 'low'; } catch (e) {} }
+    });
+    if (!s.resolved && !s.resolving) resolveSlide(s);
+    if (s.kind === 'ugoira' && !s.frameUrls && s.resolved) prepareUgoira(s);
+  }
+
+  // 画像の読み込みを強制的にやり直す（止まったとき用）
+  function forceReloadImage(s) {
+    const img = s.mainImg;
+    if (!img || !s.pairs || !s.pairs[0]) return;
+    const url = (s.isCurrent && quality === 'orig') ? (s.pairs[0].o || s.pairs[0].r) : (s.pairs[0].r || s.pairs[0].o);
+    if (!url) return;
+    const cur = img.src;
+    img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
+    setTimeout(() => { if (s.mainImg === img) img.src = cur.includes('pximg') ? cur : url; }, 40);
+  }
+
+  // 表示中になってから一定時間たっても読み込めていなければ、優先化→強制再読み込みの順で助ける
+  function armWatchdog(s) {
+    if (s.loadWatch) clearTimeout(s.loadWatch);
+    s.loadWatch = setTimeout(() => {
+      if (!s.isCurrent) return;
+      const img = s.mainImg;
+      const imgOk = s.kind === 'ugoira' ? !!s.frameUrls : (img && img.complete && img.naturalWidth > 0);
+      if (s.resolved && imgOk) return;
+      prioritize(s);
+      s.loadWatch = setTimeout(() => {
+        if (!s.isCurrent) return;
+        const im2 = s.mainImg;
+        const ok2 = s.kind === 'ugoira' ? !!s.frameUrls : (im2 && im2.complete && im2.naturalWidth > 0);
+        if (!ok2) {
+          if (!s.resolved && s.resolving) { s.resolving = false; resolveSlide(s); }
+          else if (s.kind !== 'ugoira') forceReloadImage(s);
+          else prepareUgoira(s);
+        }
+      }, 4000);
+    }, 2600);
   }
 
   /* ---------- 表示 ---------- */
@@ -683,10 +736,12 @@
         if (!s.isCurrent) {
           s.isCurrent = true;
           if (s.resolved) upgradeSlide(s);
+          else resolveSlide(s);
           if (s.kind === 'ugoira') {
             if (s.frameUrls) startUgoira(s);
             else if (s.resolved) prepareUgoira(s);
           }
+          armWatchdog(s);
         }
       } else if (s.isCurrent) {
         s.isCurrent = false;
@@ -758,6 +813,7 @@
             if (s.frameUrls) startUgoira(s);
             else if (s.resolved) prepareUgoira(s);
           }
+          armWatchdog(s);
         } else {
           s.isCurrent = false;
           stopUgoira(s);

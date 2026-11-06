@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.5.0
+// @version      3.5.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -197,7 +197,25 @@
     return pair.r || pair.o;
   }
 
-  function upgradeSlide(s) {
+  // 元画像への差し替えは「裏で読み切ってから」行い、表示中の画像は絶対に格下げしない（消える・遅くなる元）
+  function swapToOriginal(s, img, pair) {
+    if (!pair || !pair.o || s.origLoading) return;
+    const cur = img.getAttribute('src') || '';
+    if (cur.includes(pair.o)) return;
+    s.origLoading = true;
+    const pre = new Image();
+    pre.decoding = 'async';
+    try { pre.fetchPriority = 'high'; } catch (e) {}
+    pre.onload = () => {
+      s.origLoading = false;
+      if ((img.getAttribute('src') || '').includes(pair.o)) return;
+      img.src = pair.o;
+    };
+    pre.onerror = () => { s.origLoading = false; };
+    pre.src = pair.o;
+  }
+
+  function upgradeSlide(s, force) {
     if (!s.resolved || !s.pairs) return;
     const holder = s.sectionEl && s.sectionEl.querySelector('.pts-holder');
     if (!holder) return;
@@ -206,16 +224,23 @@
       imgs.forEach((im, i) => {
         const pair = s.pairs[i];
         if (!pair) return;
-        const target = levelUrl(s, pair);
-        if (target && im.getAttribute('src') !== target && !im.src.includes(target)) im.src = target;
+        if (force) {
+          const target = levelUrl(s, pair);
+          if (target && !(im.getAttribute('src') || '').includes(target)) im.src = target;
+        } else if (s.isCurrent && quality === 'orig' && i === (s.pageIdx || 0)) {
+          swapToOriginal(s, im, pair);
+        }
       });
-      s.mainImg = imgs[0] || s.mainImg;
+      s.mainImg = imgs[s.pageIdx || 0] || imgs[0] || s.mainImg;
     } else {
       const pair = s.pairs[0];
-      const target = levelUrl(s, pair);
-      if (s.mainImg && target) {
-        const cur = s.mainImg.getAttribute('src') || '';
-        if (!cur.includes(target)) s.mainImg.src = target;
+      if (s.mainImg && pair) {
+        if (force) {
+          const target = levelUrl(s, pair);
+          if (target && !(s.mainImg.getAttribute('src') || '').includes(target)) s.mainImg.src = target;
+        } else if (s.isCurrent && quality === 'orig') {
+          swapToOriginal(s, s.mainImg, pair);
+        }
       }
       if (s.kind === 'ugoira') prepareUgoira(s);
     }
@@ -505,15 +530,14 @@
     if (s.kind === 'ugoira' && !s.frameUrls && s.resolved) prepareUgoira(s);
   }
 
-  // 画像の読み込みを強制的にやり直す（止まったとき用）
+  // 画像の読み込みを強制的にやり直す（壊れて終わっているときだけ。読み込み途中では呼ばない）
   function forceReloadImage(s) {
     const img = s.mainImg;
     if (!img || !s.pairs || !s.pairs[0]) return;
-    const url = (s.isCurrent && quality === 'orig') ? (s.pairs[0].o || s.pairs[0].r) : (s.pairs[0].r || s.pairs[0].o);
+    const url = (quality === 'orig' && s.pairs[0].o) ? s.pairs[0].o : (s.pairs[0].r || s.pairs[0].o);
     if (!url) return;
-    const cur = img.src;
-    img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=';
-    setTimeout(() => { if (s.mainImg === img) img.src = cur.includes('pximg') ? cur : url; }, 40);
+    img.src = '';
+    img.src = url;
   }
 
   // 表示中になってから一定時間たっても読み込めていなければ、優先化→強制再読み込みの順で助ける
@@ -531,8 +555,9 @@
         const ok2 = s.kind === 'ugoira' ? !!s.frameUrls : (im2 && im2.complete && im2.naturalWidth > 0);
         if (!ok2) {
           if (!s.resolved && s.resolving) { s.resolving = false; resolveSlide(s); }
-          else if (s.kind !== 'ugoira') forceReloadImage(s);
-          else prepareUgoira(s);
+          else if (s.kind === 'ugoira') prepareUgoira(s);
+          else if (im2 && im2.complete && im2.naturalWidth === 0) forceReloadImage(s);
+          // 読み込みが続いているだけなら、やり直すとかえって遅くなるので触らない
         }
       }, 4000);
     }, 2600);
@@ -544,8 +569,8 @@
     if (!s.sectionEl) return;
     const holder = s.sectionEl.querySelector('.pts-holder');
     if (!holder) return;
-    holder.innerHTML = '';
     if (s.kind === 'multi' && s.pairs && s.pairs.length > 1) {
+      holder.innerHTML = '';
       const pager = document.createElement('div');
       pager.className = 'pts-pager';
       s.pairs.forEach((pair, i) => {
@@ -562,7 +587,9 @@
       });
       pager.addEventListener('scroll', () => {
         const idx = Math.round(pager.scrollLeft / pager.clientWidth);
+        s.pageIdx = idx;
         if (s.pageChip) s.pageChip.textContent = `${idx + 1} / ${s.pairs.length}`;
+        upgradeSlide(s);
       }, { passive: true });
       holder.appendChild(pager);
       if (s.pageChip) {
@@ -571,17 +598,27 @@
       }
       s.mainImg = pager.querySelector('img');
     } else {
-      const im = document.createElement('img');
-      im.className = 'pts-img';
-      im.decoding = 'async';
+      // 仮表示のimg要素を使い回す（作り直すと一瞬消える。URLが同じなら読み直しも起きない）
       const pair = s.pairs && s.pairs[0];
-      im.src = (pair && (pair.r || pair.o)) || s.thumb;
-      im.alt = s.title || '';
-      im.addEventListener('error', () => {
-        if (s.thumb && !im.src.includes(s.thumb)) im.src = s.thumb;
-      });
-      holder.appendChild(im);
-      s.mainImg = im;
+      const target = (pair && (pair.r || pair.o)) || s.thumb;
+      const im = s.mainImg;
+      if (im && holder.contains(im)) {
+        if (im.dataset) delete im.dataset.ptsPh;
+        if (target && !(im.getAttribute('src') || '').includes(target)) im.src = target;
+        im.alt = s.title || im.alt || '';
+      } else {
+        holder.innerHTML = '';
+        const nim = document.createElement('img');
+        nim.className = 'pts-img';
+        nim.decoding = 'async';
+        nim.src = target;
+        nim.alt = s.title || '';
+        nim.addEventListener('error', () => {
+          if (s.thumb && !nim.src.includes(s.thumb)) nim.src = s.thumb;
+        });
+        holder.appendChild(nim);
+        s.mainImg = nim;
+      }
     }
   }
 
@@ -782,16 +819,30 @@
         if (s.resolved) upgradeSlide(s);
       }
     });
-    // 前後（次2枚・前1枚）の元画像を先読みしておく（スワイプした瞬間に綺麗な画像が出る）
-    if (quality === 'orig') {
-      [idx + 1, idx + 2, idx - 1].forEach((j) => {
-        const nx = slides[j];
-        if (nx && nx.resolved && nx.kind !== 'ugoira' && nx.pairs && nx.pairs[0] && nx.pairs[0].o) {
-          const pre = new Image();
-          pre.decoding = 'async';
-          pre.src = nx.pairs[0].o;
-        }
-      });
+    // 近く（前後3枚）の仮表示サムネイルは、監視を待たずスクロール位置から直接読み込む
+    slides.forEach((s, i) => {
+      if (Math.abs(i - idx) <= 3 && s.mainImg && s.mainImg.dataset && s.mainImg.dataset.ptsPh
+        && !s.mainImg.getAttribute('src') && s.thumb) {
+        s.mainImg.src = s.thumb;
+      }
+    });
+    // 先読みは「表示中が読み終わってから」。表示中より先に帯域を食うと全部遅くなる
+    const cur = slides[idx];
+    const curOk = cur && (cur.kind === 'ugoira' ? !!cur.frameUrls
+      : (cur.mainImg && cur.mainImg.complete && cur.mainImg.naturalWidth > 0));
+    if (quality === 'orig' && curOk) {
+      const n1 = slides[idx + 1];
+      if (n1 && n1.resolved && n1.kind !== 'ugoira' && n1.pairs && n1.pairs[0] && n1.pairs[0].o) {
+        const pre = new Image();
+        pre.decoding = 'async';
+        pre.src = n1.pairs[0].o;
+      }
+      const n2 = slides[idx + 2];
+      if (n2 && n2.resolved && n2.kind !== 'ugoira' && n2.pairs && n2.pairs[0] && n2.pairs[0].r) {
+        const pre2 = new Image();
+        pre2.decoding = 'async';
+        pre2.src = n2.pairs[0].r;
+      }
     }
   }
 
@@ -901,7 +952,7 @@
     overlay.querySelector('.pts-quality').addEventListener('change', (e) => {
       quality = e.target.value;
       // 画質を変えたら、解決済みスライドの表示レベルだけ付け替える（取り直しはしない）
-      slides.forEach((s) => { if (s.resolved) upgradeSlide(s); });
+      slides.forEach((s) => { if (s.resolved) upgradeSlide(s, true); });
     });
     feedEl.addEventListener('scroll', () => {
       const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;

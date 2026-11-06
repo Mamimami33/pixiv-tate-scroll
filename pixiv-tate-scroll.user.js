@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.12
+// @version      3.13.13
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -3906,8 +3906,7 @@
     return work;
   }
 
-  // 検索専用: 検索API候補 + recommend/init (上位2作品まで)。
-  // 検索ワード一致を最優先し、検索結果にも同順位内の小加点を与える。
+  // 検索専用: 検索API候補のみを検索ワード一致優先で並べ替える。
   async function buildSearchRankedBatch(rawSearch, word, previous = [], excludeIds = [], signal) {
     const exclusions = [...seenTimes.keys(), ...excludeIds];
     const prepared = await prepareCandidates(rawSearch, {
@@ -3918,41 +3917,7 @@
       !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
     );
     if (signal?.aborted || !searchItems.length) return [];
-    const recLimit = Math.floor(searchItems.length * 3 / 7);
-    const searchIds = new Set(searchItems.map(it => String(it.id)));
-    if (!recLimit) return searchPrioritize(searchItems, word, previous, searchIds);
-
-    const seeds = [...searchItems]
-      .sort((a, b) => tasteScore(b) - tasteScore(a))
-      .slice(0, 2);
-    const responses = await Promise.all(seeds.map(async it => {
-      try {
-        const body = await fetchJson(
-          `/ajax/illust/${encodeURIComponent(it.id)}/recommend/init?limit=30`, signal);
-        return customCandidateArray(body);
-      } catch (e) {
-        if (e?.name !== 'AbortError') console.warn('[PTS search rec]', e);
-        return []; // 検索API結果は残す
-      }
-    }));
-    if (signal?.aborted) return [];
-
-    const recPrepared = await prepareCandidates(responses.flat(), {
-      excludeIds: [...exclusions, ...searchIds],
-      enrichTop: 0, rank: tasteScore
-    });
-    const recEligible = recPrepared.filter(it =>
-      !skipStrong(it.id) && !isSeen(it.id) &&
-      !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
-    );
-    const recChosen = searchPrioritize(recEligible, word, previous)
-      .slice(0, recLimit);
-
-    // searchPrioritizeは検索一致tier、tasteScore、作者分散を処理する。
-    // 既存の保存後用「source」タグペナルティはここでは使わない。
-    return searchPrioritize(
-      [...searchItems, ...recChosen], word, previous, searchIds
-    );
+    return searchPrioritize(searchItems, word, previous);
   }
 
   function searchGridDiversify(items) {

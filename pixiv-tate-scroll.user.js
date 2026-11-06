@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      2.0.0
+// @version      2.0.1
 // @description  今開いているpixivのページに並んでいる作品を、TikTok風の縦スクロール（全画面スナップ）で眺めるビューアです。ブックマーク連携なし・ページ内スキャン方式。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -53,16 +53,23 @@
   }
 
   function pickBestSrc(img) {
-    // srcset があれば一番大きいものを選ぶ
+    const candidates = [];
+    // 遅延読み込みでは data-src に本命が入っていることが多い
+    const ds = img.getAttribute('data-src');
+    if (ds) candidates.push(ds);
     const ss = img.getAttribute('srcset');
     if (ss) {
       const parts = ss.split(',').map((p) => p.trim().split(/\s+/)).filter((p) => p[0]);
-      if (parts.length) {
-        parts.sort((x, y) => (parseInt(y[1]) || 0) - (parseInt(x[1]) || 0));
-        return parts[0][0];
-      }
+      parts.sort((x, y) => (parseInt(y[1]) || 0) - (parseInt(x[1]) || 0));
+      if (parts.length) candidates.push(parts[0][0]);
     }
-    return img.currentSrc || img.src || img.getAttribute('data-src') || '';
+    if (img.currentSrc) candidates.push(img.currentSrc);
+    if (img.src) candidates.push(img.src);
+    // プレースホルダ（data: 等）を避け、pximg のものを優先
+    for (const c of candidates) {
+      if (c && c.includes('i.pximg.net')) return c;
+    }
+    return candidates[0] || '';
   }
 
   // square1200 / custom1200 サムネイル → master1200 に変換を試みる（ダメなら表示時にサムネへ差し戻す）
@@ -126,6 +133,22 @@
     overlay.style.display = 'block';
     document.body.style.overflow = 'hidden';
     buildFeed();
+    // 遅延読み込みで後から増えるページ対策：少し置いて再スキャンし、増えた分を足す
+    setTimeout(() => appendNew(), 1200);
+    setTimeout(() => appendNew(), 3000);
+  }
+
+  function appendNew() {
+    if (!overlay || overlay.style.display === 'none') return;
+    const known = new Set(slides.map((s) => s.id));
+    const items = scanPage().filter((it) => !known.has(it.id));
+    if (items.length === 0) return;
+    items.forEach((s) => {
+      slides.push(s);
+      renderSlide(s, slides.length - 1);
+    });
+    const c = overlay.querySelector('.pts-counter');
+    c.textContent = `${slides.length} 件`;
   }
 
   function closeViewer() {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.10.0
+// @version      3.10.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -1878,8 +1878,1074 @@
     // 以前はIntersectionObserverと二重に書き換えて競合していた（ChatGPTレビュー反映）
   }
 
+  /* ---------- 診断モード v3.10.1（GETのみ・オンデマンド） ---------- */
+
+  const ptsDiag = {
+    installed: false,
+    seq: 0,
+    controller: null,
+    lines: []
+  };
+
+  function diagText(value) {
+    return String(value == null ? 'なし' : value)
+      .replace(/[\r\n]/g, ' ')
+      .slice(0, 180);
+  }
+
+  function diagKeys(obj) {
+    if (!obj || typeof obj !== 'object') return 'なし';
+    return Object.keys(obj).join(', ') || '空';
+  }
+
+  function diagTagShape(tags) {
+    if (tags == null) {
+      return { shape: 'なし', count: 0 };
+    }
+
+    const nested =
+      !Array.isArray(tags) &&
+      typeof tags === 'object' &&
+      Array.isArray(tags.tags);
+
+    const arr = nested ? tags.tags : tags;
+
+    if (Array.isArray(arr)) {
+      const first = arr.find(x => x != null);
+      const kind = first == null
+        ? '空'
+        : typeof first === 'string'
+          ? '文字列'
+          : typeof first === 'object'
+            ? 'オブジェクト'
+            : typeof first;
+
+      const count = arr.filter(x =>
+        (typeof x === 'string' && x.length > 0) ||
+        (x && typeof x === 'object' &&
+          typeof x.tag === 'string' &&
+          x.tag.length > 0)
+      ).length;
+
+      return {
+        shape: `${nested ? 'オブジェクト内の' : ''}${kind}配列`,
+        count
+      };
+    }
+
+    return {
+      shape: typeof tags === 'object'
+        ? `オブジェクト(${diagKeys(tags)})`
+        : typeof tags,
+      count: typeof tags === 'string' && tags.length ? 1 : 0
+    };
+  }
+
+  function diagTopKey(history, live) {
+    const scores = new Map();
+
+    for (const source of [history, live]) {
+      if (!source || typeof source !== 'object') continue;
+
+      for (const [key, raw] of Object.entries(source)) {
+        const num = Number(raw);
+
+        if (key && Number.isFinite(num) && num > 0) {
+          scores.set(key, (scores.get(key) || 0) + num);
+        }
+      }
+    }
+
+    return [...scores]
+      .sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+  }
+
+  // 既知のレスポンス形式を優先し、
+  // 見つからなければ深さ3まで候補配列を探す。
+  function diagFindArray(body) {
+    const preferred = [
+      ['body.illustManga.data', body?.illustManga?.data],
+      ['body.thumbnails.illust', body?.thumbnails?.illust],
+      ['body.thumbnails.manga', body?.thumbnails?.manga],
+      ['body.illusts', body?.illusts],
+      ['body.works', body?.works],
+      ['body.items', body?.items],
+      ['body.data', body?.data]
+    ];
+
+    const chosen = preferred.find(
+      ([, value]) => Array.isArray(value)
+    );
+
+    if (chosen) {
+      return { path: chosen[0], data: chosen[1] };
+    }
+
+    const queue = [
+      { value: body, path: 'body', depth: 0 }
+    ];
+
+    let checked = 0;
+
+    while (queue.length && checked++ < 80) {
+      const { value, path, depth } = queue.shift();
+
+      if (!value ||
+          typeof value !== 'object' ||
+          depth >= 3) {
+        continue;
+      }
+
+      for (const [key, child] of
+        Object.entries(value).slice(0, 30)) {
+
+        const nextPath = `${path}.${key}`;
+
+        if (
+          Array.isArray(child) &&
+          (
+            child.length === 0 ||
+            child.some(x =>
+              x &&
+              typeof x === 'object' &&
+              (x.id != null || x.illustId != null)
+            )
+          )
+        ) {
+          return { path: nextPath, data: child };
+        }
+
+        if (
+          child &&
+          typeof child === 'object' &&
+          !Array.isArray(child)
+        ) {
+          queue.push({
+            value: child,
+            path: nextPath,
+            depth: depth + 1
+          });
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function diagError(error) {
+    return diagText(
+      error && error.message ? error.message : error
+    );
+  }
+
+  // 診断専用GET。
+  // 既存fetchJsonとは独立させてHTTPステータスを取得する。
+  async function diagGet(url, signal) {
+    if (signal.aborted) throw new Error('中止');
+
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const abort = () => controller.abort();
+
+    signal.addEventListener('abort', abort, {
+      once: true
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 12000);
+
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json'
+        },
+        signal: controller.signal
+      });
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      let json;
+
+      try {
+        json = await res.json();
+      } catch (e) {
+        throw new Error(
+          `HTTP ${res.status} / JSON解釈失敗`
+        );
+      }
+
+      if (!json || typeof json !== 'object') {
+        throw new Error('JSONがオブジェクトではない');
+      }
+
+      if (json.error) {
+        throw new Error(
+          `API error: ${diagText(json.message)}`
+        );
+      }
+
+      if (!json.body ||
+          typeof json.body !== 'object') {
+        throw new Error(
+          `HTTP ${res.status} / body形式が想定外`
+        );
+      }
+
+      return json.body;
+
+    } catch (e) {
+      if (timedOut) {
+        throw new Error('タイムアウト（12秒）');
+      }
+
+      if (signal.aborted) {
+        throw new Error('中止');
+      }
+
+      throw e;
+
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+    }
+  }
+
+  function diagAppend(seq, line) {
+    if (seq !== ptsDiag.seq) return;
+
+    ptsDiag.lines.push(line);
+
+    const out = overlay?.querySelector(
+      '.pts-diag-output'
+    );
+
+    if (out) {
+      out.value = ptsDiag.lines.join('\n');
+      out.scrollTop = out.scrollHeight;
+    }
+  }
+
+  // 1チェックごとに独立してエラーを処理する。
+  async function diagCheck(seq, label, work) {
+    try {
+      const result = await work();
+      diagAppend(seq, `${label}: ${result}`);
+    } catch (e) {
+      diagAppend(
+        seq,
+        `${label}: NG / ${diagError(e)}`
+      );
+    }
+  }
+
+  // pixiv本体の「おすすめ作品」見出しを探す。
+  // ビューア自身のDOMは対象に含めない。
+  function diagCarouselIds(pageId) {
+    const headingSelector =
+      'h1,h2,h3,h4,h5,h6,[role="heading"],' +
+      'section strong,aside strong,' +
+      'section span,aside span';
+
+    const headings = document.querySelectorAll(
+      headingSelector
+    );
+
+    for (const head of headings) {
+      if (head.closest('#pts-overlay')) continue;
+
+      const title = (head.textContent || '').trim();
+
+      if (
+        title.length > 45 ||
+        !/おすすめ作品/.test(title)
+      ) {
+        continue;
+      }
+
+      let root = head.parentElement;
+
+      for (
+        let depth = 0;
+        root && depth < 6;
+        depth++, root = root.parentElement
+      ) {
+        const links = root.querySelectorAll(
+          'a[href*="/artworks/"]'
+        );
+
+        if (!links.length || links.length > 80) {
+          continue;
+        }
+
+        const ids = new Set();
+
+        for (const link of links) {
+          const id = (
+            link.getAttribute('href') || ''
+          ).match(/\/artworks\/(\d+)/)?.[1];
+
+          if (id && id !== pageId) {
+            ids.add(id);
+          }
+        }
+
+        if (ids.size) {
+          return [...ids];
+        }
+      }
+    }
+
+    return [];
+  }
+
+  function closeDiagnosticPanel() {
+    if (!ptsDiag.installed) return;
+
+    // 古い診断結果が次の実行に混ざらないようにする。
+    ptsDiag.seq++;
+
+    if (ptsDiag.controller) {
+      ptsDiag.controller.abort();
+    }
+
+    ptsDiag.controller = null;
+
+    const panel = overlay?.querySelector(
+      '.pts-diag-panel'
+    );
+
+    if (panel) {
+      panel.style.display = 'none';
+    }
+
+    const start = overlay?.querySelector(
+      '.pts-diagnostic'
+    );
+
+    if (start) {
+      start.disabled = false;
+    }
+  }
+
+  async function copyDiagnosticReport() {
+    const out = overlay?.querySelector(
+      '.pts-diag-output'
+    );
+
+    const btn = overlay?.querySelector(
+      '.pts-diag-copy'
+    );
+
+    if (!out || !btn) return;
+
+    let copied = false;
+
+    // 第一候補：Clipboard API
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(
+          out.value
+        );
+
+        copied = true;
+      }
+    } catch (e) {
+      // Safariで失敗したら従来方式を試す。
+    }
+
+    // 第二候補：旧来のコピー処理
+    if (!copied) {
+      try {
+        out.focus();
+        out.select();
+
+        out.setSelectionRange(
+          0,
+          out.value.length
+        );
+
+        copied = !!document.execCommand('copy');
+      } catch (e) {
+        // 手動コピーへ
+      }
+    }
+
+    btn.textContent = copied
+      ? 'コピー完了'
+      : '選択して手動コピー';
+  }
+
+  async function runDiagnostic() {
+    if (
+      !ptsDiag.installed ||
+      ptsDiag.controller
+    ) {
+      return;
+    }
+
+    const panel = overlay.querySelector(
+      '.pts-diag-panel'
+    );
+
+    panel.style.display = 'flex';
+
+    const start = overlay.querySelector(
+      '.pts-diagnostic'
+    );
+
+    const copy = overlay.querySelector(
+      '.pts-diag-copy'
+    );
+
+    start.disabled = true;
+    copy.textContent = 'コピー';
+
+    const controller = new AbortController();
+    ptsDiag.controller = controller;
+
+    const seq = ++ptsDiag.seq;
+    ptsDiag.lines = [];
+
+    diagAppend(
+      seq,
+      `pixiv診断 v3.10.1 / ${new Date().toLocaleString('ja-JP')}`
+    );
+
+    diagAppend(
+      seq,
+      '通信はGETのみ。APIの返答形式は実機で確認します。'
+    );
+
+    // 診断内だけで使う一時キャッシュ。
+    // 永続ストレージや既存の学習状態は変更しない。
+    const recCache = new Map();
+
+    let bookmarkWorks = [];
+    let storedHistoryWorks = [];
+
+    try {
+
+      /* ----- 1. ブックマーク一覧 ----- */
+
+      await diagCheck(
+        seq,
+        '1. ブックマーク一覧',
+        async () => {
+          const id = getMyUserId();
+
+          if (!id) {
+            throw new Error(
+              '自分のユーザーIDが不明'
+            );
+          }
+
+          const body = await diagGet(
+            `/ajax/user/${encodeURIComponent(id)}/bookmarks/artworks` +
+            '?tag=&offset=0&limit=48&rest=show',
+            controller.signal
+          );
+
+          if (!Array.isArray(body.works)) {
+            throw new Error(
+              `body.worksなし（bodyキー: ${diagKeys(body)}）`
+            );
+          }
+
+          bookmarkWorks = body.works;
+
+          const first = bookmarkWorks[0];
+
+          const tagged = bookmarkWorks.filter(
+            w => diagTagShape(w?.tags).count > 0
+          ).length;
+
+          const users = bookmarkWorks.filter(
+            w =>
+              w?.userId != null &&
+              String(w.userId) !== ''
+          ).length;
+
+          const ugoira = bookmarkWorks.filter(
+            w => Number(w?.illustType) === 2
+          ).length;
+
+          return (
+            `OK / ${bookmarkWorks.length}件` +
+            ` / tags ${tagged}/${bookmarkWorks.length}` +
+            `（先頭: ${diagTagShape(first?.tags).shape}）` +
+            ` / userId ${users}/${bookmarkWorks.length}` +
+            ` / うごイラ ${ugoira}` +
+            ` / total ${body.total ?? 'なし'}` +
+            `\n   先頭キー: ${diagKeys(first)}`
+          );
+        }
+      );
+
+      /* ----- 2. 履歴学習 ----- */
+
+      await diagCheck(
+        seq,
+        '2. 履歴学習',
+        async () => {
+          const raw = localStorage.getItem(
+            'PTS_PROFILE_V2'
+          );
+
+          if (raw == null) {
+            throw new Error(
+              'PTS_PROFILE_V2が存在しない'
+            );
+          }
+
+          const saved = JSON.parse(raw);
+
+          // v3.10.0はsaved.historyに保存している。
+          const history =
+            saved?.history ??
+            saved?.bookmarkHistory;
+
+          if (
+            !history ||
+            typeof history !== 'object'
+          ) {
+            throw new Error(
+              `historyなし（保存キー: ${diagKeys(saved)}）`
+            );
+          }
+
+          if (!Array.isArray(history.works)) {
+            throw new Error(
+              '保存済みhistory.worksが配列でない'
+            );
+          }
+
+          storedHistoryWorks = history.works;
+
+          const tagged = storedHistoryWorks.filter(
+            w => diagTagShape(w?.tags).count > 0
+          ).length;
+
+          return (
+            `OK / initialized=${history.initialized === true}` +
+            ` / 保存${storedHistoryWorks.length}件` +
+            ` / tags ${tagged}/${storedHistoryWorks.length}`
+          );
+        }
+      );
+
+      /* ----- 3. recommend/init ----- */
+
+      await diagCheck(
+        seq,
+        '3. recommend/init',
+        async () => {
+          const first =
+            bookmarkWorks.find(
+              w => w &&
+                (w.id != null || w.illustId != null)
+            ) ||
+            storedHistoryWorks.find(
+              w => w &&
+                (w.id != null || w.illustId != null)
+            );
+
+          const id = String(
+            first?.id ?? first?.illustId ?? ''
+          );
+
+          if (!/^\d+$/.test(id)) {
+            throw new Error(
+              'ブックマーク先頭の作品IDがない'
+            );
+          }
+
+          const body = await diagGet(
+            `/ajax/illust/${encodeURIComponent(id)}` +
+            '/recommend/init?limit=60&lang=ja',
+            controller.signal
+          );
+
+          recCache.set(id, body);
+
+          if (!Array.isArray(body.illusts)) {
+            throw new Error(
+              `body.illustsなし（bodyキー: ${diagKeys(body)}）`
+            );
+          }
+
+          const a = body.illusts;
+
+          const tagged = a.filter(
+            w => diagTagShape(w?.tags).count > 0
+          ).length;
+
+          const users = a.filter(
+            w =>
+              w?.userId != null &&
+              String(w.userId) !== ''
+          ).length;
+
+          // キーが存在するかを数える。
+          // bookmarkDataがnullでもキー有りに含む。
+          const bookmarks = a.filter(
+            w =>
+              w &&
+              Object.prototype.hasOwnProperty.call(
+                w,
+                'bookmarkData'
+              )
+          ).length;
+
+          return (
+            `OK / illusts ${a.length}件` +
+            ` / tags ${tagged}/${a.length}` +
+            ` / userId ${users}/${a.length}` +
+            ` / bookmarkDataキー ${bookmarks}/${a.length}` +
+            ` / nextIds ${
+              Array.isArray(body.nextIds)
+                ? body.nextIds.length
+                : '配列なし'
+            }` +
+            `\n   先頭キー: ${diagKeys(a[0])}`
+          );
+        }
+      );
+
+      /* ----- 4. タグ検索 ----- */
+
+      await diagCheck(
+        seq,
+        '4. タグ検索（popular_d）',
+        async () => {
+          const tag =
+            diagTopKey(
+              historyProfile.tags,
+              profile.tags
+            ) || 'R-18';
+
+          const url =
+            `/ajax/search/artworks/${encodeURIComponent(tag)}?` +
+            new URLSearchParams({
+              word: tag,
+              order: 'popular_d',
+              mode: 'all',
+              s_mode: 's_tag',
+              p: '1'
+            });
+
+          const body = await diagGet(
+            url,
+            controller.signal
+          );
+
+          const found = diagFindArray(body);
+
+          if (!found) {
+            throw new Error(
+              `候補配列なし（bodyキー: ${diagKeys(body)}）`
+            );
+          }
+
+          return (
+            `OK / タグ「${diagText(tag)}」` +
+            ` / popular_d指定（有効性未確認）` +
+            ` / ${found.path} ${found.data.length}件` +
+            `\n   先頭キー: ${diagKeys(found.data[0])}` +
+            ` / bodyキー: ${diagKeys(body)}`
+          );
+        }
+      );
+
+      /* ----- 5. 作者作品一覧 ----- */
+
+      await diagCheck(
+        seq,
+        '5. 作者作品一覧',
+        async () => {
+          const userId =
+            diagTopKey(
+              historyProfile.authors,
+              profile.authors
+            ) ||
+            String(
+              (
+                bookmarkWorks.find(
+                  w => w?.userId
+                )?.userId ??
+                storedHistoryWorks.find(
+                  w => w?.userId
+                )?.userId
+              ) || ''
+            );
+
+          if (!/^\d+$/.test(userId)) {
+            throw new Error(
+              '最頻作者IDがない'
+            );
+          }
+
+          let reason = '';
+
+          // 第1候補：profile/all
+          try {
+            const body = await diagGet(
+              `/ajax/user/${encodeURIComponent(userId)}/profile/all`,
+              controller.signal
+            );
+
+            const il = body.illusts;
+
+            if (
+              !il ||
+              typeof il !== 'object'
+            ) {
+              throw new Error(
+                `illusts形式不明（bodyキー: ${diagKeys(body)}）`
+              );
+            }
+
+            const count = Array.isArray(il)
+              ? il.length
+              : Object.keys(il).length;
+
+            const keys = Array.isArray(il)
+              ? []
+              : Object.keys(il);
+
+            const kind = Array.isArray(il)
+              ? '配列'
+              : keys.length === 0
+                ? '空オブジェクト'
+                : keys.every(k => /^\d+$/.test(k))
+                  ? '数字IDキーのオブジェクト'
+                  : 'キー形式不明のオブジェクト';
+
+            const manga =
+              body.manga &&
+              typeof body.manga === 'object'
+                ? (
+                    Array.isArray(body.manga)
+                      ? body.manga.length
+                      : Object.keys(body.manga).length
+                  )
+                : 'なし';
+
+            return (
+              `OK / profile/all` +
+              ` / illusts: ${kind} ${count}件` +
+              ` / manga ${manga}` +
+              ` / bodyキー: ${diagKeys(body)}`
+            );
+
+          } catch (e) {
+            reason = diagError(e);
+          }
+
+          // 第2候補：illusts
+          try {
+            const body = await diagGet(
+              `/ajax/user/${encodeURIComponent(userId)}/illusts` +
+              '?limit=30&tag=&lang=ja',
+              controller.signal
+            );
+
+            const found = diagFindArray(body);
+
+            if (!found) {
+              throw new Error(
+                `候補配列なし（bodyキー: ${diagKeys(body)}）`
+              );
+            }
+
+            return (
+              `OK / 代替illusts使用` +
+              ` / ${found.path} ${found.data.length}件` +
+              ` / 先頭キー: ${diagKeys(found.data[0])}` +
+              ` / 第一候補NG: ${reason}`
+            );
+
+          } catch (e) {
+            throw new Error(
+              `profile/all: ${reason}` +
+              ` / 代替illusts: ${diagError(e)}`
+            );
+          }
+        }
+      );
+
+      /* ----- 6. フォロー新着 ----- */
+
+      await diagCheck(
+        seq,
+        '6. フォロー新着',
+        async () => {
+          const body = await diagGet(
+            '/ajax/follow_latest/illust?mode=all&p=1',
+            controller.signal
+          );
+
+          const found = diagFindArray(body);
+
+          if (!found) {
+            throw new Error(
+              `候補配列なし（bodyキー: ${diagKeys(body)}）`
+            );
+          }
+
+          return (
+            `OK / ${found.path} ${found.data.length}件` +
+            `\n   先頭キー: ${diagKeys(found.data[0])}` +
+            ` / bodyキー: ${diagKeys(body)}`
+          );
+        }
+      );
+
+      /* ----- 7. カルーセル照合 ----- */
+
+      await diagCheck(
+        seq,
+        '7. カルーセル照合',
+        async () => {
+          const id = location.pathname.match(
+            /^\/artworks\/(\d+)/
+          )?.[1];
+
+          if (!id) {
+            return '対象外（作品ページ以外）';
+          }
+
+          const carousel = diagCarouselIds(id);
+
+          if (!carousel.length) {
+            return (
+              '見つからず（見出し・DOMの変化は要確認）'
+            );
+          }
+
+          // 3番と同じ作品なら、そのレスポンスを再利用。
+          const body =
+            recCache.get(id) ||
+            await diagGet(
+              `/ajax/illust/${encodeURIComponent(id)}` +
+              '/recommend/init?limit=60&lang=ja',
+              controller.signal
+            );
+
+          if (!Array.isArray(body.illusts)) {
+            throw new Error(
+              `illustsなし（bodyキー: ${diagKeys(body)}）`
+            );
+          }
+
+          const ids = new Set(
+            body.illusts.map(
+              x => String(
+                x?.id ?? x?.illustId ?? ''
+              )
+            )
+          );
+
+          const matched = carousel.filter(
+            x => ids.has(x)
+          ).length;
+
+          return (
+            `OK / カルーセル${carousel.length}件中` +
+            ` recommend/initに${matched}件` +
+            ` / DOM見出し探索（要確認）`
+          );
+        }
+      );
+
+      diagAppend(
+        seq,
+        '完了（診断中の書き込み操作なし）'
+      );
+
+    } finally {
+      if (seq === ptsDiag.seq) {
+        ptsDiag.controller = null;
+        start.disabled = false;
+      }
+    }
+  }
+
+  /* ---------- 診断UIの設置 ---------- */
+
+  function installDiagnosticUI() {
+    if (ptsDiag.installed || !overlay) return;
+
+    ptsDiag.installed = true;
+
+    // 上部バーのボタン
+    const btn = document.createElement('button');
+
+    btn.className = 'pts-diagnostic';
+    btn.type = 'button';
+    btn.textContent = '診断';
+
+    overlay.querySelector('.pts-rescan').before(btn);
+
+    // 診断結果パネル
+    const panel = document.createElement('div');
+
+    panel.className = 'pts-diag-panel';
+    panel.style.display = 'none';
+
+    panel.innerHTML = `
+      <div class="pts-diag-sheet"
+           role="dialog"
+           aria-modal="true"
+           aria-label="API診断">
+        <div class="pts-diag-toolbar">
+          <strong>pixiv API診断（読み取り専用）</strong>
+          <button type="button" class="pts-diag-copy">コピー</button>
+          <button type="button" class="pts-diag-close">閉じる</button>
+        </div>
+        <textarea
+          class="pts-diag-output"
+          readonly
+          spellcheck="false"
+          aria-label="診断結果"></textarea>
+      </div>
+    `;
+
+    overlay.appendChild(panel);
+
+    const style = document.createElement('style');
+
+    style.textContent = `
+      #pts-overlay .pts-diagnostic {
+        background: rgba(255,255,255,.15);
+        color: #fff;
+        border: 0;
+        border-radius: 999px;
+        padding: 7px 10px;
+        font-size: 12px;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+
+      #pts-overlay .pts-bar {
+        overflow-x: auto;
+        overscroll-behavior-x: contain;
+        white-space: nowrap;
+        -webkit-overflow-scrolling: touch;
+      }
+
+      #pts-overlay .pts-close {
+        position: sticky;
+        right: 0;
+        flex-shrink: 0;
+        z-index: 4;
+      }
+
+      #pts-overlay .pts-diag-panel {
+        position: absolute;
+        inset: 0;
+        z-index: 30;
+        background: rgba(0,0,0,.85);
+        align-items: center;
+        justify-content: center;
+        padding:
+          calc(14px + env(safe-area-inset-top))
+          12px
+          calc(14px + env(safe-area-inset-bottom));
+        box-sizing: border-box;
+      }
+
+      #pts-overlay .pts-diag-sheet {
+        width: 100%;
+        max-width: 900px;
+        height: 83vh;
+        height: 83dvh;
+        max-height: 100%;
+        display: flex;
+        flex-direction: column;
+        background: #171717;
+        color: white;
+        border: 1px solid #555;
+        border-radius: 12px;
+        box-sizing: border-box;
+        padding: 10px;
+        min-height: 0;
+      }
+
+      #pts-overlay .pts-diag-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+        font-size: 13px;
+      }
+
+      #pts-overlay .pts-diag-toolbar strong {
+        flex: 1;
+      }
+
+      #pts-overlay .pts-diag-toolbar button {
+        background: #333;
+        color: white;
+        border: 1px solid #666;
+        border-radius: 8px;
+        padding: 9px 12px;
+        white-space: nowrap;
+      }
+
+      #pts-overlay .pts-diag-output {
+        width: 100%;
+        flex: 1;
+        min-height: 0;
+        resize: none;
+        box-sizing: border-box;
+        background: #080808;
+        color: #eee;
+        border: 1px solid #444;
+        border-radius: 7px;
+        padding: 10px;
+        font: 12px/1.65 ui-monospace, Menlo, monospace;
+        white-space: pre-wrap;
+        overflow: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+    `;
+
+    document.head.appendChild(style);
+
+    btn.addEventListener(
+      'click',
+      () => {
+        void runDiagnostic();
+      }
+    );
+
+    panel.querySelector('.pts-diag-close')
+      .addEventListener(
+        'click',
+        closeDiagnosticPanel
+      );
+
+    panel.querySelector('.pts-diag-copy')
+      .addEventListener(
+        'click',
+        () => {
+          void copyDiagnosticReport();
+        }
+      );
+  }
+
   function openViewer() {
     buildOverlay();
+    // 診断ボタンとパネルを一度だけ設置する（この時点では診断は実行しない）
+    installDiagnosticUI();
     overlay.style.display = 'block';
     keepAwake(true);
     buildFeed();
@@ -1888,6 +2954,8 @@
   }
 
   function closeViewer() {
+    // 診断中なら通信を中止し、パネルを閉じる
+    closeDiagnosticPanel();
     feedGeneration++;
     customResetState();
     overlay.style.display = 'none';

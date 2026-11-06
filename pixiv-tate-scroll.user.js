@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.11.1
+// @version      3.12.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -153,50 +153,105 @@
     return s.resolvePromise;
   }
 
+  function seriesNextId(nav) {
+    if (!nav || typeof nav !== 'object') return null;
+
+    const options = [
+      nav.next, nav.nextIllust, nav.nextArtwork,
+      nav.nextWork, nav.nextEpisode,
+      nav.nextIllustId, nav.nextId
+    ];
+
+    for (const value of options) {
+      const id = value && typeof value === 'object'
+        ? (value.id ?? value.illustId ??
+           value.illust?.id ?? value.work?.id)
+        : value;
+
+      if (id != null && /^\d+$/.test(String(id))) {
+        return String(id);
+      }
+    }
+
+    return null;
+  }
+
   async function resolveSlideImpl(s, signal) {
     try {
-      const body = await fetchJson(`/ajax/illust/${s.id}`, signal);
+      const body = await fetchJson(
+        `/ajax/illust/${s.id}`, signal
+      );
+
+      s.seriesNextId = seriesNextId(body?.seriesNavData);
+      s.seriesInfoChecked = true;
       s.rawType = body.illustType;
       s.tags = normTags(body.tags);
       s.userId = body.userId ? String(body.userId) : null;
-      s.bookmarked = s.bookmarked || knownBookmarkedIds.has(String(s.id)) || !!body.bookmarkData;
+      s.bookmarked = s.bookmarked ||
+        knownBookmarkedIds.has(String(s.id)) ||
+        !!body.bookmarkData;
+
       if (s.bookmarked) {
         knownBookmarkedIds.add(String(s.id));
-        if (!s.tasteLearned
-          && !bookmarkHistory.works.some((w) => String(w.id) === String(s.id))) {
+        if (!s.tasteLearned &&
+            !bookmarkHistory.works.some(w =>
+              String(w.id) === String(s.id))) {
           learnFromWork(s.tags, s.userId, body.illustType, 3);
           s.tasteLearned = true;
         }
       }
+
       paintBookmarkBtn(s);
-      if (body.title && !s.title) { s.title = body.title; if (s.titleEl) s.titleEl.textContent = s.title; }
-      if (body.userName) { s.author = body.userName; if (s.authorEl) s.authorEl.textContent = s.author; }
-      const pageCount = body.pageCount || 1;
-      if (body.illustType === 2) {
-        // pixivの種別コード: 0=イラスト / 1=マンガ / 2=うごイラ
+
+      if (body.title && !s.title) {
+        s.title = body.title;
+        if (s.titleEl) s.titleEl.textContent = s.title;
+      }
+      if (body.userName) {
+        s.author = body.userName;
+        if (s.authorEl) s.authorEl.textContent = s.author;
+      }
+
+      const pageCount = Number(body.pageCount) || 1;
+
+      if (Number(body.illustType) === 2) {
         s.kind = 'ugoira';
         try {
-          let meta = s.metaPromise ? await s.metaPromise : null;
-          if (!meta) meta = await fetchJson(`/ajax/illust/${s.id}/ugoira_meta`);
+          let meta = s.metaPromise
+            ? await s.metaPromise : null;
+          if (!meta) {
+            meta = await fetchJson(
+              `/ajax/illust/${s.id}/ugoira_meta`
+            );
+          }
           s.zipSmall = meta.src || null;
           s.zipFull = meta.originalSrc || null;
           s.zipUrl = s.zipSmall || s.zipFull;
           s.frames = meta.frames || null;
           if (!s.zipUrl) s.ugoiraError = 'メタにZIPなし';
-          else if (!s.frames || s.frames.length === 0) s.ugoiraError = 'フレーム情報なし';
+          else if (!s.frames?.length) {
+            s.ugoiraError = 'フレーム情報なし';
+          }
         } catch (e) {
-          s.ugoiraError = 'メタ取得失敗: ' + (e && e.message ? e.message : e);
+          s.ugoiraError =
+            'メタ取得失敗: ' + (e?.message || String(e));
         }
+
         const pair = pickPair(body.urls);
         s.pairs = [pair];
-        // 個別フレームURLの型（_ugoira0.jpg → 連番に差し替え可能なら使う）
-        const m = (pair.o || '').match(/^(.*_ugoira)0(\.\w+)$/);
-        if (m) { s.frameBase = m[1]; s.frameExt = m[2]; }
+        const m = (pair.o || '')
+          .match(/^(.*_ugoira)0(\.\w+)$/);
+        if (m) {
+          s.frameBase = m[1];
+          s.frameExt = m[2];
+        }
       } else if (pageCount > 1) {
         s.kind = 'multi';
         try {
-          const pages = await fetchJson(`/ajax/illust/${s.id}/pages`);
-          s.pairs = pages.map((p) => pickPair(p.urls));
+          const pages = await fetchJson(
+            `/ajax/illust/${s.id}/pages`
+          );
+          s.pairs = pages.map(p => pickPair(p.urls));
         } catch (e) {
           s.pairs = [pickPair(body.urls)];
           s.kind = 'single';
@@ -206,12 +261,13 @@
         s.pairs = [pickPair(body.urls)];
       }
     } catch (e) {
-      if (signal && signal.aborted) return; // 中断された場合は状態を書かない（再試行側に任せる）
+      if (signal?.aborted) return;
       s.kind = 'single';
-      s.resolveError = (e && e.message) ? e.message : String(e);
+      s.resolveError = e?.message || String(e);
       const u = upgradeUrl(s.thumb) || s.thumb;
       s.pairs = [{ r: u, o: u }];
     }
+
     s.resolved = true;
     applyResolved(s);
     upgradeSlide(s);
@@ -640,7 +696,31 @@
 
   /* ---------- 表示 ---------- */
 
-    function applyResolved(s) {
+  function checkMangaComplete(s, idx) {
+    if (!s || s.kind !== 'multi' || !s.isCurrent ||
+        !s.pairs || idx !== s.pairs.length - 1) return;
+
+    const img = s.sectionEl
+      ?.querySelectorAll('.pts-page img')[idx];
+
+    if (!img) return;
+
+    if (img.complete && img.naturalWidth > 0) {
+      applyPositive(s, 'complete', 1.0);
+
+    } else if (s.completeWaitImg !== img) {
+      s.completeWaitImg = img;
+
+      img.addEventListener('load', () => {
+        if (s.isCurrent &&
+            s.pageIdx === s.pairs?.length - 1) {
+          applyPositive(s, 'complete', 1.0);
+        }
+      }, { once: true });
+    }
+  }
+
+  function applyResolved(s) {
     if (!s.sectionEl) return;
 
     const multi = s.kind === 'multi' &&
@@ -653,6 +733,7 @@
 
     if (multi) {
       holder.innerHTML = '';
+
       const pager = document.createElement('div');
       pager.className = 'pts-pager';
 
@@ -673,9 +754,17 @@
       });
 
       pager.addEventListener('scroll', () => {
-        const idx = Math.round(
-          pager.scrollLeft / Math.max(1, pager.clientWidth)
+        const idx = Math.max(
+          0,
+          Math.min(
+            s.pairs.length - 1,
+            Math.round(
+              pager.scrollLeft /
+              Math.max(1, pager.clientWidth)
+            )
+          )
         );
+
         s.pageIdx = idx;
 
         if (s.pageChip) {
@@ -685,6 +774,7 @@
 
         loadHorizontalNeighbors(s, idx);
         upgradeSlide(s);
+        checkMangaComplete(s, idx);
       }, { passive: true });
 
       holder.appendChild(pager);
@@ -1003,13 +1093,145 @@
   }
 
   /* ---------- 自前レコメンド v2（履歴500件＋永続化） ---------- */
+  /* ---------- v3.12 配布対応：アカウント識別 ---------- */
+
+  function detectLoggedInPixivId() {
+    const ids = [];
+    const valid = value => {
+      const id = String(value ?? '');
+      return /^[1-9]\d*$/.test(id) ? id : '';
+    };
+    const add = value => {
+      const id = valid(value);
+      if (id) ids.push(id);
+    };
+    const parse = text => {
+      if (!text || typeof text !== 'string') return null;
+      try { return JSON.parse(text); }
+      catch (e) { return null; }
+    };
+
+    // 方式1：pixivのサーバー埋め込みログイン情報
+    const meta = document.querySelector(
+      'meta[name="global-data"]'
+    );
+
+    const globalData = parse(meta?.content);
+
+    if (globalData?.isLoggedIn === false ||
+        globalData?.userData?.isLoggedIn === false) {
+      return '';
+    }
+
+    add(globalData?.userData?.id);
+    add(globalData?.userData?.userId);
+
+    // 方式2：Next.jsのページ埋め込み情報
+    const next = parse(
+      document.getElementById('__NEXT_DATA__')
+        ?.textContent
+    );
+
+    const props = next?.props?.pageProps;
+
+    if (props?.isLoggedIn === false ||
+        props?.gaUserData?.isLoggedIn === false) {
+      return '';
+    }
+
+    add(props?.gaUserData?.userId);
+
+    const state = props?.serverSerializedPreloadedState;
+    const parsedState = typeof state === 'string'
+      ? parse(state)
+      : state;
+
+    add(parsedState?.userData?.self?.id);
+    add(parsedState?.userData?.self?.userId);
+
+    // 取得元が矛盾した場合は使用しない。
+    const unique = [...new Set(ids)];
+
+    if (unique.length !== 1) {
+      console.warn(
+        '[PTS] ログインユーザーIDを確定できません',
+        unique.length > 1 ? '取得元が不一致' : '識別情報なし'
+      );
+      return '';
+    }
+
+    return unique[0];
+  }
+
+  const ACTIVE_PIXIV_USER_ID = detectLoggedInPixivId();
+
+  function accountStorageKey(base) {
+    if (!ACTIVE_PIXIV_USER_ID) return '';
+    return `${base}:user:${ACTIVE_PIXIV_USER_ID}`;
+  }
+
+  function legacyProfileOwnerMatches() {
+    if (!ACTIVE_PIXIV_USER_ID) return false;
+
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem('PTS_PROFILE_V2') || 'null'
+      );
+
+      return saved?.version === 2 &&
+        String(saved?.history?.userId || '') ===
+          ACTIVE_PIXIV_USER_ID;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function readAccountStorage(base) {
+    const key = accountStorageKey(base);
+    if (!key) return null;
+
+    try {
+      const current = localStorage.getItem(key);
+      if (current !== null) return current;
+
+      const legacy = localStorage.getItem(base);
+      if (legacy === null) return null;
+
+      let mayMigrate = legacyProfileOwnerMatches();
+
+      // スキップ履歴には所有者IDを直接保存している。
+      if (base === 'PTS_SKIP_V1') {
+        try {
+          const data = JSON.parse(legacy);
+          mayMigrate =
+            String(data?.userId || '') === ACTIVE_PIXIV_USER_ID;
+        } catch (e) {
+          mayMigrate = false;
+        }
+      }
+
+      if (!mayMigrate) return null;
+
+      // コピーのみ。旧キーは変更しない。
+      try {
+        localStorage.setItem(key, legacy);
+      } catch (e) {
+        console.warn('[PTS] 旧データの移行保存失敗', e);
+      }
+
+      return legacy;
+
+    } catch (e) {
+      console.warn('[PTS] アカウント別データ読み込み失敗', e);
+      return null;
+    }
+  }
+
   const PROFILE_KEY = 'PTS_PROFILE_V2';
   const HISTORY_LIMIT = 500;
   const HISTORY_PAGE_SIZE = 48;
   const HISTORY_REFRESH_MS = 6 * 60 * 60 * 1000;
   const HISTORY_HALF_LIFE = 100;
-  // 自分のpixivユーザーID（自動検出の誤認を防ぐため固定。ChatGPT案のMY_USER_ID_OVERRIDE）
-  const MY_USER_ID_OVERRIDE = '50590090';
 
   const profile = { tags: {}, authors: {}, ugoira: 0 };
   let bookmarkHistory = { userId: '', works: [], initialized: false, updatedAt: 0 };
@@ -1023,41 +1245,66 @@
   }
 
   function readProfile() {
+    // 未ログイン・ID不明なら旧データを使用しない。
+    if (!getMyUserId()) return;
+
     let saved = null;
-    try { saved = JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null'); } catch (e) {}
-    if (!saved || saved.version !== 2) {
-      try {
-        const old = JSON.parse(sessionStorage.getItem('pts-profile') || 'null');
-        if (old && old.tags) saved = { version: 2, live: old };
-      } catch (e) {}
+
+    try {
+      saved = JSON.parse(
+        readAccountStorage(PROFILE_KEY) || 'null'
+      );
+    } catch (e) {
+      console.warn('[PTS] プロフィール解析失敗', e);
     }
-    if (saved && saved.live) {
+
+    if (!saved || saved.version !== 2) return;
+
+    if (saved.live &&
+        typeof saved.live === 'object') {
       const p = saved.live;
-      if (p.tags && typeof p.tags === 'object') profile.tags = p.tags;
-      if (p.authors && typeof p.authors === 'object') profile.authors = p.authors;
+
+      if (p.tags && typeof p.tags === 'object' &&
+          !Array.isArray(p.tags)) {
+        profile.tags = p.tags;
+      }
+
+      if (p.authors && typeof p.authors === 'object' &&
+          !Array.isArray(p.authors)) {
+        profile.authors = p.authors;
+      }
+
       profile.ugoira = Number(p.ugoira) || 0;
     }
-    if (saved && saved.history && typeof saved.history === 'object') {
-      const h = saved.history;
-      if (Array.isArray(h.works)) {
-        bookmarkHistory = {
-          userId: String(h.userId || ''),
-          works: h.works.slice(0, HISTORY_LIMIT),
-          initialized: h.initialized === true,
-          updatedAt: Number(h.updatedAt) || 0
-        };
-      }
+
+    const h = saved.history;
+
+    if (h && Array.isArray(h.works) &&
+        String(h.userId || '') === getMyUserId()) {
+      bookmarkHistory = {
+        userId: getMyUserId(),
+        works: h.works.slice(0, HISTORY_LIMIT),
+        initialized: h.initialized === true,
+        updatedAt: Number(h.updatedAt) || 0,
+        dateMigrationChecked: h.dateMigrationChecked === true
+      };
     }
   }
 
   function saveProfile() {
+    const key = accountStorageKey(PROFILE_KEY);
+
+    if (!key) return;
+
     try {
-      localStorage.setItem(PROFILE_KEY, JSON.stringify({
+      localStorage.setItem(key, JSON.stringify({
         version: 2,
         live: profile,
         history: bookmarkHistory
       }));
-    } catch (e) { console.warn('[PTS] profile保存失敗', e); }
+    } catch (e) {
+      console.warn('[PTS] profile保存失敗', e);
+    }
   }
 
   // ビューア内での保存操作・既存の表示解決時の学習に使う
@@ -1073,60 +1320,196 @@
     saveProfile();
   }
 
+  /* ---------- v3.12: 独立したスキップ学習 ---------- */
+
+  const SKIP_KEY = 'PTS_SKIP_V1';
+  const skipProfile = {
+    tags: {},
+    authors: {},
+    works: {}
+  };
+
+  const skippedThisSession = new Set();
+  const viewedThisSession = new Set();
+
+  let navIntent = { reason: 'other', until: 0 };
+  let skipNavigationBound = false;
+
+  function loadSkipProfile() {
+    if (!getMyUserId()) return;
+
+    try {
+      const raw = JSON.parse(
+        readAccountStorage(SKIP_KEY) || 'null'
+      );
+
+      if (!raw ||
+          String(raw.userId || '') !== getMyUserId()) {
+        return;
+      }
+
+      for (const key of ['tags', 'authors', 'works']) {
+        if (raw[key] &&
+            typeof raw[key] === 'object' &&
+            !Array.isArray(raw[key])) {
+          Object.assign(skipProfile[key], raw[key]);
+        }
+      }
+    } catch (e) {
+      console.warn('[PTS] スキップ履歴読み込み失敗', e);
+    }
+  }
+
+  function saveSkipProfile() {
+    const key = accountStorageKey(SKIP_KEY);
+    if (!key) return;
+
+    const entries = Object.entries(skipProfile.works)
+      .sort((a, b) =>
+        (Number(b[1]?.time) || 0) -
+        (Number(a[1]?.time) || 0)
+      );
+
+    skipProfile.works =
+      Object.fromEntries(entries.slice(0, 2000));
+
+    try {
+      localStorage.setItem(key, JSON.stringify({
+        userId: getMyUserId(),
+        ...skipProfile
+      }));
+    } catch (e) {
+      console.warn('[PTS] スキップ履歴保存失敗', e);
+    }
+  }
+
+  function learnSkip(s) {
+    const id = String(s?.id || '');
+
+    if (!/^\d+$/.test(id) ||
+        skippedThisSession.has(id) ||
+        s.bookmarked || s.likedThisSession) return;
+
+    skippedThisSession.add(id);
+
+    for (const tag of normTags(s.tags)) {
+      skipProfile.tags[tag] = Math.min(
+        50,
+        (Number(skipProfile.tags[tag]) || 0) + 0.15
+      );
+    }
+
+    if (s.userId) {
+      const author = String(s.userId);
+      skipProfile.authors[author] = Math.min(
+        50,
+        (Number(skipProfile.authors[author]) || 0) + 0.15
+      );
+    }
+
+    const old = skipProfile.works[id];
+
+    skipProfile.works[id] = {
+      count: Math.min(20, (Number(old?.count) || 0) + 1),
+      time: Date.now()
+    };
+
+    saveSkipProfile();
+  }
+
+  function skipStrong(id) {
+    return (
+      Number(skipProfile.works[String(id)]?.count) || 0
+    ) >= 2;
+  }
+
+  function bindSkipNavigation() {
+    if (skipNavigationBound || !feedEl) return;
+    skipNavigationBound = true;
+
+    const userIntent = () => {
+      if (!zoomedSlide) {
+        navIntent = {
+          reason: 'user',
+          until: performance.now() + 2500
+        };
+      }
+    };
+
+    feedEl.addEventListener('touchstart', e => {
+      if (e.touches.length === 1) userIntent();
+    }, { passive: true, capture: true });
+
+    feedEl.addEventListener('pointerdown', e => {
+      if (e.isPrimary) userIntent();
+    }, { passive: true, capture: true });
+
+    feedEl.addEventListener(
+      'wheel', userIntent, { passive: true }
+    );
+  }
+
+  loadSkipProfile();
+
   function getMyUserId() {
-    if (MY_USER_ID_OVERRIDE) return String(MY_USER_ID_OVERRIDE);
-    // 1. 自分のブックマークページURL
-    const path = location.pathname.match(/^\/users\/(\d+)\/bookmarks(?:\/|$)/);
-    if (path) return path[1];
-    // 2. meta[name="global-data"]
-    const meta = document.querySelector('meta[name="global-data"]');
-    if (meta) {
-      try {
-        const data = JSON.parse(meta.getAttribute('content') || '{}');
-        const id = data.userData?.id ?? data.userData?.userId ??
-          data.user?.id ?? data.user?.userId ??
-          data.loginUser?.id ?? data.loginUser?.userId ??
-          data.loginUserId;
-        if (id != null && /^\d+$/.test(String(id))) return String(id);
-      } catch (e) { /* 次の経路を試す */ }
-    }
-    // 3. ページ内の自分のブックマークへのリンク
-    for (const a of document.querySelectorAll('a[href*="/bookmarks/artworks"]')) {
-      const href = a.getAttribute('href') || '';
-      const m = href.match(/\/users\/(\d+)\/bookmarks\/artworks(?:[/?#]|$)/);
-      if (m) return m[1];
-    }
-    return '';
+    // ページ読み込み時に確認したログインユーザーのみ。
+    // 他人のプロフィールURLや作品の作者IDは使わない。
+    return ACTIVE_PIXIV_USER_ID;
   }
 
   function parseBookmarkPage(body) {
-    if (!body || !Array.isArray(body.works)) throw new Error('bookmarks API: body.worksがありません');
+    if (!body || !Array.isArray(body.works)) {
+      throw new Error('bookmarks API: body.worksがありません');
+    }
+
     return body.works.map(w => {
       const id = w && (w.id ?? w.illustId);
       if (id == null) return null;
+
       return {
         id: String(id),
         userId: w.userId == null ? '' : String(w.userId),
         tags: normTags(w.tags),
         illustType: Number(w.illustType),
-        pageCount: Number(w.pageCount) || 1
+        pageCount: Number(w.pageCount) || 1,
+        createDate: typeof w.createDate === 'string'
+          ? w.createDate : null
       };
     }).filter(Boolean);
   }
 
   function learnFromBookmarks(works) {
     const next = { tags: {}, authors: {}, ugoira: 0 };
-    (works || []).slice(0, HISTORY_LIMIT).forEach((work, index) => {
-      const weight = Math.pow(0.5, index / HISTORY_HALF_LIFE);
-      for (const tag of normTags(work.tags)) {
-        next.tags[tag] = (next.tags[tag] || 0) + weight;
-      }
-      if (work.userId) {
-        const id = String(work.userId);
-        next.authors[id] = (next.authors[id] || 0) + weight;
-      }
-      if (Number(work.illustType) === 2) next.ugoira += weight;
-    });
+    const now = Date.now();
+
+    (works || []).slice(0, HISTORY_LIMIT)
+      .forEach((work, index) => {
+        const ts = Date.parse(work.createDate || '');
+        const valid = Number.isFinite(ts) &&
+          ts > 0 && ts <= now + 86400000;
+
+        const weight = valid
+          ? Math.pow(
+              0.5,
+              Math.max(0, now - ts) / (180 * 86400000)
+            )
+          : Math.pow(0.5, index / HISTORY_HALF_LIFE);
+
+        for (const tag of normTags(work.tags)) {
+          next.tags[tag] = (next.tags[tag] || 0) + weight;
+        }
+
+        if (work.userId) {
+          const id = String(work.userId);
+          next.authors[id] =
+            (next.authors[id] || 0) + weight;
+        }
+
+        if (Number(work.illustType) === 2) {
+          next.ugoira += weight;
+        }
+      });
+
     historyProfile = next;
   }
 
@@ -1315,90 +1698,138 @@
 
   async function initProfileFromBookmarks(force = false) {
     if (historyInitPromise) return historyInitPromise;
+
     const userId = getMyUserId();
     if (!userId) {
-      console.warn('[PTS] 自分のユーザーIDを取得できず履歴学習をスキップ');
+      console.warn('[PTS] 自分のIDが不明');
       return;
     }
-    // 別アカウントの履歴を絶対に混ぜない
-    if (bookmarkHistory.userId && bookmarkHistory.userId !== userId) {
-      bookmarkHistory = { userId, works: [], initialized: false, updatedAt: 0 };
+
+    if (bookmarkHistory.userId &&
+        bookmarkHistory.userId !== userId) {
+      bookmarkHistory = {
+        userId, works: [], initialized: false,
+        updatedAt: 0, dateMigrationChecked: false
+      };
       historyProfile = { tags: {}, authors: {}, ugoira: 0 };
     }
+
     bookmarkHistory.userId = userId;
     applyBookmarkHistory();
-    if (!force && bookmarkHistory.initialized &&
-        Date.now() - bookmarkHistory.updatedAt < HISTORY_REFRESH_MS) return;
+
+    const fresh =
+      Date.now() - bookmarkHistory.updatedAt < HISTORY_REFRESH_MS;
+
+    if (!force && bookmarkHistory.initialized && fresh &&
+        bookmarkHistory.dateMigrationChecked) return;
 
     historyInitPromise = (async () => {
-      const previous = bookmarkHistory.initialized ? bookmarkHistory.works : [];
+      const previous = bookmarkHistory.initialized
+        ? bookmarkHistory.works : [];
       const oldIds = new Set(previous.map(w => String(w.id)));
-      const fresh = [];
-      const seen = new Set();
-      let overlap = false;
-      let exhausted = false;
+      const incoming = [], seen = new Set();
+      let overlap = false, exhausted = false;
 
-      for (let offset = 0; offset < HISTORY_LIMIT; offset += HISTORY_PAGE_SIZE) {
+      for (let offset = 0; offset < HISTORY_LIMIT;
+           offset += HISTORY_PAGE_SIZE) {
         const page = await fetchBookmarkPage(userId, offset);
-        if (page.length === 0) { exhausted = true; break; }
+        if (!page.length) { exhausted = true; break; }
+
         for (const work of page) {
           if (seen.has(work.id)) continue;
           seen.add(work.id);
-          fresh.push(work);
+          incoming.push(work);
           if (oldIds.has(work.id)) overlap = true;
         }
-        if (page.length < HISTORY_PAGE_SIZE) { exhausted = true; break; }
+
+        if (page.length < HISTORY_PAGE_SIZE) {
+          exhausted = true; break;
+        }
         if (previous.length && overlap) break;
       }
 
-      // 取得が最後まで正常に終了した時だけcommitする。
-      // 初回途中失敗時はinitialized=falseのままで次回やり直せる。
-      const freshIds = new Set(fresh.map(w => w.id));
+      const freshIds = new Set(incoming.map(w => w.id));
       const merged = previous.length && overlap && !exhausted
-        ? [...fresh, ...previous.filter(w => !freshIds.has(w.id))]
-        : fresh;
-      const completed = fresh.length >= HISTORY_LIMIT || exhausted ||
-        (previous.length > 0 && overlap);
-      if (!completed) throw new Error('履歴取得が完了していません');
+        ? [...incoming, ...previous.filter(w => !freshIds.has(w.id))]
+        : incoming;
+
+      if (!(incoming.length >= HISTORY_LIMIT ||
+            exhausted || (previous.length > 0 && overlap))) {
+        throw new Error('履歴取得が未完了');
+      }
 
       bookmarkHistory = {
         userId,
         works: merged.slice(0, HISTORY_LIMIT),
         initialized: true,
-        updatedAt: Date.now()
+        updatedAt: Date.now(),
+        dateMigrationChecked: true
       };
+
       applyBookmarkHistory();
       saveProfile();
-      console.info('[PTS] 履歴学習完了', bookmarkHistory.works.length, '件');
-    })().catch(e => {
-      console.warn('[PTS] 履歴学習失敗（次回再試行）', e);
-    }).finally(() => { historyInitPromise = null; });
+      console.info('[PTS] 履歴学習完了',
+        bookmarkHistory.works.length);
+    })().catch(e =>
+      console.warn('[PTS] 履歴学習失敗', e)
+    ).finally(() => { historyInitPromise = null; });
+
     return historyInitPromise;
   }
 
   // 数値を返す完成版。タグ×3、作者×9、うごイラ、R-18を評価。
   function tasteScore(it) {
-    let score = 0;
-    let tagScore = 0;
     const tags = normTags(it.tags);
+    let tagScore = 0;
+
     for (const tag of tags) {
-      const count = Math.max(0, (Number(historyProfile.tags[tag]) || 0) +
-        (Number(profile.tags[tag]) || 0) * 1.5);
+      const count = Math.max(0,
+        (Number(historyProfile.tags[tag]) || 0) +
+        (Number(profile.tags[tag]) || 0) * 1.5
+      );
+
       tagScore += Math.log1p(count);
     }
-    score += Math.min(30, tagScore * 3);
 
-    const authorId = it.userId == null ? '' : String(it.userId);
+    let score = Math.min(30, tagScore * 3);
+
+    const authorId =
+      it.userId == null ? '' : String(it.userId);
+
     if (authorId) {
-      const count = Math.max(0, (Number(historyProfile.authors[authorId]) || 0) +
-        (Number(profile.authors[authorId]) || 0) * 1.5);
+      const count = Math.max(0,
+        (Number(historyProfile.authors[authorId]) || 0) +
+        (Number(profile.authors[authorId]) || 0) * 1.5
+      );
+
       score += Math.min(27, Math.log1p(count) * 9);
     }
 
-    const hasUgoira = Number(it.illustType) === 2;
-    if (hasUgoira && historyProfile.ugoira + profile.ugoira > 0) score += 4;
+    if (Number(it.illustType) === 2 &&
+        historyProfile.ugoira + profile.ugoira > 0) {
+      score += 4;
+    }
+
     if (tags.includes('R-18')) score += 3;
-    return Number.isFinite(score) ? score : 0;
+
+    const negTags = tags.reduce(
+      (sum, t) =>
+        sum + (Number(skipProfile.tags[t]) || 0) * 0.5,
+      0
+    );
+
+    const negAuthor =
+      (Number(skipProfile.authors[authorId]) || 0) * 2;
+
+    const penalty = Math.min(
+      8,
+      score * 0.30,
+      negTags + negAuthor
+    );
+
+    return Number.isFinite(score)
+      ? Math.max(0, score - penalty)
+      : 0;
   }
 
   function sortByTaste(items) {
@@ -1509,12 +1940,28 @@
   }
 
   function candidatesToSlides(items) {
-    return items.map((it) => {
-      const s = newSlide(it.id, it.url || '', it.title || '', it.userName || '');
-      s.tags = it.tags;
-      s.userId = it.userId;
-      if (!Number.isNaN(it.illustType)) s.rawType = it.illustType;
+    return items.map(it => {
+      const s = newSlide(
+        it.id,
+        it.url || '',
+        it.title || '',
+        it.userName || ''
+      );
+
+      s.tags = normTags(it.tags);
+      s.userId = it.userId == null
+        ? null : String(it.userId);
+
+      if (Number.isFinite(Number(it.illustType))) {
+        s.rawType = Number(it.illustType);
+      }
+
       s.bookmarked = false;
+      s.customSources = Array.isArray(it._customSources)
+        ? it._customSources.slice()
+        : [];
+      s.createDate = it.createDate || null;
+
       return s;
     });
   }
@@ -1630,6 +2077,124 @@
   }
 
   // 最終順位を1件ずつ決め、作者の連続だけを緩く抑える
+  function customArrangeBatch(items) {
+    const ranked = customDiversify(items).filter(it =>
+      !skipStrong(it.id) &&
+      !isSeen(it.id) &&
+      !knownBookmarkedIds.has(String(it.id))
+    );
+
+    const total = Math.min(CUSTOM_TARGET, ranked.length);
+
+    const topAuthors = new Set(
+      Object.entries(historyProfile.authors)
+        .sort((a, b) => Number(b[1]) - Number(a[1]))
+        .slice(0, 12)
+        .map(([id]) => String(id))
+    );
+
+    const now = Date.now();
+
+    const recentFavorite = it => {
+      if (customBatchNumber !== 0 ||
+          !it._customSources?.includes('follow') ||
+          !topAuthors.has(String(it.userId || ''))) {
+        return false;
+      }
+
+      const ts = Date.parse(it.createDate || '');
+      return Number.isFinite(ts) &&
+        ts <= now && now - ts <= 14 * 86400000;
+    };
+
+    const fav = ranked.filter(recentFavorite).slice(0, 3);
+    const favIds = new Set(fav.map(it => it.id));
+    const rest = ranked.filter(it => !favIds.has(it.id));
+
+    const tastes = rest.map(tasteScore).sort((a, b) => a - b);
+    const median = tastes[Math.floor(tastes.length / 2)] ?? 0;
+
+    const eligible = it =>
+      it._customSources?.some(x =>
+        x === 'discovery' || x === 'tag'
+      ) &&
+      !topAuthors.has(String(it.userId || '')) &&
+      tasteScore(it) <= median &&
+      !skipStrong(it.id);
+
+    const explorers = rest.filter(eligible)
+      .slice(0, Math.floor(total / 5));
+
+    const explorerIds = new Set(explorers.map(it => it.id));
+    const ordinary = rest.filter(it => !explorerIds.has(it.id));
+
+    const output = [], used = new Set();
+
+    for (let i = 0; i < total; i++) {
+      let it = i < fav.length ? fav[i] : null;
+
+      if (!it && i % 5 === 4) it = explorers.shift();
+      if (!it) it = ordinary.shift() || explorers.shift();
+      if (!it || used.has(it.id)) break;
+
+      used.add(it.id);
+      output.push(it);
+    }
+
+    return output;
+  }
+
+  function reorderUnviewedAfterLike(liked) {
+    if (mode !== 'custom' ||
+        !slides.includes(liked) || !feedEl) return;
+
+    const idx = currentIndex();
+    if (slides[idx] !== liked) return;
+
+    const tagSet = new Set(normTags(liked.tags));
+    const slots = [];
+
+    for (let i = idx + 1; i < slides.length; i++) {
+      if (!viewedThisSession.has(String(slides[i].id))) {
+        slots.push(i);
+      }
+    }
+
+    if (!slots.length) return;
+
+    const candidates = slots.map(i => slides[i]);
+
+    const score = s => {
+      const matches = normTags(s.tags)
+        .filter(t => tagSet.has(t)).length;
+
+      const sameAuthor = liked.userId && s.userId &&
+        String(liked.userId) === String(s.userId);
+
+      return tasteScore(s) +
+        Math.min(20, matches * 5) +
+        (sameAuthor ? 16 : 0);
+    };
+
+    candidates.sort((a, b) => score(b) - score(a));
+    slots.forEach((i, n) => {
+      slides[i] = candidates[n];
+    });
+
+    const top = feedEl.scrollTop;
+    let next = null;
+
+    for (let i = slides.length - 1; i > idx; i--) {
+      const el = slides[i].sectionEl;
+      if (el && el.nextElementSibling !== next) {
+        feedEl.insertBefore(el, next);
+      }
+      next = el;
+    }
+
+    feedEl.scrollTop = top;
+  }
+
   function customDiversify(items) {
     const pool = items.slice();
     const output = [];
@@ -1671,77 +2236,156 @@
     const first = customBatchNumber === 0;
     const jobs = [];
     const seeds = customPickSeeds();
+
     if (!first && customNextIds.length) {
       const ids = customNextIds.slice(0, 60);
-      jobs.push({ type:'next', ids, run: () => fetchJson(
-        '/ajax/illust/recommend/illusts?illustIds=' +
-        encodeURIComponent(ids.join(',')) + '&lang=ja') });
+      jobs.push({
+        type: 'next', ids,
+        run: () => fetchJson(
+          '/ajax/illust/recommend/illusts?illustIds=' +
+          encodeURIComponent(ids.join(',')) + '&lang=ja'
+        )
+      });
     }
-    for (const id of seeds) jobs.push({ type:'seed', run:() => fetchJson(
-      `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`) });
-    jobs.push({ type:'discovery', run:() => fetchJson(
-      '/ajax/discovery/artworks?mode=all&limit=60') });
-    const tags = Object.entries(historyProfile.tags).map(([k,v]) =>
-      [k, Number(v || 0) + Number(profile.tags[k] || 0) * 1.5])
-      .filter(([k,v]) => k && Number.isFinite(v) && v > 0)
-      .sort((a,b) => b[1] - a[1]).slice(0, 12).map(([k]) => k);
+
+    for (const id of seeds) {
+      jobs.push({
+        type: 'seed',
+        run: () => fetchJson(
+          `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
+        )
+      });
+    }
+
+    jobs.push({
+      type: 'discovery',
+      run: () => fetchJson(
+        '/ajax/discovery/artworks?mode=all&limit=60'
+      )
+    });
+
+    const tags = Object.entries(historyProfile.tags)
+      .map(([k, v]) => [
+        k, Number(v || 0) + Number(profile.tags[k] || 0) * 1.5
+      ])
+      .filter(([k, v]) => k && Number.isFinite(v) && v > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([k]) => k);
+
     if (!tags.length) tags.push('R-18');
+
     const tag = tags[customTagOffset++ % tags.length];
-    jobs.push({ type:'tag', run:() => fetchJson(
-      '/ajax/search/artworks/' + encodeURIComponent(tag) + '?' +
-      new URLSearchParams({word:tag,order:'popular_d',mode:'all',s_mode:'s_tag',p:'1'})) });
+
+    jobs.push({
+      type: 'tag',
+      run: () => fetchJson(
+        '/ajax/search/artworks/' + encodeURIComponent(tag) +
+        '?' + new URLSearchParams({
+          word: tag, order: 'popular_d',
+          mode: 'all', s_mode: 's_tag', p: '1'
+        })
+      )
+    });
+
     if (!customFollowFinished) {
       const page = customFollowPage;
-      jobs.push({ type:'follow', page, run:() => fetchJson(
-        `/ajax/follow_latest/illust?mode=all&p=${page}`) });
+      jobs.push({
+        type: 'follow', page,
+        run: () => fetchJson(
+          `/ajax/follow_latest/illust?mode=all&p=${page}`
+        )
+      });
     }
-    const authors = Object.entries(historyProfile.authors).filter(([k,v]) =>
-      /^\d+$/.test(k) && Number(v) > 0).sort((a,b) => b[1]-a[1]).slice(0,12);
+
+    const authors = Object.entries(historyProfile.authors)
+      .filter(([k, v]) => /^\d+$/.test(k) && Number(v) > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12);
+
     if (authors.length) {
-      const authorId = authors[customAuthorOffset++ % authors.length][0];
-      jobs.push({ type:'author', run:() => fetchJson(
-        `/ajax/user/${encodeURIComponent(authorId)}/illusts?limit=30&tag=&lang=ja`) });
+      const authorId =
+        authors[customAuthorOffset++ % authors.length][0];
+
+      jobs.push({
+        type: 'author',
+        run: () => fetchJson(
+          `/ajax/user/${encodeURIComponent(authorId)}/illusts?limit=30&tag=&lang=ja`
+        )
+      });
     }
-    // 最大8回、同時実行は3回まで。失敗したソースだけ無視する。
+
     const chosen = jobs.slice(0, CUSTOM_MAX_REQUESTS);
+
     const settled = await mapLimited(chosen, 3, async job => {
-      try { return {ok:true, body:await job.run()}; }
-      catch (e) { return {ok:false, error:e}; }
+      try {
+        return { ok: true, body: await job.run() };
+      } catch (e) {
+        return { ok: false, error: e };
+      }
     });
+
     const results = [], nextIds = [];
     let successful = 0;
-    settled.forEach((r,i) => {
+
+    settled.forEach((r, i) => {
       const job = chosen[i];
+
       if (!r?.ok) {
-        if (job.type !== 'author') console.warn('[PTS custom]', job.type, r?.error);
+        if (job.type !== 'author') {
+          console.warn('[PTS custom]', job.type, r?.error);
+        }
         return;
       }
+
       const body = r.body || {};
-      const found = customCandidateArray(body);
-      let items = found;
-      if (job.type === 'author') items = items.filter(x =>
-        x && typeof x.url === 'string' && x.url.length > 0);
-      if (job.type === 'author' && !items.length) return; // 要確認APIは黙って無効化
+      let items = customCandidateArray(body);
+
+      if (job.type === 'author') {
+        items = items.filter(x =>
+          x && typeof x.url === 'string' && x.url.length > 0
+        );
+      }
+
+      if (job.type === 'author' && !items.length) return;
+
       successful++;
-      results.push({type:job.type, items});
-      if (Array.isArray(body.nextIds)) nextIds.push(...body.nextIds);
+      results.push({ type: job.type, items });
+
+      if (Array.isArray(body.nextIds)) {
+        nextIds.push(...body.nextIds);
+      }
+
       if (job.type === 'follow') {
         if (items.length) customFollowPage = job.page + 1;
         else customFollowFinished = true;
       }
+
       if (job.type === 'next') {
         const consumed = new Set(job.ids);
-        customNextIds = customNextIds.filter(x => !consumed.has(x));
+        customNextIds = customNextIds.filter(
+          x => !consumed.has(x)
+        );
         customQueuedIds = new Set(customNextIds);
       }
     });
-    if (!successful) throw new Error('全候補ソースの取得に失敗');
+
+    if (!successful) {
+      throw new Error('全候補ソースの取得に失敗');
+    }
+
     customMergeNextIds(nextIds);
-    const prepared = await prepareCandidates(customCollect(results), {
-      excludeIds: [...customSeenIds, ...seenTimes.keys()],
-      enrichTop: 0, rank: customBaseScore
-    });
-    return customDiversify(prepared).slice(0, CUSTOM_TARGET);
+
+    const prepared = await prepareCandidates(
+      customCollect(results),
+      {
+        excludeIds: [...customSeenIds, ...seenTimes.keys()],
+        enrichTop: 0,
+        rank: customBaseScore
+      }
+    );
+
+    return customArrangeBatch(prepared);
   }
 
   function customResetState() {
@@ -1852,14 +2496,22 @@
   const sessionSaved = [];
   const POSITIVE_KEY = 'PTS_POSITIVE_V1';
   const positiveSignals = new Set();
+
   try {
-    const saved = JSON.parse(localStorage.getItem(POSITIVE_KEY) || '[]');
+    const saved = JSON.parse(
+      readAccountStorage(POSITIVE_KEY) || '[]'
+    );
+
     if (Array.isArray(saved)) {
       for (const key of saved.slice(-10000)) {
-        if (/^\d+:(long|loop)$/.test(String(key))) positiveSignals.add(String(key));
+        if (/^\d+:(long|loop|complete)$/.test(String(key))) {
+          positiveSignals.add(String(key));
+        }
       }
     }
-  } catch (e) { /* 未保存なら空から開始 */ }
+  } catch (e) {
+    console.warn('[PTS] ポジティブ履歴復元失敗', e);
+  }
   let sessionBackTarget = '';
   let activeView = null;
   let activeTick = null;
@@ -1877,15 +2529,34 @@
   let singleTapTimer = null;
 
   function loadSeenTimes() {
+    if (!getMyUserId()) return;
+
     try {
-      const raw = JSON.parse(localStorage.getItem(SEEN_KEY) || '{}');
+      const raw = JSON.parse(
+        readAccountStorage(SEEN_KEY) || '{}'
+      );
+
+      if (!raw || typeof raw !== 'object' ||
+          Array.isArray(raw)) return;
+
       const now = Date.now();
-      for (const [id, time] of Object.entries(raw)) {
-        if (/^\d+$/.test(id) && Number.isFinite(time)
-            && time > now - SEEN_LIFE && time <= now) seenTimes.set(id, time);
+
+      for (const [id, value] of Object.entries(raw)) {
+        const time = Number(value);
+
+        if (/^\d+$/.test(id) &&
+            Number.isFinite(time) &&
+            time > now - SEEN_LIFE &&
+            time <= now) {
+          seenTimes.set(id, time);
+        }
       }
+
       trimSeenTimes();
-    } catch (e) { console.warn('[PTS] 既読読み込み失敗', e); }
+
+    } catch (e) {
+      console.warn('[PTS] 既読読み込み失敗', e);
+    }
   }
   function trimSeenTimes() {
     if (seenTimes.size <= SEEN_MAX) return;
@@ -1894,10 +2565,22 @@
   }
   let seenSaveTimer = null;
   function saveSeenTimes() {
-    clearTimeout(seenSaveTimer); seenSaveTimer = null;
+    clearTimeout(seenSaveTimer);
+    seenSaveTimer = null;
+
+    const key = accountStorageKey(SEEN_KEY);
+    if (!key) return;
+
     trimSeenTimes();
-    try { localStorage.setItem(SEEN_KEY, JSON.stringify(Object.fromEntries(seenTimes))); }
-    catch (e) { console.warn('[PTS] 既読保存失敗', e); }
+
+    try {
+      localStorage.setItem(
+        key,
+        JSON.stringify(Object.fromEntries(seenTimes))
+      );
+    } catch (e) {
+      console.warn('[PTS] 既読保存失敗', e);
+    }
   }
   function markSeen(id) {
     if (!/^\d+$/.test(String(id))) return;
@@ -1970,44 +2653,128 @@
   }
   function onCurrentSlideChanged(s) {
     if (!s || activeView?.slide === s) return;
-    activeView = { slide: s, elapsed: 0, last: performance.now(), recorded: false,
-      long: false, loop: false, loopCompleted: false };
+
+    const old = activeView;
+
+    if (old && old.slide !== s &&
+        old.mode === mode &&
+        old.generation === feedGeneration &&
+        slides.includes(old.slide)) {
+
+      const manual = navIntent.reason === 'user' &&
+        performance.now() <= navIntent.until;
+
+      if (manual && old.readySeen &&
+          old.elapsed < 2000 &&
+          !old.slide.bookmarked &&
+          !old.slide.likedThisSession) {
+        learnSkip(old.slide);
+      }
+    }
+
+    viewedThisSession.add(String(s.id));
+
+    activeView = {
+      slide: s,
+      mode,
+      generation: feedGeneration,
+      elapsed: 0,
+      last: performance.now(),
+      readySeen: false,
+      recorded: false,
+      long: false,
+      loop: false,
+      loopCompleted: false
+    };
+
     if (zoomedSlide && zoomedSlide !== s) clearZoom();
+
     resetAutoAdvance();
     syncDock();
   }
   function applyPositive(s, kind, weight) {
-    const key = `${s.id}:${kind}`;
-    if (positiveSignals.has(key) || !s.tags?.length) return;
-    positiveSignals.add(key);
+    if (!s) return;
+
+    const signal = `${s.id}:${kind}`;
+
+    if (positiveSignals.has(signal) ||
+        !s.tags?.length) return;
+
+    positiveSignals.add(signal);
+
     const recent = [...positiveSignals].slice(-10000);
+
     if (positiveSignals.size > 10000) {
-      positiveSignals.clear(); recent.forEach(k => positiveSignals.add(k));
+      positiveSignals.clear();
+
+      recent.forEach(key => {
+        positiveSignals.add(key);
+      });
     }
-    try { localStorage.setItem(POSITIVE_KEY, JSON.stringify(recent)); }
-    catch (e) { console.warn('[PTS] 学習履歴保存失敗', e); }
-    learnFromWork(s.tags, s.userId, s.rawType, weight);
+
+    const key = accountStorageKey(POSITIVE_KEY);
+
+    if (key) {
+      try {
+        localStorage.setItem(
+          key,
+          JSON.stringify(recent)
+        );
+      } catch (e) {
+        console.warn('[PTS] 学習履歴保存失敗', e);
+      }
+    }
+
+    learnFromWork(
+      s.tags,
+      s.userId,
+      s.rawType,
+      weight
+    );
   }
 
   function tickViewing() {
-    if (!overlay || overlay.style.display === 'none' || !activeView) return;
-    const v = activeView, now = performance.now();
+    if (!overlay ||
+        overlay.style.display === 'none' ||
+        !activeView) return;
+
+    const v = activeView;
+    const now = performance.now();
     const dt = Math.max(0, Math.min(1000, now - v.last));
+
     v.last = now;
     const s = v.slide;
-    if (document.hidden || slides[currentIndex()] !== s || !s.isCurrent || !visibleReady(s)) return;
+
+    if (document.hidden ||
+        slides[currentIndex()] !== s ||
+        !s.isCurrent ||
+        !visibleReady(s)) return;
+
+    v.readySeen = true;
     v.elapsed += dt;
+
     if (!v.recorded && v.elapsed >= 1000) {
-      v.recorded = true; markSeen(s.id); noteSessionVisit(s);
+      v.recorded = true;
+      markSeen(s.id);
+      noteSessionVisit(s);
     }
+
     if (!v.long && v.elapsed >= 20000) {
-      v.long = true; applyPositive(s, 'long', 0.25);
+      v.long = true;
+      applyPositive(s, 'long', 0.25);
     }
+
     if (!v.loop && v.loopCompleted && v.elapsed >= 5000) {
-      v.loop = true; applyPositive(s, 'loop', 0.4);
+      v.loop = true;
+      applyPositive(s, 'loop', 0.4);
     }
-    s.sectionEl?.classList.toggle('pts-slow',
-      !effectsReduced && s.kind !== 'ugoira' && !zoomedSlide);
+
+    s.sectionEl?.classList.toggle(
+      'pts-slow',
+      !effectsReduced &&
+      s.kind !== 'ugoira' &&
+      !zoomedSlide
+    );
   }
   function onUgoiraLoop(s) {
     if (activeView?.slide === s) activeView.loopCompleted = true;
@@ -2095,48 +2862,38 @@
 
   async function likeArtwork(s, x, y) {
     showLikeHeart(s, x, y);
+    s.likedThisSession = true;
 
     const generation = feedGeneration;
 
     try {
-      if (!s.resolved && (!s.tags?.length || !s.userId)) {
+      if (!s.resolved &&
+          (!s.tags?.length || !s.userId)) {
         await resolveSlide(s);
       }
 
-      // いいねのたびにフルウェイト3.0で学習。
-      // 滞在学習のpositiveSignals制限は使わない。
       if (s.tags?.length ||
           s.userId ||
           Number(s.rawType) === 2) {
         learnFromWork(s.tags, s.userId, s.rawType, 3);
-
-        // ensureBookmarked側の自動学習との
-        // 二重加点を防ぐ。
         s.tasteLearned = true;
-      } else {
-        console.warn(
-          '[PTS like] 学習情報がなく加点は保留',
-          s.id
-        );
       }
 
-      // 自前フィードでも関連候補を現在作品の後ろへ。
-      if (
-        generation === feedGeneration &&
-        mode === 'custom' &&
-        slides.includes(s)
-      ) {
-        void insertRecommendationsAfterBookmark(s);
+      if (generation === feedGeneration &&
+          slides.includes(s)) {
+        void insertSeriesAfter(s);
+
+        if (mode === 'custom') {
+          reorderUnviewedAfterLike(s);
+          void insertRecommendationsAfterBookmark(s);
+        }
       }
 
-      // 既に保存済みならPOSTしない。
       const newlySaved = await ensureBookmarked(s);
-
       if (newlySaved) recordSessionSave(s);
 
     } catch (e) {
       console.warn('[PTS like] ブックマーク処理失敗', e);
-
     } finally {
       syncDock();
     }
@@ -2146,23 +2903,18 @@
     const holder = e.target.closest?.('.pts-holder');
     if (!holder) return;
 
-    // renderSlideの従来タップ送りを抑止。
     e.stopImmediatePropagation();
 
-    if (
-      twoFingerTap ||
-      performance.now() < suppressTapUntil ||
-      e.isPrimary === false
-    ) return;
+    if (twoFingerTap ||
+        performance.now() < suppressTapUntil ||
+        e.isPrimary === false) return;
 
-    if (
-      !touchStart ||
-      touchStart.pointerId !== e.pointerId ||
-      Math.hypot(
-        e.clientX - touchStart.x,
-        e.clientY - touchStart.y
-      ) > 12
-    ) return;
+    if (!touchStart ||
+        touchStart.pointerId !== e.pointerId ||
+        Math.hypot(
+          e.clientX - touchStart.x,
+          e.clientY - touchStart.y
+        ) > 12) return;
 
     const s = slides[currentIndex()];
 
@@ -2172,15 +2924,14 @@
 
     const now = performance.now();
 
-    if (
-      lastTap &&
-      lastTap.id === String(s.id) &&
-      now - lastTap.time <= LIKE_TAP_WINDOW &&
-      Math.hypot(
-        e.clientX - lastTap.x,
-        e.clientY - lastTap.y
-      ) <= 46
-    ) {
+    if (lastTap &&
+        lastTap.id === String(s.id) &&
+        now - lastTap.time <= LIKE_TAP_WINDOW &&
+        Math.hypot(
+          e.clientX - lastTap.x,
+          e.clientY - lastTap.y
+        ) <= 46) {
+
       clearTimeout(singleTapTimer);
       singleTapTimer = null;
       lastTap = null;
@@ -2202,11 +2953,9 @@
       singleTapTimer = null;
       lastTap = null;
 
-      if (
-        !slides.includes(s) ||
-        slides[currentIndex()] !== s ||
-        overlay?.style.display === 'none'
-      ) return;
+      if (!slides.includes(s) ||
+          slides[currentIndex()] !== s ||
+          overlay?.style.display === 'none') return;
 
       if (immersive) {
         showControlsTemporarily();
@@ -2216,13 +2965,11 @@
       if (zoomedSlide || s.kind === 'multi') return;
 
       const r = holder.getBoundingClientRect();
+      const step =
+        (e.clientX - r.left) / Math.max(1, r.width) < .33
+          ? -1 : 1;
 
-      gotoSlide(
-        currentIndex() +
-        ((e.clientX - r.left) / Math.max(1, r.width) < .33
-          ? -1
-          : 1)
-      );
+      gotoSlide(currentIndex() + step, 'user');
     }, LIKE_TAP_WINDOW);
   }
 
@@ -2704,10 +3451,20 @@
   let wakeLock = null;
   let csrfToken = null;
 
-  function gotoSlide(i) {
+  function gotoSlide(i, reason = 'other') {
     if (!feedEl || i < 0 || i >= slides.length) return;
+
+    navIntent = {
+      reason,
+      until: performance.now() + 3000
+    };
+
     if (zoomedSlide) clearZoom();
-    feedEl.scrollTo({ top: i * feedEl.clientHeight, behavior: 'smooth' });
+
+    feedEl.scrollTo({
+      top: i * feedEl.clientHeight,
+      behavior: 'smooth'
+    });
   }
 
   function currentIndex() {
@@ -2821,41 +3578,143 @@
   }
 
   // ブックマークした作品のおすすめを、その作品の直後に最大12件差し込む
+  async function insertSeriesAfter(s) {
+    if (!s || s.seriesInsertStarted ||
+        !slides.includes(s)) return;
+
+    s.seriesInsertStarted = true;
+    const generation = feedGeneration;
+
+    try {
+      if (!s.seriesInfoChecked) {
+        const body = await fetchJson(
+          `/ajax/illust/${encodeURIComponent(s.id)}`
+        );
+
+        s.seriesNextId = seriesNextId(body?.seriesNavData);
+        s.seriesInfoChecked = true;
+      }
+
+      const id = String(s.seriesNextId || '');
+
+      if (!/^\d+$/.test(id) ||
+          id === String(s.id) ||
+          isSeen(id) ||
+          knownBookmarkedIds.has(id) ||
+          viewedThisSession.has(id) ||
+          slides.some(x => String(x.id) === id)) return;
+
+      const next = await fetchJson(
+        `/ajax/illust/${encodeURIComponent(id)}`
+      );
+
+      if (!next ||
+          next.bookmarkData ||
+          !next.urls ||
+          generation !== feedGeneration ||
+          !slides.includes(s) ||
+          slides.some(x => String(x.id) === id) ||
+          isSeen(id) ||
+          knownBookmarkedIds.has(id)) return;
+
+      const item = newSlide(
+        id,
+        next.urls.regular || next.urls.original || '',
+        next.title || '',
+        next.userName || ''
+      );
+
+      item.tags = normTags(next.tags);
+      item.userId = next.userId == null
+        ? null : String(next.userId);
+      item.rawType = Number(next.illustType);
+      item.seriesParentId = String(s.id);
+
+      const current = slides[currentIndex()];
+      const oldTop = feedEl.scrollTop;
+      const height = Math.max(1, feedEl.clientHeight);
+
+      insertSlidesAfter(slides.indexOf(s), [item]);
+
+      if (current && current !== s &&
+          slides.includes(current)) {
+        feedEl.scrollTop =
+          slides.indexOf(current) * height + oldTop % height;
+      }
+
+      markCurrentFromScroll();
+
+    } catch (e) {
+      s.seriesInsertStarted = false;
+    }
+  }
+
   async function insertRecommendationsAfterBookmark(s) {
     if (s.recommendInsertStarted) return;
+
     s.recommendInsertStarted = true;
     const generation = feedGeneration;
+
     if (!slides.includes(s)) return;
+
     try {
-      const body = await fetchJson(`/ajax/illust/${s.id}/recommend/init?limit=60&lang=ja`);
-      let candidates = Array.isArray(body.illusts) ? body.illusts : [];
-      if (candidates.length === 0 && Array.isArray(body.nextIds) && body.nextIds.length > 0) {
+      const body = await fetchJson(
+        `/ajax/illust/${s.id}/recommend/init?limit=60&lang=ja`
+      );
+
+      let candidates = Array.isArray(body.illusts)
+        ? body.illusts : [];
+
+      if (!candidates.length &&
+          Array.isArray(body.nextIds) &&
+          body.nextIds.length) {
         const batch = body.nextIds.slice(0, 60).map(String);
-        const more = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
+        const more = await fetchJson(
+          '/ajax/illust/recommend/illusts?illustIds=' +
+          batch.join(',') + '&lang=ja'
+        );
         candidates = more.illusts || [];
       }
-      const ranked = await prepareCandidates(candidates, { excludeIds: [s.id], enrichTop: 16 });
-      if (generation !== feedGeneration || !feedEl || !slides.includes(s)) return;
-      const seen = new Set(slides.map((x) => String(x.id)));
-      const selected = ranked.filter((it) => {
-        if (seen.has(it.id) || knownBookmarkedIds.has(it.id)) return false;
+
+      const ranked = await prepareCandidates(candidates, {
+        excludeIds: [s.id, s.seriesNextId].filter(Boolean),
+        enrichTop: 16
+      });
+
+      if (generation !== feedGeneration ||
+          !feedEl || !slides.includes(s)) return;
+
+      const seen = new Set(slides.map(x => String(x.id)));
+
+      const selected = ranked.filter(it => {
+        if (seen.has(it.id) ||
+            knownBookmarkedIds.has(it.id)) return false;
         seen.add(it.id);
         return true;
       }).slice(0, 12);
-      if (selected.length === 0) return;
-      const posIdx = slides.indexOf(s);
-      // 差し込みで表示中の作品がずれる場合は、表示位置を維持する
-      const currentSlide = slides[currentIndex()];
-      const oldScrollTop = feedEl.scrollTop;
-      const oldHeight = Math.max(1, feedEl.clientHeight);
-      insertSlidesAfter(posIdx, candidatesToSlides(selected));
-      if (currentSlide && currentSlide !== s) {
-        const newIndex = slides.indexOf(currentSlide);
-        if (newIndex >= 0) {
-          feedEl.scrollTop = newIndex * oldHeight + (oldScrollTop % oldHeight);
-        }
+
+      if (!selected.length) return;
+
+      const current = slides[currentIndex()];
+      const oldTop = feedEl.scrollTop;
+      const height = Math.max(1, feedEl.clientHeight);
+
+      let pos = slides.indexOf(s);
+
+      if (slides[pos + 1]?.seriesParentId === String(s.id)) {
+        pos++;
       }
+
+      insertSlidesAfter(pos, candidatesToSlides(selected));
+
+      if (current && current !== s &&
+          slides.includes(current)) {
+        feedEl.scrollTop =
+          slides.indexOf(current) * height + oldTop % height;
+      }
+
       markCurrentFromScroll();
+
     } catch (e) {
       s.recommendInsertStarted = false;
     }
@@ -2863,14 +3722,26 @@
 
   async function toggleBookmark(s, btn) {
     if (!s || !btn) return;
-    if (s.bookmarked) { paintBookmarkBtn(s); syncDock(); return; }
+
+    if (s.bookmarked) {
+      paintBookmarkBtn(s);
+      syncDock();
+      return;
+    }
+
     btn.disabled = true;
     btn.textContent = '保存中…';
+
     try {
       const newlySaved = await ensureBookmarked(s);
+
       if (newlySaved) {
         recordSessionSave(s);
-        if (mode !== 'custom' && mode !== 'saved') void insertRecommendationsAfterBookmark(s);
+        void insertSeriesAfter(s);
+
+        if (mode !== 'custom' && mode !== 'saved') {
+          void insertRecommendationsAfterBookmark(s);
+        }
       }
     } catch (e) {
       if (!s.bookmarked) {
@@ -3213,12 +4084,92 @@
   // 1チェックごとに独立してエラーを処理する。
   async function diagCheck(seq, label, work) {
     try {
-      const result = await work();
+      let result;
+
+      if (label === '2. 履歴学習') {
+        const key = accountStorageKey(PROFILE_KEY);
+
+        if (!key) {
+          throw new Error(
+            'ログインID不明（履歴学習停止中）'
+          );
+        }
+
+        const raw = localStorage.getItem(key);
+
+        if (!raw) {
+          throw new Error(
+            'このアカウントのプロフィール未保存'
+          );
+        }
+
+        const saved = JSON.parse(raw);
+        const history = saved?.history;
+
+        if (!history ||
+            !Array.isArray(history.works) ||
+            String(history.userId || '') !== getMyUserId()) {
+          throw new Error(
+            '履歴なし、または保存アカウントが不一致'
+          );
+        }
+
+        const tagged = history.works.filter(
+          w => diagTagShape(w?.tags).count > 0
+        ).length;
+
+        result =
+          `OK / ログイン識別=OK` +
+          ` / initialized=${history.initialized === true}` +
+          ` / 保存${history.works.length}件` +
+          ` / tags ${tagged}/${history.works.length}`;
+
+      } else {
+        result = await work();
+      }
+
       diagAppend(seq, `${label}: ${result}`);
+
     } catch (e) {
       diagAppend(
         seq,
         `${label}: NG / ${diagError(e)}`
+      );
+    }
+
+    // v3.12.0で追加したシリーズ診断を維持。
+    if (label === '7. カルーセル照合' &&
+        seq === ptsDiag.seq) {
+      await diagCheck(
+        seq,
+        '8. シリーズ情報',
+        async () => {
+          const id = String(
+            slides[currentIndex()]?.id ||
+            location.pathname.match(
+              /^\/artworks\/(\d+)/
+            )?.[1] || ''
+          );
+
+          if (!/^\d+$/.test(id)) {
+            return '対象外（作品IDなし）';
+          }
+
+          const body = await diagGet(
+            `/ajax/illust/${id}`,
+            ptsDiag.controller?.signal
+          );
+
+          const nav = body?.seriesNavData;
+          const next = seriesNextId(nav);
+
+          return (
+            `OK / seriesNavData=${
+              nav && typeof nav === 'object'
+                ? 'あり' : 'なし'
+            } / next=${next || 'なし'}`
+          );
+        }
       );
     }
   }
@@ -4099,14 +5050,27 @@
     buildOverlay();
     installDiagnosticUI();
     installExperienceUI();
+    bindSkipNavigation();
+
+    skippedThisSession.clear();
+    viewedThisSession.clear();
+
+    navIntent = {
+      reason: 'other',
+      until: 0
+    };
+
     overlay.style.display = 'block';
     keepAwake(true);
     setImmersive(false);
     keepCurrent = false;
+
     sessionTrail.length = 0;
     sessionSaved.length = 0;
     activeView = null;
+
     buildFeed();
+
     setTimeout(() => pageLoadMore(), 800);
     setTimeout(() => pageLoadMore(), 2500);
   }

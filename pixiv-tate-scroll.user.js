@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.8.0
+// @version      3.8.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -159,7 +159,7 @@
       s.rawType = body.illustType;
       s.tags = normTags(body.tags);
       s.userId = body.userId ? String(body.userId) : null;
-      s.bookmarked = !!body.bookmarkData;
+      s.bookmarked = s.bookmarked || knownBookmarkedIds.has(String(s.id)) || !!body.bookmarkData;
       if (s.bookmarked) {
         knownBookmarkedIds.add(String(s.id));
         if (!s.tasteLearned) {
@@ -818,6 +818,12 @@
     relatedSwitchBusy = true;
     const generation = feedGeneration;
     if (btn) { btn.textContent = '読み込み中…'; btn.disabled = true; }
+    // 関連へ進む操作もブックマークとして扱う。保存は裏で実行し、関連フィードの取得を待たせない
+    if (!slide.bookmarked) {
+      ensureBookmarked(slide).catch((e) => {
+        console.warn('[PTS] 関連切替時の自動保存失敗', e);
+      });
+    }
     try {
       // pixivのおすすめ（作品の関連）と、本人の行動ベースのおすすめ（ディスカバリー）を並列取得して統合
       const [recResult, discResult] = await Promise.allSettled([
@@ -1193,6 +1199,50 @@
     }
   }
 
+  // ブックマークの通信・状態更新・学習を共通化（ChatGPT実装）
+  // おすすめ差し込みは呼び出し側の責務とする
+  async function ensureBookmarked(s) {
+    const id = String(s.id);
+    // 同じ作品の保存処理が進行中なら、そのPromiseを共有する
+    if (s.bookmarkPromise) return s.bookmarkPromise;
+    // 既に保存済みなら再POSTしない
+    if (s.bookmarked || knownBookmarkedIds.has(id)) {
+      s.bookmarked = true;
+      knownBookmarkedIds.add(id);
+      paintBookmarkBtn(s);
+      return false; // 新規保存ではない
+    }
+    const promise = (async () => {
+      const token = await getCsrfToken();
+      if (!token) throw new Error('token取得失敗');
+      const res = await fetch('/ajax/illusts/bookmarks/add', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'x-csrf-token': token },
+        body: JSON.stringify({ illust_id: id, restrict: 0, comment: '', tags: [] }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const json = await res.json();
+      if (json.error) throw new Error(json.message || 'api error');
+      // 保存成功後にのみ状態更新
+      s.bookmarked = true;
+      knownBookmarkedIds.add(id);
+      paintBookmarkBtn(s);
+      // 作品情報が取得済みなら、1回だけ学習
+      if (!s.tasteLearned && s.tags && s.tags.length) {
+        learnFromWork(s.tags, s.userId, s.rawType, 3);
+        s.tasteLearned = true;
+      }
+      return true; // 新規保存成功
+    })();
+    s.bookmarkPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (s.bookmarkPromise === promise) s.bookmarkPromise = null;
+    }
+  }
+
   // ブックマークした作品のおすすめを、その作品の直後に最大12件差し込む
   async function insertRecommendationsAfterBookmark(s) {
     if (s.recommendInsertStarted) return;
@@ -1235,30 +1285,26 @@
   }
 
   async function toggleBookmark(s, btn) {
-    if (s.bookmarked) { paintBookmarkBtn(s); return; }
+    if (s.bookmarked) {
+      paintBookmarkBtn(s);
+      return;
+    }
     btn.disabled = true;
     btn.textContent = '保存中…';
     try {
-      const token = await getCsrfToken();
-      if (!token) throw new Error('token取得失敗');
-      const res = await fetch('/ajax/illusts/bookmarks/add', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json', 'x-csrf-token': token },
-        body: JSON.stringify({ illust_id: String(s.id), restrict: 0, comment: '', tags: [] }),
-      });
-      const json = await res.json();
-      if (json.error) throw new Error(json.message || 'api error');
-      s.bookmarked = true;
-      knownBookmarkedIds.add(String(s.id));
-      paintBookmarkBtn(s);
-      if (s.tags && s.tags.length) {
-        learnFromWork(s.tags, s.userId, s.rawType, 3);
-        s.tasteLearned = true;
+      // 共通処理：pixivへの保存・状態更新・学習
+      const newlySaved = await ensureBookmarked(s);
+      // 通常の保存操作だけ、おすすめを直後に差し込む
+      if (newlySaved) {
+        insertRecommendationsAfterBookmark(s);
       }
-      // 保存は完了済み。おすすめ差し込みは裏で進める（完了は待たない）
-      insertRecommendationsAfterBookmark(s);
     } catch (e) {
+      // 並行して別の保存処理が成功した場合は失敗表示しない
+      if (s.bookmarked) {
+        paintBookmarkBtn(s);
+        return;
+      }
+      console.warn('[PTS] ブックマーク失敗', e);
       btn.textContent = '保存失敗 もう一度タップ';
       btn.disabled = false;
     }

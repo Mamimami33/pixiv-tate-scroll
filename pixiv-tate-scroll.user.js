@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      1.1.0
-// @description  pixivのブックマーク／ディスカバリーをTikTok風の縦スクロール（全画面スナップ）で眺めるビューアを、pixivのページ上に重ねて表示します。
+// @version      2.0.0
+// @description  今開いているpixivのページに並んでいる作品を、TikTok風の縦スクロール（全画面スナップ）で眺めるビューアです。ブックマーク連携なし・ページ内スキャン方式。
 // @match        https://www.pixiv.net/*
 // @grant        none
 // @run-at       document-idle
@@ -11,7 +11,6 @@
 (function () {
   'use strict';
 
-  // ブックマークレット等で二重に読み込まれた場合は、既存ボタンを押して終わる
   if (window.__ptsLoaded) {
     const existing = document.getElementById('pts-launch');
     if (existing) existing.click();
@@ -19,121 +18,85 @@
   }
   window.__ptsLoaded = true;
 
-  const LIMIT = 100;
   let overlay = null;
   let feedEl = null;
-  let works = [];        // 取得済みブックマーク（生データ）
-  let slides = [];       // 表示用スライド {img, title, author, page, rating}
-  let offset = 0;
-  let total = Infinity;
-  let loading = false;
-  let filterAllAgesOnly = true; // true=全年齢のみ / false=R-18も表示
-  let userId = null;
-  let source = 'bookmarks'; // 'bookmarks' | 'discovery'
+  let slides = [];
 
-  function detectUserId() {
-    // 自分のブックマークページURLから取る
-    const m = location.pathname.match(/\/users\/(\d+)\/bookmarks/);
-    if (m) return m[1];
-    // ページ内のプロフィールリンク等から推測
-    const a = document.querySelector('a[href^="/users/"]');
-    if (a) {
-      const mm = a.getAttribute('href').match(/\/users\/(\d+)/);
-      if (mm) return mm[1];
-    }
-    return null;
-  }
-
-  async function fetchMore() {
-    if (loading) return;
-    if (source === 'bookmarks' && offset >= total) return;
-    loading = true;
-    try {
-      let list = [];
-      if (source === 'bookmarks') {
-        const url = `/ajax/user/${userId}/bookmarks/artworks?tag=&offset=${offset}&limit=${LIMIT}&rest=show&lang=ja`;
-        const res = await fetch(url, { credentials: 'same-origin' });
-        const json = await res.json();
-        if (json.error) throw new Error(json.message || 'api error');
-        total = json.body.total;
-        list = json.body.works || [];
-        offset += list.length;
-      } else {
-        // ディスカバリー（おすすめ）：呼ぶたびに新しいセットが返る
-        const mode = filterAllAgesOnly ? 'safe' : 'all';
-        const url = `/ajax/discovery/artworks?mode=${mode}&limit=${LIMIT}&lang=ja`;
-        const res = await fetch(url, { credentials: 'same-origin' });
-        const json = await res.json();
-        if (json.error) throw new Error(json.message || 'api error');
-        list = (json.body.illusts || []).map((it) => ({
-          id: it.id,
-          title: it.title,
-          url: it.url,
-          userName: it.userName,
-          xRestrict: it.xRestrict,
-          illustType: it.illustType,
-        }));
-        total = Infinity;
-      }
-      works = works.concat(list);
-      await appendSlides(list);
-    } catch (e) {
-      console.warn('[pixiv縦スクロール] 取得失敗', e);
-    } finally {
-      loading = false;
-    }
-  }
-
-  async function resolveImage(work) {
-    // イラスト・マンガは /ajax/illust/<id> から regular を取る。失敗したらサムネイルで代用。
-    try {
-      const res = await fetch(`/ajax/illust/${work.id}`, { credentials: 'same-origin' });
-      const json = await res.json();
-      if (!json.error && json.body && json.body.urls) {
-        return json.body.urls.regular || json.body.urls.original || work.url;
-      }
-    } catch (e) { /* fall through */ }
-    return work.url;
-  }
-
-  async function appendSlides(list) {
-    for (const w of list) {
-      const rating = (w.xRestrict && w.xRestrict > 0) ? 'r18' : 'all';
-      if (filterAllAgesOnly && rating !== 'all') continue;
-      const img = await resolveImage(w);
-      slides.push({
-        img,
-        title: w.title || '',
-        author: w.userName || '',
-        page: `https://www.pixiv.net/artworks/${w.id}`,
-        rating,
-        ugoira: w.illustType === 1,
+  // ページ内から作品を集める（a[href*="/artworks/"] とその中の画像）
+  function scanPage() {
+    const seen = new Set();
+    const items = [];
+    const anchors = document.querySelectorAll('a[href*="/artworks/"]');
+    anchors.forEach((a) => {
+      if (overlay && overlay.contains(a)) return;
+      const m = (a.getAttribute('href') || '').match(/\/artworks\/(\d+)/);
+      if (!m) return;
+      const id = m[1];
+      if (seen.has(id)) return;
+      const img = a.querySelector('img') || (a.parentElement && a.parentElement.querySelector('img'));
+      if (!img) return;
+      const thumb = pickBestSrc(img);
+      if (!thumb || !thumb.includes('i.pximg.net')) return;
+      seen.add(id);
+      // タイトル・作者は近くのテキストから拾える範囲で
+      const card = a.closest('li, div');
+      const title = (img.alt || '').trim();
+      items.push({
+        id,
+        thumb,
+        full: upgradeUrl(thumb),
+        title,
+        page: `https://www.pixiv.net/artworks/${id}`,
       });
-      renderSlide(slides[slides.length - 1], slides.length - 1);
+    });
+    return items;
+  }
+
+  function pickBestSrc(img) {
+    // srcset があれば一番大きいものを選ぶ
+    const ss = img.getAttribute('srcset');
+    if (ss) {
+      const parts = ss.split(',').map((p) => p.trim().split(/\s+/)).filter((p) => p[0]);
+      if (parts.length) {
+        parts.sort((x, y) => (parseInt(y[1]) || 0) - (parseInt(x[1]) || 0));
+        return parts[0][0];
+      }
     }
-    updateCounter();
+    return img.currentSrc || img.src || img.getAttribute('data-src') || '';
+  }
+
+  // square1200 / custom1200 サムネイル → master1200 に変換を試みる（ダメなら表示時にサムネへ差し戻す）
+  function upgradeUrl(url) {
+    const m = url.match(/^https:\/\/i\.pximg\.net\/c\/[^/]+\/(img-master\/.+?)_(?:square1200|custom1200)\.(\w+)$/);
+    if (m) {
+      return `https://i.pximg.net/${m[1]}_p0_master1200.jpg`;
+    }
+    return url;
   }
 
   function renderSlide(s, idx) {
     const sec = document.createElement('section');
     sec.className = 'pts-slide';
-    sec.dataset.index = idx;
 
     const img = document.createElement('img');
     img.className = 'pts-img';
-    img.src = s.img;
-    img.alt = s.title;
+    img.src = s.full;
+    img.alt = s.title || '';
     img.loading = idx < 2 ? 'eager' : 'lazy';
+    img.addEventListener('error', () => {
+      if (img.src !== s.thumb) img.src = s.thumb;
+    });
     sec.appendChild(img);
 
-    const meta = document.createElement('div');
-    meta.className = 'pts-meta';
-    const badge = s.rating === 'r18' ? '<span class="pts-badge">R-18</span>' : '';
-    const ugo = s.ugoira ? '<span class="pts-badge pts-badge-ugo">うごイラ（静止画）</span>' : '';
-    meta.innerHTML = `${badge}${ugo}<div class="pts-title"></div><div class="pts-author"></div>`;
-    meta.querySelector('.pts-title').textContent = s.title;
-    meta.querySelector('.pts-author').textContent = s.author;
-    sec.appendChild(meta);
+    if (s.title) {
+      const meta = document.createElement('div');
+      meta.className = 'pts-meta';
+      const t = document.createElement('div');
+      t.className = 'pts-title';
+      t.textContent = s.title;
+      meta.appendChild(t);
+      sec.appendChild(meta);
+    }
 
     const link = document.createElement('a');
     link.className = 'pts-open';
@@ -146,72 +109,23 @@
     feedEl.appendChild(sec);
   }
 
-  function rebuildFeed() {
-    slides = [];
+  function buildFeed() {
+    slides = scanPage();
     feedEl.innerHTML = '';
-    // フィルター変更時は取得済み分から作り直す
-    (async () => {
-      for (const w of works) {
-        const rating = (w.xRestrict && w.xRestrict > 0) ? 'r18' : 'all';
-        if (filterAllAgesOnly && rating !== 'all') continue;
-        const img = await resolveImage(w);
-        slides.push({
-          img,
-          title: w.title || '',
-          author: w.userName || '',
-          page: `https://www.pixiv.net/artworks/${w.id}`,
-          rating,
-          ugoira: w.illustType === 1,
-        });
-        renderSlide(slides[slides.length - 1], slides.length - 1);
-      }
-      updateCounter();
-    })();
-  }
-
-  function updateCounter() {
+    slides.forEach((s, i) => renderSlide(s, i));
     const c = overlay.querySelector('.pts-counter');
-    if (!c) return;
-    if (source === 'bookmarks') {
-      c.textContent = `${slides.length} 件表示 / ブックマーク ${total === Infinity ? '…' : total} 件`;
+    if (slides.length === 0) {
+      c.textContent = 'このページに作品が見つかりませんでした。検索結果・ランキング・作品ページ等で開いてください';
     } else {
-      c.textContent = `${slides.length} 件表示 / ディスカバリー`;
+      c.textContent = `${slides.length} 件`;
     }
-  }
-
-  function resetAll() {
-    works = [];
-    slides = [];
-    offset = 0;
-    total = Infinity;
-    if (feedEl) feedEl.innerHTML = '';
-  }
-
-  function setSource(next) {
-    if (source === next) return;
-    if (next === 'bookmarks' && !userId) {
-      userId = detectUserId();
-      if (!userId) {
-        alert('ユーザーIDが分かりませんでした。自分のブックマークページ（/users/○○/bookmarks/artworks）を開いてから切り替えてください。');
-        overlay.querySelector('.pts-source').value = source;
-        return;
-      }
-    }
-    source = next;
-    resetAll();
-    updateCounter();
-    fetchMore();
   }
 
   function openViewer() {
-    userId = detectUserId();
-    // ブックマークページ以外ではディスカバリーを初期ソースにする
-    if (!/users\/\d+\/bookmarks/.test(location.pathname)) source = 'discovery';
     buildOverlay();
-    overlay.querySelector('.pts-source').value = source;
     overlay.style.display = 'block';
     document.body.style.overflow = 'hidden';
-    if (works.length === 0) fetchMore();
+    buildFeed();
   }
 
   function closeViewer() {
@@ -225,64 +139,28 @@
     overlay.id = 'pts-overlay';
     overlay.innerHTML = `
       <div class="pts-bar">
-        <select class="pts-source">
-          <option value="bookmarks">ブックマーク</option>
-          <option value="discovery">ディスカバリー</option>
-        </select>
-        <span class="pts-counter">読み込み中…</span>
-        <label class="pts-filter">
-          <input type="checkbox" class="pts-filter-check" checked>
-          <span>全年齢のみ</span>
-        </label>
+        <span class="pts-counter">…</span>
+        <button class="pts-rescan">再スキャン</button>
         <button class="pts-close" title="閉じる">✕</button>
       </div>
       <div class="pts-feed"></div>
     `;
     feedEl = overlay.querySelector('.pts-feed');
     overlay.querySelector('.pts-close').addEventListener('click', closeViewer);
-    overlay.querySelector('.pts-source').addEventListener('change', (e) => {
-      setSource(e.target.value);
-    });
-    overlay.querySelector('.pts-filter-check').addEventListener('change', (e) => {
-      filterAllAgesOnly = e.target.checked;
-      if (source === 'discovery') {
-        // ディスカバリー側のmode自体を切り替えるので取り直す
-        resetAll();
-        fetchMore();
-      } else {
-        rebuildFeed();
-        // フィルターOFFで表示件数が少ない場合は先読みを進める
-        if (!filterAllAgesOnly) fetchMore();
-      }
-    });
-    // 終端近くまで来たら次ページを取得
-    feedEl.addEventListener('scroll', () => {
-      const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
-      if (remain < feedEl.clientHeight * 3) fetchMore();
-    }, { passive: true });
-    // キーボード操作
+    overlay.querySelector('.pts-rescan').addEventListener('click', buildFeed);
     document.addEventListener('keydown', (e) => {
       if (!overlay || overlay.style.display === 'none') return;
       if (e.key === 'Escape') closeViewer();
-      if (e.key === 'ArrowDown' || e.key === ' ') {
-        e.preventDefault();
-        feedEl.scrollBy({ top: feedEl.clientHeight, behavior: 'smooth' });
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        feedEl.scrollBy({ top: -feedEl.clientHeight, behavior: 'smooth' });
-      }
     });
 
     const style = document.createElement('style');
     style.textContent = `
       #pts-overlay{position:fixed;inset:0;background:#000;z-index:99999;display:none;}
-      .pts-bar{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;gap:12px;
+      .pts-bar{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;gap:10px;
         padding:10px 14px;color:#fff;background:linear-gradient(rgba(0,0,0,.65),transparent);font-size:13px;}
       .pts-counter{opacity:.9}
-      .pts-source{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:8px;padding:6px 8px;font-size:13px;}
-      .pts-source option{color:#000;}
-      .pts-filter{margin-left:auto;display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;}
+      .pts-rescan{margin-left:auto;background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;
+        padding:7px 12px;cursor:pointer;font-size:12px;}
       .pts-close{background:rgba(255,255,255,.15);color:#fff;border:0;border-radius:999px;width:32px;height:32px;cursor:pointer;font-size:15px;}
       .pts-feed{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scrollbar-width:none;}
       .pts-feed::-webkit-scrollbar{display:none;}
@@ -291,19 +169,14 @@
       .pts-img{max-width:100%;max-height:100%;object-fit:contain;}
       .pts-meta{position:absolute;left:0;right:0;bottom:0;padding:28px 16px 18px;color:#fff;pointer-events:none;
         background:linear-gradient(transparent,rgba(0,0,0,.7));}
-      .pts-title{font-size:16px;font-weight:700;line-height:1.4;}
-      .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
-      .pts-badge{display:inline-block;background:#e6007e;color:#fff;font-size:11px;font-weight:700;
-        border-radius:4px;padding:2px 6px;margin:0 6px 6px 0;}
-      .pts-badge-ugo{background:#555;}
+      .pts-title{font-size:15px;font-weight:700;line-height:1.4;}
       .pts-open{position:absolute;right:14px;bottom:64px;background:rgba(255,255,255,.16);color:#fff;
-        text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;backdrop-filter:blur(4px);}
+        text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
     `;
     document.head.appendChild(style);
     document.body.appendChild(overlay);
   }
 
-  // 起動ボタン
   const btn = document.createElement('button');
   btn.id = 'pts-launch';
   btn.textContent = '縦スクロール';

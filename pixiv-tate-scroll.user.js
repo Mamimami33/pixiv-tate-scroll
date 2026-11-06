@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      2.1.0
+// @version      2.2.0
 // @description  今開いているpixivのページに並んでいる作品を、TikTok風の縦スクロール（全画面スナップ）で眺めるビューアです。ブックマーク連携なし・ページ内スキャン方式。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -136,14 +136,29 @@
     }
   }
 
+  let pageLoadBusy = false;
+  let pageLoadMisses = 0;
+
+  // 背後のページをスクロールしてpixiv側の無限読み込みを進め、増えた分をフィードに足す
+  function pageLoadMore() {
+    if (pageLoadBusy || pageLoadMisses >= 3) return;
+    pageLoadBusy = true;
+    const before = slides.length;
+    window.scrollBy(0, Math.max(2000, window.innerHeight * 3));
+    setTimeout(() => {
+      appendNew();
+      pageLoadMisses = (slides.length === before) ? pageLoadMisses + 1 : 0;
+      pageLoadBusy = false;
+    }, 1300);
+  }
+
   function openViewer() {
     buildOverlay();
     overlay.style.display = 'block';
-    document.body.style.overflow = 'hidden';
     buildFeed();
-    // 遅延読み込みで後から増えるページ対策：少し置いて再スキャンし、増えた分を足す
-    setTimeout(() => appendNew(), 1200);
-    setTimeout(() => appendNew(), 3000);
+    // 開いた直後も背後ページを少し進めて取り込み量を増やす
+    setTimeout(() => pageLoadMore(), 800);
+    setTimeout(() => pageLoadMore(), 2500);
   }
 
   function appendNew() {
@@ -162,7 +177,6 @@
 
   function closeViewer() {
     overlay.style.display = 'none';
-    document.body.style.overflow = '';
   }
 
   function buildOverlay() {
@@ -180,6 +194,11 @@
     feedEl = overlay.querySelector('.pts-feed');
     overlay.querySelector('.pts-close').addEventListener('click', closeViewer);
     overlay.querySelector('.pts-rescan').addEventListener('click', buildFeed);
+    // フィードの終わりが近づいたら背後ページから続きを取り込む
+    feedEl.addEventListener('scroll', () => {
+      const remain = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
+      if (remain < feedEl.clientHeight * 2) pageLoadMore();
+    }, { passive: true });
     document.addEventListener('keydown', (e) => {
       if (!overlay || overlay.style.display === 'none') return;
       if (e.key === 'Escape') closeViewer();

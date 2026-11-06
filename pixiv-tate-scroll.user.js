@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.7.0
+// @version      3.8.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -74,6 +74,7 @@
       frames: null, zipUrl: null, frameBase: null, frameExt: null,
       sectionEl: null, mainImg: null, titleEl: null, authorEl: null, pageChip: null,
       animTimer: null, animIdx: 0, frameUrls: null, isCurrent: false,
+      tags: null, userId: null, bookmarked: false, bookmarkBtn: null,
     };
   }
 
@@ -156,7 +157,16 @@
     try {
       const body = await fetchJson(`/ajax/illust/${s.id}`, signal);
       s.rawType = body.illustType;
+      s.tags = normTags(body.tags);
+      s.userId = body.userId ? String(body.userId) : null;
       s.bookmarked = !!body.bookmarkData;
+      if (s.bookmarked) {
+        knownBookmarkedIds.add(String(s.id));
+        if (!s.tasteLearned) {
+          learnFromWork(s.tags, s.userId, body.illustType, 3);
+          s.tasteLearned = true;
+        }
+      }
       paintBookmarkBtn(s);
       if (body.title && !s.title) { s.title = body.title; if (s.titleEl) s.titleEl.textContent = s.title; }
       if (body.userName) { s.author = body.userName; if (s.authorEl) s.authorEl.textContent = s.author; }
@@ -804,61 +814,74 @@
   let relatedLoading = false;
 
   async function switchToRelated(slide, btn) {
+    if (relatedSwitchBusy) return;
+    relatedSwitchBusy = true;
+    const generation = feedGeneration;
     if (btn) { btn.textContent = '読み込み中…'; btn.disabled = true; }
     try {
-      const body = await fetchJson(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`);
-      let illusts = body.illusts || [];
-      relatedNextIds = (body.nextIds || []).map(String);
-      // illustsが空でも候補IDがあればそちらから取る（IDは成功してから消費する）
-      if (illusts.length === 0 && relatedNextIds.length > 0) {
-        const batch = relatedNextIds.slice(0, 60);
-        const b2 = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
-        relatedNextIds.splice(0, batch.length);
-        illusts = b2.illusts || [];
-        if (b2.nextIds) {
-          const queued = new Set(relatedNextIds);
-          b2.nextIds.map(String).forEach((id) => { if (!queued.has(id)) { relatedNextIds.push(id); queued.add(id); } });
+      // pixivのおすすめ（作品の関連）と、本人の行動ベースのおすすめ（ディスカバリー）を並列取得して統合
+      const [recResult, discResult] = await Promise.allSettled([
+        fetchJson(`/ajax/illust/${slide.id}/recommend/init?limit=60&lang=ja`),
+        fetchJson('/ajax/discovery/artworks?mode=all&limit=60'),
+      ]);
+      if (generation !== feedGeneration || !slides.includes(slide)) return;
+      if (recResult.status === 'rejected' && discResult.status === 'rejected') {
+        throw new Error('候補取得に失敗');
+      }
+      const rec = recResult.status === 'fulfilled' ? recResult.value : {};
+      const disc = discResult.status === 'fulfilled' ? discResult.value : {};
+      let recItems = Array.isArray(rec.illusts) ? rec.illusts : [];
+      const discItems = Array.isArray(disc.illusts) ? disc.illusts : [];
+      let nextIds = Array.isArray(rec.nextIds) ? rec.nextIds.map(String) : [];
+      if (recItems.length === 0 && nextIds.length > 0) {
+        const batch = nextIds.slice(0, 60);
+        const more = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
+        recItems = more.illusts || [];
+        nextIds = nextIds.slice(batch.length);
+        if (Array.isArray(more.nextIds)) {
+          const queued = new Set(nextIds);
+          more.nextIds.map(String).forEach((id) => { if (!queued.has(id)) { nextIds.push(id); queued.add(id); } });
         }
       }
-      const items = illusts
-        .map((it) => newSlide(String(it.id), it.url || '', it.title || '', it.userName || ''))
-        .filter((it) => it.id !== slide.id);
-      if (items.length === 0) throw new Error('関連0件');
+      const ranked = await prepareCandidates([...recItems, ...discItems], { excludeIds: [slide.id] });
+      if (generation !== feedGeneration || !slides.includes(slide)) return;
+      if (ranked.length === 0) throw new Error('関連候補0件');
       const idx = slides.indexOf(slide);
+      // 後続スライドは後片付けしてから外す（タイマーやBlobを残さない）
+      slides.slice(idx + 1).forEach((s) => {
+        cleanupSlide(s);
+        if (nearObs && s.sectionEl) nearObs.unobserve(s.sectionEl);
+        if (s.sectionEl) s.sectionEl.remove();
+      });
       slides = slides.slice(0, idx + 1);
-      while (feedEl.children.length > idx + 1) {
-        const removed = feedEl.lastChild;
-        if (nearObs) nearObs.unobserve(removed);
-        feedEl.removeChild(removed);
-      }
       mode = 'related';
-      addItems(items);
+      relatedNextIds = [];
+      mergeNextIds(nextIds);
+      addItems(candidatesToSlides(ranked));
+      markCurrentFromScroll();
       if (btn) btn.textContent = '関連に切替済み';
     } catch (e) {
       if (btn) { btn.textContent = '失敗: ' + ((e && e.message) || e); btn.disabled = false; }
+    } finally {
+      relatedSwitchBusy = false;
     }
   }
 
   // 関連モードの続き読み込み（候補IDが残っている間は末尾に足していく）
   async function relatedLoadMore() {
-    if (mode !== 'related' || relatedLoading || relatedNextIds.length === 0) return;
+    if (mode !== 'related' || relatedLoading || relatedSwitchBusy || relatedNextIds.length === 0) return;
     relatedLoading = true;
+    const generation = feedGeneration;
     try {
       // IDは成功してから消費する（失敗時に候補が消えないように）
       const batch = relatedNextIds.slice(0, 60);
       const body = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
+      if (generation !== feedGeneration || mode !== 'related') return;
+      const ranked = await prepareCandidates(body.illusts || []);
+      if (generation !== feedGeneration || mode !== 'related') return;
       relatedNextIds.splice(0, batch.length);
-      const seen = new Set(slides.map((s) => s.id));
-      const items = (body.illusts || [])
-        .map((it) => newSlide(String(it.id), it.url || '', it.title || '', it.userName || ''))
-        .filter((it) => { if (seen.has(it.id)) return false; seen.add(it.id); return true; });
-      addItems(items);
-      if (body.nextIds) {
-        const queued = new Set(relatedNextIds);
-        body.nextIds.map(String).forEach((id) => {
-          if (!seen.has(id) && !queued.has(id)) { relatedNextIds.push(id); queued.add(id); }
-        });
-      }
+      addItems(candidatesToSlides(ranked));
+      mergeNextIds(body.nextIds || []);
     } catch (e) { /* 次のスクロールで再試行 */ }
     relatedLoading = false;
   }
@@ -936,6 +959,171 @@
     scheduleAutoAdvance(idx);
   }
 
+  /* ---------- 自前レコメンド（本人のブックマークから好みを学習して並べ替える） ---------- */
+
+  const profile = { tags: {}, authors: {}, ugoira: 0 };
+  try {
+    const saved = JSON.parse(sessionStorage.getItem('pts-profile') || 'null');
+    if (saved && saved.tags) { profile.tags = saved.tags; profile.authors = saved.authors || {}; profile.ugoira = saved.ugoira || 0; }
+  } catch (e) {}
+
+  function saveProfile() {
+    try { sessionStorage.setItem('pts-profile', JSON.stringify(profile)); } catch (e) {}
+  }
+
+  function normTags(tags) {
+    if (!tags) return [];
+    const arr = Array.isArray(tags) ? tags : (tags.tags || []);
+    return arr.map((t) => (typeof t === 'string' ? t : (t && t.tag) || '')).filter(Boolean);
+  }
+
+  // ブックマーク済み作品から好みを学習する（重みつき）
+  function learnFromWork(tags, userId, illustType, weight) {
+    (tags || []).forEach((t) => { profile.tags[t] = (profile.tags[t] || 0) + weight; });
+    if (userId) profile.authors[String(userId)] = (profile.authors[String(userId)] || 0) + weight;
+    if (illustType === 2) profile.ugoira += weight;
+    saveProfile();
+  }
+
+  // 候補作品の「好み一致度」。pixivの並び順は同点のときの tiebreak として残る
+  function tasteScore(it) {
+    let sc = 0;
+    normTags(it.tags).forEach((t) => { sc += Math.min(profile.tags[t] || 0, 10); });
+    if (it.userId && profile.authors[String(it.userId)]) sc += 8;
+    if (it.illustType === 2 && profile.ugoira >= 3) sc += 3;
+    return sc;
+  }
+
+  function sortByTaste(items) {
+    return items
+      .map((it, i) => ({ it, i, sc: tasteScore(it) }))
+      .sort((a, b) => (b.sc - a.sc) || (a.i - b.i))
+      .map((x) => x.it);
+  }
+
+  /* ---------- 候補の共通処理（ChatGPT実装案を検証・調整して採用） ---------- */
+
+  const knownBookmarkedIds = new Set();
+  let feedGeneration = 0;
+  let relatedSwitchBusy = false;
+
+  function candidateId(it) {
+    const id = it && (it.id != null ? it.id : it.illustId);
+    return id == null ? '' : String(id);
+  }
+
+  function normalizeCandidate(it) {
+    return {
+      ...it,
+      id: candidateId(it),
+      tags: normTags(it.tags),
+      userId: it.userId == null ? null : String(it.userId),
+      illustType: Number(it.illustType),
+      bookmarked: !!(it.bookmarkData || it.bookmarked || it.isBookmarked),
+      bookmarkStateKnown:
+        Object.prototype.hasOwnProperty.call(it, 'bookmarkData') ||
+        Object.prototype.hasOwnProperty.call(it, 'bookmarked') ||
+        Object.prototype.hasOwnProperty.call(it, 'isBookmarked'),
+    };
+  }
+
+  async function mapLimited(items, limit, fn) {
+    const result = new Array(items.length);
+    let cursor = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (cursor < items.length) {
+          const i = cursor++;
+          result[i] = await fn(items[i], i);
+        }
+      })
+    );
+    return result;
+  }
+
+  // リスト側に無い情報（タグ・作者・保存状態）だけを個別取得で補う
+  async function enrichCandidate(it) {
+    if (!it.id) return null;
+    if (it.tags.length > 0 && it.userId && it.bookmarkStateKnown) return it;
+    try {
+      const body = await fetchJson(`/ajax/illust/${encodeURIComponent(it.id)}`);
+      return {
+        ...it,
+        tags: normTags(body.tags),
+        userId: body.userId == null ? it.userId : String(body.userId),
+        illustType: Number(body.illustType),
+        bookmarked: !!body.bookmarkData,
+        bookmarkData: body.bookmarkData,
+      };
+    } catch (e) {
+      return null; // 保存状態が不明な候補は安全側で除外
+    }
+  }
+
+  // 候補を「重複・表示済み・保存済み」を除いて好み順に並べる。
+  // 個別取得での補完は上位 enrichTop 件だけに絞る（全件補完は遅すぎるため。ChatGPT案からの調整点）
+  async function prepareCandidates(rawItems, options = {}) {
+    const excludeIds = new Set((options.excludeIds || []).map(String));
+    slides.forEach((s) => excludeIds.add(String(s.id)));
+    knownBookmarkedIds.forEach((id) => excludeIds.add(id));
+    const seen = new Set();
+    const unique = [];
+    for (const raw of rawItems || []) {
+      const it = normalizeCandidate(raw);
+      if (!it.id || excludeIds.has(it.id) || seen.has(it.id)) continue;
+      if (it.bookmarked) { knownBookmarkedIds.add(it.id); continue; }
+      seen.add(it.id);
+      unique.push(it);
+    }
+    const prelim = sortByTaste(unique);
+    const enrichTop = options.enrichTop != null ? options.enrichTop : 24;
+    const head = prelim.slice(0, enrichTop);
+    const tail = prelim.slice(enrichTop);
+    const enriched = await mapLimited(head, 4, enrichCandidate);
+    const headOk = enriched.filter((it) => {
+      if (!it) return false;
+      if (it.bookmarked) { knownBookmarkedIds.add(it.id); return false; }
+      return true;
+    });
+    return [...sortByTaste(headOk), ...tail];
+  }
+
+  function candidatesToSlides(items) {
+    return items.map((it) => {
+      const s = newSlide(it.id, it.url || '', it.title || '', it.userName || '');
+      s.tags = it.tags;
+      s.userId = it.userId;
+      if (!Number.isNaN(it.illustType)) s.rawType = it.illustType;
+      s.bookmarked = false;
+      return s;
+    });
+  }
+
+  function mergeNextIds(ids) {
+    const queued = new Set(relatedNextIds);
+    const displayed = new Set(slides.map((s) => String(s.id)));
+    for (const value of ids || []) {
+      const id = String(value);
+      if (!id || queued.has(id) || displayed.has(id) || knownBookmarkedIds.has(id)) continue;
+      relatedNextIds.push(id);
+      queued.add(id);
+    }
+  }
+
+  // スライド群を指定位置の直後に差し込む（ブックマーク時のおすすめ差し込み用）
+  function insertSlidesAfter(posIdx, newSlides) {
+    if (newSlides.length === 0) return;
+    newSlides.forEach((s) => renderSlide(s, 99));
+    slides.splice(posIdx + 1, 0, ...newSlides);
+    let anchor = slides[posIdx] ? slides[posIdx].sectionEl : null;
+    newSlides.forEach((s) => {
+      if (anchor && anchor.nextSibling) feedEl.insertBefore(s.sectionEl, anchor.nextSibling);
+      else if (anchor) feedEl.appendChild(s.sectionEl);
+      anchor = s.sectionEl;
+    });
+    updateCounter();
+  }
+
   /* ---------- 片手・ハンズフリー向け機能 ---------- */
 
   let autoSec = 0;
@@ -1005,6 +1193,47 @@
     }
   }
 
+  // ブックマークした作品のおすすめを、その作品の直後に最大12件差し込む
+  async function insertRecommendationsAfterBookmark(s) {
+    if (s.recommendInsertStarted) return;
+    s.recommendInsertStarted = true;
+    const generation = feedGeneration;
+    if (!slides.includes(s)) return;
+    try {
+      const body = await fetchJson(`/ajax/illust/${s.id}/recommend/init?limit=60&lang=ja`);
+      let candidates = Array.isArray(body.illusts) ? body.illusts : [];
+      if (candidates.length === 0 && Array.isArray(body.nextIds) && body.nextIds.length > 0) {
+        const batch = body.nextIds.slice(0, 60).map(String);
+        const more = await fetchJson(`/ajax/illust/recommend/illusts?illustIds=${batch.join(',')}&lang=ja`);
+        candidates = more.illusts || [];
+      }
+      const ranked = await prepareCandidates(candidates, { excludeIds: [s.id], enrichTop: 16 });
+      if (generation !== feedGeneration || !feedEl || !slides.includes(s)) return;
+      const seen = new Set(slides.map((x) => String(x.id)));
+      const selected = ranked.filter((it) => {
+        if (seen.has(it.id) || knownBookmarkedIds.has(it.id)) return false;
+        seen.add(it.id);
+        return true;
+      }).slice(0, 12);
+      if (selected.length === 0) return;
+      const posIdx = slides.indexOf(s);
+      // 差し込みで表示中の作品がずれる場合は、表示位置を維持する
+      const currentSlide = slides[currentIndex()];
+      const oldScrollTop = feedEl.scrollTop;
+      const oldHeight = Math.max(1, feedEl.clientHeight);
+      insertSlidesAfter(posIdx, candidatesToSlides(selected));
+      if (currentSlide && currentSlide !== s) {
+        const newIndex = slides.indexOf(currentSlide);
+        if (newIndex >= 0) {
+          feedEl.scrollTop = newIndex * oldHeight + (oldScrollTop % oldHeight);
+        }
+      }
+      markCurrentFromScroll();
+    } catch (e) {
+      s.recommendInsertStarted = false;
+    }
+  }
+
   async function toggleBookmark(s, btn) {
     if (s.bookmarked) { paintBookmarkBtn(s); return; }
     btn.disabled = true;
@@ -1021,7 +1250,14 @@
       const json = await res.json();
       if (json.error) throw new Error(json.message || 'api error');
       s.bookmarked = true;
+      knownBookmarkedIds.add(String(s.id));
       paintBookmarkBtn(s);
+      if (s.tags && s.tags.length) {
+        learnFromWork(s.tags, s.userId, s.rawType, 3);
+        s.tasteLearned = true;
+      }
+      // 保存は完了済み。おすすめ差し込みは裏で進める（完了は待たない）
+      insertRecommendationsAfterBookmark(s);
     } catch (e) {
       btn.textContent = '保存失敗 もう一度タップ';
       btn.disabled = false;
@@ -1041,6 +1277,10 @@
   }
 
   function buildFeed() {
+    feedGeneration++;
+    relatedNextIds = [];
+    relatedLoading = false;
+    relatedSwitchBusy = false;
     slides.forEach(cleanupSlide);
     slides = [];
     mode = 'page';
@@ -1108,6 +1348,7 @@
   }
 
   function closeViewer() {
+    feedGeneration++;
     overlay.style.display = 'none';
     keepAwake(false);
     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }

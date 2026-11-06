@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.8
+// @version      3.13.9
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -2145,12 +2145,11 @@
 
   function reorderUnviewedAfterLike(liked) {
     if (mode !== 'custom' ||
-        !slides.includes(liked) || !feedEl) return;
+      !slides.includes(liked) || !feedEl) return;
 
     const idx = currentIndex();
     if (slides[idx] !== liked) return;
 
-    const tagSet = new Set(normTags(liked.tags));
     const slots = [];
 
     for (let i = idx + 1; i < slides.length; i++) {
@@ -2162,36 +2161,129 @@
     if (!slots.length) return;
 
     const candidates = slots.map(i => slides[i]);
+    const sorted = diversifyBookmarkRecommendations(
+      candidates, liked, [liked]
+    );
 
-    const score = s => {
-      const matches = normTags(s.tags)
-        .filter(t => tagSet.has(t)).length;
-
-      const sameAuthor = liked.userId && s.userId &&
-        String(liked.userId) === String(s.userId);
-
-      return tasteScore(s) +
-        Math.min(20, matches * 5) +
-        (sameAuthor ? 16 : 0);
-    };
-
-    candidates.sort((a, b) => score(b) - score(a));
     slots.forEach((i, n) => {
-      slides[i] = candidates[n];
+      slides[i] = sorted[n];
     });
 
     const top = feedEl.scrollTop;
-    let next = null;
 
     for (let i = slides.length - 1; i > idx; i--) {
       const el = slides[i].sectionEl;
-      if (el && el.nextElementSibling !== next) {
-        feedEl.insertBefore(el, next);
+      const following = slides[i + 1]?.sectionEl || null;
+
+      if (el && el.nextElementSibling !== following) {
+        feedEl.insertBefore(el, following);
       }
-      next = el;
     }
 
     feedEl.scrollTop = top;
+  }
+
+  /* ---------- v3.13.9: 関連差し込みのタグ分散 ---------- */
+  const REC_GENERIC_TAGS = new Set([
+    'r-18', 'r-18g', 'オリジナル', '創作',
+    '一次創作', '二次創作', 'イラスト', '漫画',
+    'マンガ', 'うごイラ', 'アニメ', 'ゲーム',
+    '女の子', '男の子', '少女', '少年',
+    '女性', '男性', '美少女', 'かわいい',
+    '可愛い', '制服', '水着', '百合',
+    'bl', 'nl', '背景', '風景',
+    '落書き', 'らくがき', 'ファンアート', 'fanart'
+  ]);
+
+  function identityTagSet(tags) {
+    const out = new Set();
+    for (const tag of normTags(tags)) {
+      const t = String(tag).normalize('NFKC')
+        .trim().toLowerCase();
+      if (t.length < 2 || REC_GENERIC_TAGS.has(t) ||
+        /^[\d,]*users?入り$/.test(t)) continue;
+      out.add(t);
+    }
+    return out;
+  }
+
+  function commonIdentityTags(a, b) {
+    if (!a || !b) return 0;
+    const x = identityTagSet(a.tags);
+    const y = identityTagSet(b.tags);
+    let count = 0;
+    for (const tag of x) {
+      if (y.has(tag)) count++;
+    }
+    return count;
+  }
+
+  function identityDiversityPenalty(
+    it, source, last, second, repeated = 0
+  ) {
+    if (!source) return 0;
+
+    const anchor = commonIdentityTags(it, source);
+    const one = last &&
+      String(last.id) !== String(source.id)
+      ? commonIdentityTags(it, last) : 0;
+    const two = second &&
+      String(second.id) !== String(source.id)
+      ? commonIdentityTags(it, second) : 0;
+
+    return Math.min(
+      18,
+      Math.min(12, anchor * 5) +
+      Math.min(8, one * 4) +
+      Math.min(4, two * 2) +
+      (anchor ? Math.min(6, repeated * 1.5) : 0)
+    );
+  }
+
+  function diversifyBookmarkRecommendations(
+    items, source, previous = [source]
+  ) {
+    const pool = items.slice();
+    const output = [];
+    let repeated = 0;
+
+    while (pool.length) {
+      const tail = [...previous, ...output];
+      const last = tail.at(-1);
+      const second = tail.at(-2);
+      const a = String(last?.userId || '');
+      const b = String(second?.userId || '');
+
+      let best = 0;
+      let bestScore = -Infinity;
+
+      for (let i = 0; i < pool.length; i++) {
+        const it = pool[i];
+        const author = String(it.userId || '');
+
+        let score = customBaseScore(it);
+
+        if (author && author === a) score -= 12;
+        if (author && author === b) score -= 5;
+
+        score -= identityDiversityPenalty(
+          it, source, last, second, repeated
+        );
+
+        if (score > bestScore) {
+          bestScore = score;
+          best = i;
+        }
+      }
+
+      const chosen = pool.splice(best, 1)[0];
+      output.push(chosen);
+
+      if (commonIdentityTags(chosen, source)) repeated++;
+
+    }
+
+    return output;
   }
 
   function customDiversify(items) {
@@ -3604,32 +3696,56 @@
     return tags.some(t => t.includes(query)) ? 1 : 0;
   }
 
-  function searchPrioritize(items, word, previous = [], boosts = new Set()) {
+  function searchPrioritize(
+    items, word, previous = [], boosts = new Set(), source = null
+  ) {
     const pool = items.slice();
     const ordered = [];
+    let repeated = 0;
+
     while (pool.length) {
       const tail = [...previous.slice(-2), ...ordered];
-      const a = String(tail.at(-1)?.userId || '');
-      const b = String(tail.at(-2)?.userId || '');
-      let best = 0, bestScore = -Infinity;
+      const last = tail.at(-1);
+      const second = tail.at(-2);
+      const a = String(last?.userId || '');
+      const b = String(second?.userId || '');
+
+      let best = 0;
+      let highest = -Infinity;
+
       for (let i = 0; i < pool.length; i++) {
         const it = pool[i];
-        const id = String(it.id);
         const author = String(it.userId || '');
         const normalized = {
           ...it, illustType: it.illustType ?? it.rawType
         };
+
+        // 検索一致の1000点刻みは分散点より優先。
         let score = searchWordTier(it, word) * 1000 +
-          tasteScore(normalized) + (boosts.has(id) ? 14 : 0);
+          tasteScore(normalized) +
+          (boosts.has(String(it.id)) ? 14 : 0);
+
         if (author && author === a) score -= 12;
         if (author && author === b) score -= 5;
-        if (score > bestScore) {
-          bestScore = score;
+
+        score -= identityDiversityPenalty(
+          it, source, last, second, repeated
+        );
+
+        if (score > highest) {
+          highest = score;
           best = i;
         }
       }
-      ordered.push(pool.splice(best, 1)[0]);
+
+      const chosen = pool.splice(best, 1)[0];
+      ordered.push(chosen);
+
+      if (source && commonIdentityTags(chosen, source)) {
+        repeated++;
+      }
     }
+
     return ordered;
   }
 
@@ -3654,74 +3770,103 @@
   }
 
   function reorderSearchFeedTail(anchor, word) {
-    if (mode !== 'search' || !slides.includes(anchor) || !feedEl) return;
+    if (mode !== 'search' ||
+      !slides.includes(anchor) || !feedEl) return;
 
     const pos = slides.indexOf(anchor);
     const slots = [];
 
     for (let i = pos + 1; i < slides.length; i++) {
       const s = slides[i];
-      if (!s.isCurrent && !viewedThisSession.has(String(s.id))) {
+      if (!s.isCurrent &&
+        !viewedThisSession.has(String(s.id))) {
         slots.push(i);
       }
     }
+
     if (!slots.length) return;
 
     const boosts = anchor.searchInsertedIds || new Set();
     const candidates = slots.map(i => slides[i]);
-    const sorted = searchPrioritize(candidates, word, [anchor], boosts);
+    const sorted = searchPrioritize(
+      candidates, word, [anchor], boosts, anchor
+    );
 
-    slots.forEach((i, j) => { slides[i] = sorted[j]; });
+    slots.forEach((i, j) => {
+      slides[i] = sorted[j];
+    });
 
     const top = feedEl.scrollTop;
+
     for (let i = slides.length - 1; i > pos; i--) {
       const node = slides[i].sectionEl;
       const following = slides[i + 1]?.sectionEl || null;
+
       if (node && node.nextElementSibling !== following) {
         feedEl.insertBefore(node, following);
       }
     }
+
     feedEl.scrollTop = top;
   }
 
   async function improveSearchFeedAfterBookmark(s) {
     if (!s || mode !== 'search' || !slides.includes(s) ||
-        !searchConfig?.word || s.searchImprovePromise) return;
+      !searchConfig?.word || s.searchImprovePromise) return;
 
     const generation = feedGeneration;
     const word = s.gridSearchWord || searchConfig.word;
+
     const work = (async () => {
       try {
         const raw = await fetchSearchRelatedCandidates(s.id);
+
+        if (generation !== feedGeneration ||
+          !slides.includes(s)) return;
+
         const prepared = await prepareCandidates(raw, {
-          excludeIds: [s.id, s.seriesNextId, ...seenTimes.keys()],
-          enrichTop: 0, rank: tasteScore
+          excludeIds: [
+            s.id, s.seriesNextId, ...new Set(slides.map(x => x.id))
+          ].filter(Boolean),
+          enrichTop: 8
         });
 
-        if (generation !== feedGeneration || mode !== 'search' ||
-            !slides.includes(s)) return;
+        const available = prepared.filter(it =>
+          !isSeen(String(it.id)) &&
+          !knownBookmarkedIds.has(String(it.id))
+        );
 
         const ranked = searchPrioritize(
-          prepared.filter(it => !skipStrong(it.id) && !isSeen(it.id)),
-          word, [s]
+          available, word, [s], new Set(), s
         );
         const chosen = ranked.slice(0, 12);
-        s.searchInsertedIds = new Set(chosen.map(it => String(it.id)));
+
+        s.searchInsertedIds = new Set(
+          chosen.map(it => String(it.id))
+        );
+
         if (chosen.length) {
           const current = slides[currentIndex()];
           const oldTop = feedEl.scrollTop;
           const height = Math.max(1, feedEl.clientHeight);
-          insertSlidesAfter(slides.indexOf(s), candidatesToSlides(chosen));
+
+          let pos = slides.indexOf(s);
+          if (slides[pos + 1]?.seriesParentId === String(s.id)) {
+            pos++;
+          }
+
+          insertSlidesAfter(pos, candidatesToSlides(chosen));
+
           if (current && current !== s && slides.includes(current)) {
             feedEl.scrollTop =
               slides.indexOf(current) * height + oldTop % height;
           }
         }
       } catch (e) {
-        console.warn('[PTS search] 保存後の関連取得失敗', e);
+        console.warn('[PTS search] 関連取得失敗', e);
       } finally {
-        if (generation === feedGeneration && mode === 'search' &&
-            slides.includes(s)) {
+        if (generation === feedGeneration &&
+          mode === 'search' && slides.includes(s)) {
           reorderSearchFeedTail(s, word);
           markCurrentFromScroll();
         }
@@ -3729,6 +3874,7 @@
     })();
 
     s.searchImprovePromise = work;
+
     return work;
   }
 
@@ -3959,33 +4105,44 @@
     }
   }
 
-  function reorderSearchGridTail(anchorId, word, boosts = new Set()) {
+  function reorderSearchGridTail(
+    anchorId, word, boosts = new Set()
+  ) {
     const g = searchGrid;
     if (!g.open || !g.cards) return;
 
-    const pos = g.items.findIndex(it =>
-      String(it.id) === String(anchorId));
+    const pos = g.items.findIndex(
+      it => String(it.id) === String(anchorId)
+    );
     if (pos < 0) return;
 
     const head = g.items.slice(0, pos + 1);
+    const anchor = head.at(-1);
     const tail = searchPrioritize(
-      g.items.slice(pos + 1), word, head.slice(-2), boosts
+      g.items.slice(pos + 1),
+      word,
+      head.slice(-2),
+      boosts,
+      anchor
     );
 
     const nodes = new Map(
-      [...g.cards.children].map(el => [el.dataset.ptsId, el])
+      [...g.cards.children].map(
+        el => [el.dataset.ptsId, el]
+      )
     );
 
     const fragment = document.createDocumentFragment();
+
     for (const it of tail) {
       const el = nodes.get(String(it.id));
       if (el) fragment.appendChild(el);
     }
 
-    const scrollTop = g.scroll.scrollTop;
+    const top = g.scroll.scrollTop;
     g.cards.appendChild(fragment);
     g.items = [...head, ...tail];
-    g.scroll.scrollTop = scrollTop;
+    g.scroll.scrollTop = top;
   }
 
   async function improveSearchGridAfterBookmark(it, card, token) {
@@ -4001,6 +4158,9 @@
 
     try {
       const raw = await fetchSearchRelatedCandidates(id);
+
+      if (!g.open || token !== g.token) return;
+
       const prepared = await prepareCandidates(raw, {
         excludeIds: [id, ...g.ids, ...seenTimes.keys()],
         enrichTop: 0, rank: tasteScore
@@ -4008,23 +4168,30 @@
 
       if (!g.open || token !== g.token) return;
 
-      const pos = g.items.findIndex(x => String(x.id) === id);
+      const pos = g.items.findIndex(
+        x => String(x.id) === id
+      );
+      const anchor = pos >= 0 ? g.items[pos] : it;
       const previous = pos >= 0
         ? g.items.slice(Math.max(0, pos - 1), pos + 1)
-        : [];
+        : [anchor];
+
+      const available = prepared.filter(x =>
+        !skipStrong(x.id) && !isSeen(x.id) &&
+        !knownBookmarkedIds.has(String(x.id))
+      );
 
       const ranked = searchPrioritize(
-        prepared.filter(x => !skipStrong(x.id) && !isSeen(x.id)),
-        word, previous
+        available, word, previous, new Set(), anchor
       );
 
       const selected = ranked.slice(0, 12);
+
       for (const item of selected) {
         recommended.add(String(item.id));
       }
 
       appendGridCards(selected, id);
-
     } catch (e) {
       console.warn('[PTS grid] 関連取得失敗', e);
       delete card.dataset.improved;
@@ -4810,14 +4977,18 @@
   }
 
   async function insertRecommendationsAfterBookmark(s) {
-    if (s.recommendInsertStarted) return;
+    if (!s || s.recommendInsertStarted || !slides.includes(s)) return;
 
     s.recommendInsertStarted = true;
     const generation = feedGeneration;
 
-    if (!slides.includes(s)) return;
-
     try {
+      if (!s.resolved && !s.tags?.length) {
+        await resolveSlide(s);
+      }
+
+      if (generation !== feedGeneration || !slides.includes(s)) return;
+
       const body = await fetchJson(
         `/ajax/illust/${s.id}/recommend/init?limit=60&lang=ja`
       );
@@ -4826,56 +4997,63 @@
         ? body.illusts : [];
 
       if (!candidates.length &&
-          Array.isArray(body.nextIds) &&
-          body.nextIds.length) {
-        const batch = body.nextIds.slice(0, 60).map(String);
+        Array.isArray(body.nextIds) && body.nextIds.length) {
+        const ids = body.nextIds.slice(0, 60).map(String);
         const more = await fetchJson(
           '/ajax/illust/recommend/illusts?illustIds=' +
-          batch.join(',') + '&lang=ja'
+          encodeURIComponent(ids.join(',')) + '&lang=ja'
         );
-        candidates = more.illusts || [];
+        candidates = Array.isArray(more.illusts)
+          ? more.illusts : [];
       }
 
       const ranked = await prepareCandidates(candidates, {
-        excludeIds: [s.id, s.seriesNextId].filter(Boolean),
+        excludeIds: [s.id, s.seriesNextId, ...seenTimes.keys()]
+          .filter(Boolean),
         enrichTop: 16
       });
 
       if (generation !== feedGeneration ||
-          !feedEl || !slides.includes(s)) return;
+        !feedEl || !slides.includes(s)) return;
 
-      const seen = new Set(slides.map(x => String(x.id)));
+      const existing = new Set(slides.map(x => String(x.id)));
 
-      const selected = ranked.filter(it => {
-        if (seen.has(it.id) ||
-            knownBookmarkedIds.has(it.id)) return false;
-        seen.add(it.id);
+      const available = ranked.filter(it => {
+        const id = String(it.id);
+        if (existing.has(id) || isSeen(id) ||
+          knownBookmarkedIds.has(id) ||
+          it.bookmarked || skipStrong(id)) return false;
+        existing.add(id);
         return true;
-      }).slice(0, 12);
+      });
 
+      let pos = slides.indexOf(s);
+      const next = slides[pos + 1];
+      const seriesNext = next?.seriesParentId === String(s.id)
+        ? next : null;
+
+      const sorted = diversifyBookmarkRecommendations(
+        available, s, seriesNext ? [s, seriesNext] : [s]
+      );
+
+      const selected = sorted.slice(0, 12);
       if (!selected.length) return;
 
       const current = slides[currentIndex()];
       const oldTop = feedEl.scrollTop;
       const height = Math.max(1, feedEl.clientHeight);
 
-      let pos = slides.indexOf(s);
-
-      if (slides[pos + 1]?.seriesParentId === String(s.id)) {
-        pos++;
-      }
-
+      if (seriesNext) pos++;
       insertSlidesAfter(pos, candidatesToSlides(selected));
 
-      if (current && current !== s &&
-          slides.includes(current)) {
+      if (current && current !== s && slides.includes(current)) {
         feedEl.scrollTop =
           slides.indexOf(current) * height + oldTop % height;
       }
 
       markCurrentFromScroll();
-
     } catch (e) {
+      console.warn('[PTS] 関連差し込み失敗:', e);
       s.recommendInsertStarted = false;
     }
   }

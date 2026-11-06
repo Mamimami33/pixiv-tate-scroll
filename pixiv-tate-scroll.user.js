@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.3.0
+// @version      3.3.1
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -141,9 +141,13 @@
         s.kind = 'ugoira';
         try {
           const meta = await fetchJson(`/ajax/illust/${s.id}/ugoira_meta`);
-          s.zipUrl = meta.src;
-          s.frames = meta.frames;
-        } catch (e) { /* 静止画フォールバック */ }
+          s.zipUrl = meta.src || meta.originalSrc || null;
+          s.frames = meta.frames || null;
+          if (!s.zipUrl) s.ugoiraError = 'メタにZIPなし';
+          else if (!s.frames || s.frames.length === 0) s.ugoiraError = 'フレーム情報なし';
+        } catch (e) {
+          s.ugoiraError = 'メタ取得失敗: ' + (e && e.message ? e.message : e);
+        }
         const pair = pickPair(body.urls);
         s.pairs = [pair];
         // 個別フレームURLの型（_ugoira0.jpg → 連番に差し替え可能なら使う）
@@ -294,7 +298,14 @@
   }
 
   async function unzipFrames(zipUrl, frames) {
-    const buf = await (await fetch(zipUrl)).arrayBuffer();
+    let res;
+    try {
+      res = await fetch(zipUrl);
+    } catch (e) {
+      throw new Error('ZIP取得失敗(通信/CORS): ' + (e && e.message ? e.message : e));
+    }
+    if (!res.ok) throw new Error('ZIP取得失敗: HTTP ' + res.status);
+    const buf = await res.arrayBuffer();
     const view = new DataView(buf);
     // End of Central Directory を後ろから探す
     let eocd = -1;
@@ -356,13 +367,28 @@
     if (s.animTimer) { clearTimeout(s.animTimer); s.animTimer = null; }
   }
 
+  function setChip(s, text) {
+    if (!s.pageChip) return;
+    s.pageChip.style.display = 'block';
+    s.pageChip.textContent = text;
+  }
+
   async function prepareUgoira(s) {
-    if (s.frameUrls || !s.frames || s.preparingUgoira) return;
+    if (s.frameUrls || s.preparingUgoira) return;
+    if (s.ugoiraError) { if (s.isCurrent) setChip(s, 'うごイラ: ' + s.ugoiraError); return; }
+    if (!s.frames) { if (s.isCurrent) setChip(s, 'うごイラ: フレーム情報なし'); return; }
     s.preparingUgoira = true;
+    if (s.isCurrent) setChip(s, 'うごイラ準備中…');
     try {
       // 第1候補：ZIPを自前で展開する（pixiv公式と同じ方式）
       if (s.zipUrl) {
-        s.frameUrls = await unzipFrames(s.zipUrl, s.frames);
+        try {
+          s.frameUrls = await unzipFrames(s.zipUrl, s.frames);
+        } catch (e) {
+          throw new Error('ZIP展開失敗: ' + (e && e.message ? e.message : e));
+        }
+        const valid = s.frameUrls.filter(Boolean).length;
+        if (valid === 0) throw new Error('フレーム0枚');
         if (s.isCurrent) startUgoira(s);
         return;
       }
@@ -379,14 +405,13 @@
           s.frameUrls = urls;
           urls.forEach((u) => { const im = new Image(); im.src = u; });
           if (s.isCurrent) startUgoira(s);
+          return;
         }
+        throw new Error('個別フレーム不可');
       }
+      throw new Error('再生手段なし');
     } catch (e) {
-      // 失敗したら静止画のまま。失敗したことが分かるよう表示だけ出す
-      if (s.isCurrent && s.pageChip) {
-        s.pageChip.style.display = 'block';
-        s.pageChip.textContent = 'うごイラ再生できませんでした';
-      }
+      if (s.isCurrent) setChip(s, 'うごイラ: ' + (e && e.message ? e.message : e));
     } finally {
       s.preparingUgoira = false;
     }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.3.4
+// @version      3.4.0
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -26,6 +26,13 @@
   let mode = 'page'; // 'page' | 'related'
   let nearObs = null;
   let curObs = null;
+  // 画像サーバーへの接続を先に温めておく（初回表示の高速化）
+  const pc = document.createElement('link');
+  pc.rel = 'preconnect';
+  pc.href = 'https://i.pximg.net';
+  pc.crossOrigin = 'anonymous';
+  document.head.appendChild(pc);
+
   let quality = 'orig'; // 表示中の1枚は元画像、近くの先読みは1200px。'fast' にすると全体1200px止まり
 
   function pickPair(urls) {
@@ -178,7 +185,6 @@
     s.resolving = false;
     applyResolved(s);
     upgradeSlide(s);
-    debugUgoira(s);
   }
 
   // 表示レベルに応じて画像を差し替える：表示中は元画像（quality=orig時）、近くは1200px
@@ -212,14 +218,6 @@
     }
   }
 
-  // スライドの状態を下部に出す（切り分け用）
-  function debugUgoira(s) {
-    if (!s.debugEl) return;
-    s.debugEl.textContent =
-      `type=${s.rawType === undefined ? '?' : s.rawType} kind=${s.kind} res=${s.resolved ? 1 : 0} cur=${s.isCurrent ? 1 : 0} ` +
-      `zip=${s.zipUrl ? 'あり' : 'なし'} frames=${s.frames ? s.frames.length : '-'} urls=${s.frameUrls ? s.frameUrls.filter(Boolean).length : '-'} ` +
-      `anim=${s.animTimer ? '再生中' : '停止'} err=${s.resolveError || s.ugoiraError || ''}`;
-  }
 
   /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
 
@@ -365,15 +363,38 @@
       s.pageChip.style.display = 'block';
       s.pageChip.textContent = 'うごイラ再生中';
     }
+    // シークバー（再生位置）を出す
+    const total = s.frames.reduce((a, f) => a + (f.delay || 100), 0);
+    s.animTotal = total;
+    if (s.seekEl) s.seekEl.style.display = 'block';
     const step = () => {
       if (!s.frameUrls) return;
-      const url = s.frameUrls[s.animIdx % s.frameUrls.length];
+      const i = s.animIdx % s.frameUrls.length;
+      const url = s.frameUrls[i];
       if (url && s.mainImg) s.mainImg.src = url;
-      const delay = (s.frames[s.animIdx % s.frames.length].delay) || 100;
+      // 現在フレーム開始時点までの累計時間でバーを進める
+      let elapsed = 0;
+      for (let k = 0; k < i; k++) elapsed += (s.frames[k].delay || 100);
+      if (s.seekFill) s.seekFill.style.width = (total > 0 ? (elapsed / total) * 100 : 0) + '%';
+      const delay = (s.frames[i].delay) || 100;
       s.animIdx++;
       s.animTimer = setTimeout(step, delay);
     };
     step();
+  }
+
+  // シークバーがタップされたらその位置のフレームへ跳ぶ
+  function seekUgoira(s, ratio) {
+    if (!s.frameUrls || !s.frames || !s.animTotal) return;
+    let target = ratio * s.animTotal;
+    let idx = 0;
+    while (idx < s.frames.length - 1 && target >= (s.frames[idx].delay || 100)) {
+      target -= (s.frames[idx].delay || 100);
+      idx++;
+    }
+    s.animIdx = idx;
+    if (s.animTimer) { clearTimeout(s.animTimer); s.animTimer = null; }
+    if (s.isCurrent) startUgoira(s);
   }
 
   function stopUgoira(s) {
@@ -428,7 +449,6 @@
       s.ugoiraError = (e && e.message) ? e.message : String(e);
     } finally {
       s.preparingUgoira = false;
-      debugUgoira(s);
     }
   }
 
@@ -500,6 +520,22 @@
     sec.appendChild(chip);
     s.pageChip = chip;
 
+    // うごイラ用シークバー（上部バー直下）
+    const seek = document.createElement('div');
+    seek.className = 'pts-seek';
+    seek.style.display = 'none';
+    const seekFill = document.createElement('div');
+    seekFill.className = 'pts-seek-fill';
+    seek.appendChild(seekFill);
+    seek.addEventListener('pointerdown', (e) => {
+      const r = seek.getBoundingClientRect();
+      seekUgoira(s, Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)));
+      e.stopPropagation();
+    });
+    sec.appendChild(seek);
+    s.seekEl = seek;
+    s.seekFill = seekFill;
+
     const meta = document.createElement('div');
     meta.className = 'pts-meta';
     const t = document.createElement('div');
@@ -510,10 +546,6 @@
     au.textContent = s.author || '';
     meta.appendChild(t);
     meta.appendChild(au);
-    const dbg = document.createElement('div');
-    dbg.className = 'pts-debug';
-    meta.appendChild(dbg);
-    s.debugEl = dbg;
     s.titleEl = t;
     s.authorEl = au;
     sec.appendChild(meta);
@@ -600,8 +632,15 @@
         stopUgoira(s);
         if (s.resolved) upgradeSlide(s);
       }
-      debugUgoira(s);
     });
+    // 次の1枚の元画像を先読みしておく（スワイプした瞬間に綺麗な画像が出る）
+    if (quality === 'orig') {
+      const nx = slides[idx + 1];
+      if (nx && nx.resolved && nx.kind !== 'ugoira' && nx.pairs && nx.pairs[0] && nx.pairs[0].o) {
+        const pre = new Image();
+        pre.src = nx.pairs[0].o;
+      }
+    }
   }
 
   function buildFeed() {
@@ -644,7 +683,7 @@
         if (s && !s.resolved) resolveSlide(s);
         else if (s) upgradeSlide(s);
       });
-    }, { root: null, rootMargin: '150% 0px 150% 0px', threshold: 0 });
+    }, { root: null, rootMargin: '300% 0px 300% 0px', threshold: 0 });
 
     // 表示中になったら元画像に引き上げ、うごイラは再生する
     curObs = new IntersectionObserver((entries) => {
@@ -662,7 +701,6 @@
           s.isCurrent = false;
           stopUgoira(s);
         }
-        debugUgoira(s);
       });
     }, { root: null, threshold: 0.5 });
   }
@@ -742,7 +780,8 @@
         background:linear-gradient(transparent,rgba(0,0,0,.7));}
       .pts-title{font-size:15px;font-weight:700;line-height:1.4;}
       .pts-author{font-size:13px;opacity:.85;margin-top:2px;}
-      .pts-debug{font-size:10px;opacity:.75;margin-top:3px;word-break:break-all;}
+      .pts-seek{position:absolute;left:0;right:0;top:48px;height:18px;z-index:6;background:linear-gradient(to bottom, rgba(255,255,255,.25) 0 3px, transparent 3px);}
+      .pts-seek-fill{height:3px;width:0%;background:#0096fa;}
       .pts-open{position:absolute;right:14px;bottom:64px;z-index:2;background:rgba(255,255,255,.16);color:#fff;
         text-decoration:none;font-size:12px;padding:8px 12px;border-radius:999px;}
       .pts-related{position:absolute;right:14px;bottom:112px;z-index:2;background:#0096fa;color:#fff;border:0;

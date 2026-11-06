@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.9
+// @version      3.13.10
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -3878,6 +3878,55 @@
     return work;
   }
 
+  // 検索専用: 検索API候補 + recommend/init (上位2作品まで)。
+  // 検索ワード一致を最優先し、検索結果にも同順位内の小加点を与える。
+  async function buildSearchRankedBatch(rawSearch, word, previous = [], excludeIds = [], signal) {
+    const exclusions = [...seenTimes.keys(), ...excludeIds];
+    const prepared = await prepareCandidates(rawSearch, {
+      excludeIds: exclusions, enrichTop: 0, rank: tasteScore
+    });
+    const searchItems = prepared.filter(it =>
+      !skipStrong(it.id) && !isSeen(it.id) &&
+      !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
+    );
+    if (signal?.aborted || !searchItems.length) return [];
+    const recLimit = Math.floor(searchItems.length * 3 / 7);
+    const searchIds = new Set(searchItems.map(it => String(it.id)));
+    if (!recLimit) return searchPrioritize(searchItems, word, previous, searchIds);
+
+    const seeds = [...searchItems]
+      .sort((a, b) => tasteScore(b) - tasteScore(a))
+      .slice(0, 2);
+    const responses = await Promise.all(seeds.map(async it => {
+      try {
+        const body = await fetchJson(
+          `/ajax/illust/${encodeURIComponent(it.id)}/recommend/init?limit=30`, signal);
+        return customCandidateArray(body);
+      } catch (e) {
+        if (e?.name !== 'AbortError') console.warn('[PTS search rec]', e);
+        return []; // 検索API結果は残す
+      }
+    }));
+    if (signal?.aborted) return [];
+
+    const recPrepared = await prepareCandidates(responses.flat(), {
+      excludeIds: [...exclusions, ...searchIds],
+      enrichTop: 0, rank: tasteScore
+    });
+    const recEligible = recPrepared.filter(it =>
+      !skipStrong(it.id) && !isSeen(it.id) &&
+      !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
+    );
+    const recChosen = searchPrioritize(recEligible, word, previous)
+      .slice(0, recLimit);
+
+    // searchPrioritizeは検索一致tier、tasteScore、作者分散を処理する。
+    // 既存の保存後用「source」タグペナルティはここでは使わない。
+    return searchPrioritize(
+      [...searchItems, ...recChosen], word, previous, searchIds
+    );
+  }
+
   function searchGridDiversify(items) {
     if (searchGrid.searchBoosted && searchGrid.config?.word) {
       return searchPrioritize(
@@ -4225,9 +4274,8 @@
         const url = '/ajax/search/artworks/' +
           encodeURIComponent(g.config.word) + '?' + params;
         let body;
-        try {
-          body = await fetchJson(url, controller.signal);
-        } catch (e) { error = e; break; }
+        try { body = await fetchJson(url, controller.signal); }
+        catch (e) { error = e; break; }
         if (!g.open || token !== g.token) return false;
         const data = body?.illustManga?.data;
         if (!Array.isArray(data)) {
@@ -4247,20 +4295,24 @@
       }
       if (!g.open || token !== g.token) return false;
       if (collected.length) {
-        const prepared = await prepareCandidates(collected, {
-          excludeIds: [...seenTimes.keys(), ...g.ids],
-          enrichTop: 0, rank: tasteScore
-        });
+        const previous = g.items.slice(-2);
+        const ranked = await buildSearchRankedBatch(
+          collected, g.config.word, previous, [...g.ids], controller.signal
+        );
         if (!g.open || token !== g.token) return false;
-        const chosen = searchGridDiversify(prepared.filter(it =>
-          !skipStrong(it.id) && !isSeen(it.id) &&
-          !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked));
-        if (chosen.length) appendGridCards(chosen);
-        g.page = page;
-        g.finished = finished;
-        g.busy = false;
-        if (finished) g.status.textContent = g.items.length ? `${g.items.length}件` : '該当がありません';
-        // 全件除外などでスクロールできない場合も続きを取得可能にする。
+        appendGridCards(ranked); // 今あるカードは移動しない
+      }
+      g.page = page; // 失敗ページは飛ばさない
+      g.finished = finished;
+      if (error) {
+        g.status.textContent = `読み込み失敗: ${error.message || error}`;
+        g.retry.textContent = '再試行';
+        g.retry.hidden = false;
+        console.warn('[PTS grid]', error);
+      } else if (finished) {
+        g.status.textContent = g.items.length ? `${g.items.length}件` : '該当がありません';
+      } else {
+        g.status.textContent = `${g.items.length}件表示中`;
         if (g.scroll.scrollHeight <= g.scroll.clientHeight + 4) {
           g.retry.textContent = '続きを取得';
           g.retry.hidden = false;
@@ -4595,139 +4647,86 @@
 
   async function searchLoadMore() {
     if (mode !== 'search' || !searchConfig || searchBusy ||
-      searchFinished || overlay?.style.display === 'none') return;
+        searchFinished || overlay?.style.display === 'none') return;
     if (Date.now() - searchLastFailure < 4000) return;
-
     searchBusy = true;
+    searchLastFailure = 0;
     const generation = feedGeneration;
-    let nextPage = searchPage;
-    let reachedEnd = false;
-    let failure = null;
     const collected = [];
-
+    let page = searchPage, nextPage = searchPage, reachedEnd = false, failure = null;
     try {
       for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
-        const page = nextPage;
+        page = nextPage;
         if (page > 1000) { reachedEnd = true; break; }
-
         const params = new URLSearchParams({
-          word: searchConfig.word,
-          order: searchConfig.order,
-          mode: searchConfig.searchMode,
-          s_mode: searchConfig.matchMode,
+          word: searchConfig.word, order: searchConfig.order,
+          mode: searchConfig.searchMode, s_mode: searchConfig.matchMode,
           p: String(page)
         });
-
         const url = '/ajax/search/artworks/' +
           encodeURIComponent(searchConfig.word) + '?' + params;
-
         let body;
-        try {
-          body = await fetchJson(url);
-        } catch (e) {
-          failure = e;
-          break; // 失敗ページを飛ばさず、次回ここから再試行
-        }
-
+        try { body = await fetchJson(url); }
+        catch (e) { failure = e; break; }
         if (generation !== feedGeneration || mode !== 'search') return;
-
         const data = body?.illustManga?.data;
-
         if (!Array.isArray(data)) {
-          failure = new Error(
-            `検索API p=${page}: dataが配列ではありません`
-          );
+          failure = new Error(`検索API p=${page}: dataが配列ではありません`);
           break;
         }
-
         if (page === searchConfig.page) {
-          searchTagCandidates = findSearchTagCandidates(
-            body, searchConfig.word
-          );
+          searchTagCandidates = findSearchTagCandidates(body, searchConfig.word);
           renderSearchTagCandidates();
         }
-
         collected.push(...data);
         nextPage = page + 1;
-
         const total = Number(body?.illustManga?.total);
-
-        if (!data.length ||
-          (Number.isFinite(total) && total >= 0 &&
-            page * 36 >= total)) {
+        if (!data.length || (Number.isFinite(total) && total >= 0 &&
+          page * 36 >= total)) {
           reachedEnd = true;
           break;
         }
       }
       if (generation !== feedGeneration || mode !== 'search') return;
       if (collected.length) {
-        // 候補にtags/userId等があるため個別補完はしない。
-        const prepared = await prepareCandidates(collected, {
-          excludeIds: [...seenTimes.keys()],
-          enrichTop: 0,
-          rank: tasteScore
-        });
-
+        const previous = slides.slice(-2);
+        const ranked = await buildSearchRankedBatch(
+          collected, searchConfig.word, previous
+        );
         if (generation !== feedGeneration || mode !== 'search') return;
-
-        // 自前フィードと同じ作者連続ペナルティ(-12/-5)。
-        const arranged = customDiversify(
-          prepared.filter(it => !skipStrong(it.id))
-        );
-
-        const existing = new Set(
-          slides.map(s => String(s.id))
-        );
-
-        const selected = arranged.filter(it => {
+        const ids = new Set(slides.map(s => String(s.id)));
+        const selected = ranked.filter(it => {
           const id = String(it.id);
-
-          if (existing.has(id) || isSeen(id) ||
-            knownBookmarkedIds.has(id) ||
-            it.bookmarked) return false;
-
-          existing.add(id);
+          if (ids.has(id) || isSeen(id) || skipStrong(id) ||
+              knownBookmarkedIds.has(id) || it.bookmarked) return false;
+          ids.add(id);
           return true;
         });
-
         const first = slides.length === 0;
         if (selected.length) {
           addItems(candidatesToSlides(selected));
           if (first) markCurrentFromScroll();
         }
       }
-
       searchPage = nextPage;
       searchFinished = reachedEnd;
       searchLastFailure = failure ? Date.now() : 0;
-
-      if (failure) {
-        console.warn('[PTS search]', failure);
-      }
-
+      if (failure) console.warn('[PTS search]', failure);
       if (!slides.length && (searchFinished || failure)) {
         const counter = overlay?.querySelector('.pts-counter');
-        if (counter) {
-          counter.textContent = failure
-            ? '検索取得失敗: ' + (failure.message || failure)
-            : '表示可能な検索結果がありません';
-        }
+        if (counter) counter.textContent = failure
+          ? '検索取得失敗: ' + (failure.message || failure)
+          : '表示可能な検索結果がありません';
       }
     } catch (e) {
       searchLastFailure = Date.now();
       console.warn('[PTS search]', e);
-
       if (!slides.length) {
         const counter = overlay?.querySelector('.pts-counter');
-        if (counter) {
-          counter.textContent =
-            '検索取得失敗: ' + (e.message || e);
-        }
+        if (counter) counter.textContent = '検索取得失敗： ' + (e.message || e);
       }
     } finally {
-      if (generation === feedGeneration) {
-        searchBusy = false;
-      }
+      if (generation === feedGeneration) searchBusy = false;
     }
   }
 

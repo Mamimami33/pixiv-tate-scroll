@@ -4012,6 +4012,24 @@
     return String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
   }
 
+  // 検索API候補専用。illustTypeが欠落したときはrawTypeを使い、
+  // どちらも不明ならnullのままとする（ugoira加点なし）。
+  // custom用normalizeCandidateの既存挙動は変えない。
+  function searchIllustType(candidate) {
+    for (const raw of [candidate?.illustType, candidate?.rawType]) {
+      if (raw == null || raw === '') continue;
+      const type = Number(raw);
+      if (Number.isFinite(type)) return type;
+    }
+    return null;
+  }
+
+  function normalizeSearchCandidate(candidate) {
+    const normalized = normalizeCandidate(candidate);
+    normalized.illustType = searchIllustType(candidate);
+    return normalized;
+  }
+
   function legacySearchWordTier(it, word) {
     const query = searchNormalize(word);
     if (!query) return 0;
@@ -4110,9 +4128,7 @@
           if (!ctx.firstBody) ctx.firstBody = body;
           for (const tag of searchRelatedTags(body)) ctx.relatedTags.add(tag);
           for (const raw of data) {
-            const it = normalizeCandidate(raw);
-            // null/欠落したillustTypeはrawTypeの救済用に保持する。
-            if (raw.illustType == null) it.illustType = null;
+            const it = normalizeSearchCandidate(raw);
             const id = String(it.id || '');
             if (!/^\d+$/.test(id) || ctx.searchHitIds.has(id)) continue;
             ctx.searchHitIds.add(id);
@@ -4194,20 +4210,14 @@
       candidate.isSearchApiHit !== true ||
       candidate.queryKey !== ctx.queryKey) return null;
     const cached = ctx.records.get(id) || candidate;
-    const rawType = candidate.rawType ?? cached.rawType;
-    const normalizedType = cached.illustType == null && rawType != null
-      ? Number(rawType)
-      : candidate.illustType != null &&
-        Number.isFinite(Number(candidate.illustType))
-          ? Number(candidate.illustType)
-          : rawType != null ? Number(rawType)
-          : Number(cached.illustType);
+    const normalizedType = searchIllustType(cached) ??
+      searchIllustType(candidate);
     const it = {
       ...cached, ...candidate,
       title: candidate.title || cached.title || '',
       tags: normTags(candidate.tags).length ? candidate.tags : cached.tags,
       userId: candidate.userId ?? cached.userId,
-      illustType: Number.isFinite(normalizedType) ? normalizedType : 0
+      illustType: normalizedType
     };
     const match = searchDiagnosticMatch(it, ctx.word);
     return {
@@ -7366,7 +7376,8 @@
         result.apiTotal = body.illustManga.total == null ? null : Number(body.illustManga.total);
         result.relatedTags = [...new Set([...result.relatedTags, ...searchRelatedTags(body)])];
         for (const [index, raw] of data.entries()) {
-          const it = normalizeCandidate(raw), apiOrder = result.candidates.length;
+          const it = normalizeSearchCandidate(raw);
+          const apiOrder = result.candidates.length;
           const taste = {};
           tasteScore(it, taste);
           const sum = taste.tagCapped + taste.authorCapped + taste.ugoira + taste.r18 +

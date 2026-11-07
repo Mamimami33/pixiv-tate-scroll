@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.15
+// @version      3.13.16
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -143,6 +143,7 @@
 
       if (signal?.aborted) return;
 
+      s.createDate = body.createDate || s.createDate || null;
       s.seriesNextId = seriesNextId(body.seriesNavData);
       s.seriesInfoChecked = true;
       s.rawType = Number(body.illustType);
@@ -150,6 +151,10 @@
       s.userId = body.userId == null
         ? null : String(body.userId);
 
+      if (isFeedbackExcluded(s)) {
+        removeFeedbackSlides();
+        return;
+      }
       s.bookmarked = s.bookmarked ||
         knownBookmarkedIds.has(String(s.id)) ||
         !!body.bookmarkData;
@@ -160,7 +165,7 @@
         if (!s.tasteLearned &&
             !bookmarkHistory.works.some(w =>
               String(w.id) === String(s.id))) {
-          learnFromWork(s.tags, s.userId, s.rawType, 3);
+          learnFromWork(s.tags, s.userId, s.rawType, LEARN_BOOKMARK_WEIGHT, false);
           s.tasteLearned = true;
         }
       }
@@ -775,26 +780,11 @@
   /* ---------- 表示 ---------- */
 
   function checkMangaComplete(s, idx) {
-    if (!s || s.kind !== 'multi' || !s.isCurrent ||
-        !s.pairs || idx !== s.pairs.length - 1) return;
-
-    const img = s.sectionEl
-      ?.querySelectorAll('.pts-page img')[idx];
-
-    if (!img) return;
-
-    if (img.complete && img.naturalWidth > 0) {
-      applyPositive(s, 'complete', 1.0);
-
-    } else if (s.completeWaitImg !== img) {
-      s.completeWaitImg = img;
-
-      img.addEventListener('load', () => {
-        if (s.isCurrent &&
-            s.pageIdx === s.pairs?.length - 1) {
-          applyPositive(s, 'complete', 1.0);
-        }
-      }, { once: true });
+    if (!s || s.kind !== 'multi' || !s.isCurrent || activeView?.slide !== s) return;
+    const img = s.sectionEl?.querySelectorAll('.pts-page img')[idx];
+    if (img?.complete && img.naturalWidth > 0) {
+      activeView.maxPage = Math.max(activeView.maxPage, idx);
+      learnViewing(activeView);
     }
   }
 
@@ -1022,6 +1012,7 @@
   }
 
   function addItems(items) {
+    items = items.filter(it => !isFeedbackExcluded(it));
     if (items.length === 0) { updateCounter(); return; }
     items.forEach((s) => {
       slides.push(s);
@@ -1262,6 +1253,257 @@
     }
   }
 
+  /* ---------- v3.13.16: 連続学習・短期意図・明示フィードバック ---------- */
+  const LEARN_LIKE_WEIGHT = 3;
+  const LEARN_BOOKMARK_WEIGHT = 3;
+  const LEARN_OPEN_WEIGHT = 1.5;
+  const LEARN_DWELL_WEIGHT = 0.6;
+  const LEARN_PAGE_WEIGHT = 1;
+  const LEARN_LOOP_WEIGHT = 0.4;
+  const LEARN_REWATCH_WEIGHT = 1.5;
+  const LEARN_REWATCH_LIMIT = 2;
+  const LEARN_VIEW_BUDGET = 3;
+  const LEARN_RATIO_CAP = 1.5;
+  const LEARN_LOOP_CAP = 3;
+  const LEARN_SINGLE_MS = 8000;
+  const LEARN_PAGE_MS = 6000;
+  const LEARN_MULTI_MAX_MS = 120000;
+  const LEARN_ANIMATION_MIN_MS = 2000;
+  const LEARN_ANIMATION_CYCLES = 2;
+  const LEARN_READY_MS = 1000;
+  const LEARN_TICK_MAX_MS = 250;
+  const LEARN_SAVE_INTERVAL_MS = 1500;
+  let viewSaveTimer = null;
+  const LEARN_SKIP_MS = 2000;
+  const LEARN_INSTANT_MS = 1000;
+  const LEARN_SKIP_WEIGHT = 0.15;
+  const LEARN_INSTANT_WEIGHT = 0.6;
+  const LEARN_DISLIKE_WEIGHT = 12;
+  const LEARN_PROFILE_LIMIT = 2000;
+  const LEARN_PROFILE_CAP = 1000;
+  const LEARN_NEGATIVE_CAP = 50;
+  const LEARN_WORK_LIMIT = 2000;
+  const LEARN_MUTE_LIMIT = 500;
+  const LEARN_SESSION_LIMIT = 1000;
+  const LEARN_SESSION_VALUE_CAP = 100;
+  const LEARN_SESSION_HALF_LIFE_MS = 10 * 60 * 1000;
+  const LEARN_SESSION_TAG_WEIGHT = 7;
+  const LEARN_SESSION_AUTHOR_WEIGHT = 9;
+  const LEARN_SESSION_SCORE_CAP = 35;
+  const LEARN_FATIGUE_WEIGHT = 3;
+  const LEARN_FATIGUE_CAP = 24;
+  const LEARN_NEGATIVE_TAG_WEIGHT = 1.5;
+  const LEARN_NEGATIVE_AUTHOR_WEIGHT = 3;
+  const LEARN_NEGATIVE_SCORE_CAP = 36;
+  const LEARN_EVENT_LIMIT = 40;
+  const LEARN_EXPLORE_BASE = 0.2;
+  const LEARN_EXPLORE_MIN = 0.1;
+  const LEARN_EXPLORE_MAX = 0.4;
+  const LEARN_EXPLORE_SKIP_GAIN = 0.3;
+  const LEARN_EXPLORE_ENGAGE_GAIN = 0.15;
+  const LEARN_ENGAGE_RATIO = 0.6;
+  const LEARN_FRESH_WEIGHT = 8;
+  const LEARN_FRESH_HALF_LIFE_MS = 7 * 86400000;
+  const sessionProfile = {
+    tags: {}, authors: {}, fatigueTags: {}, fatigueAuthors: {},
+    works: new Map(), events: []
+  };
+  let sessionProfileOwner = '';
+  let feedbackPending = false;
+
+  function trimLearningMap(values, limit = LEARN_PROFILE_LIMIT) {
+    return Object.fromEntries(Object.entries(values)
+      .filter(([, value]) => Number.isFinite(Number(value)) && Number(value) > 0)
+      .sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, limit)
+      .map(([key, value]) => [key, Math.min(LEARN_PROFILE_CAP, Number(value))]));
+  }
+
+  function addProfileWeight(values, key, weight) {
+    // 上限に達していても新しい興味を受け入れ、最も弱い既存項目を置き換える。
+    if (!Object.prototype.hasOwnProperty.call(values, key) &&
+        Object.keys(values).length >= LEARN_PROFILE_LIMIT) {
+      const weakest = Object.keys(values).reduce((a, b) =>
+        Number(values[a]) <= Number(values[b]) ? a : b);
+      delete values[weakest];
+    }
+    values[key] = Math.min(LEARN_PROFILE_CAP, (Number(values[key]) || 0) + weight);
+  }
+
+  function resetSessionLearning() {
+    for (const key of ['tags', 'authors', 'fatigueTags', 'fatigueAuthors']) {
+      sessionProfile[key] = {};
+    }
+    sessionProfile.works.clear();
+    sessionProfile.events = [];
+    skippedThisSession.clear();
+    sessionProfileOwner = getMyUserId();
+  }
+
+  function sessionLearning() {
+    if (sessionProfileOwner !== getMyUserId()) resetSessionLearning();
+    return sessionProfile;
+  }
+
+  function sessionValue(values, key, now = Date.now()) {
+    const entry = values[key];
+    return entry ? entry.value * Math.pow(0.5,
+      Math.max(0, now - entry.time) / LEARN_SESSION_HALF_LIFE_MS) : 0;
+  }
+
+  function addSessionValue(values, key, amount) {
+    values[key] = {value: Math.min(LEARN_SESSION_VALUE_CAP, Math.max(0, sessionValue(values, key) + amount)), time: Date.now()};
+    const keys = Object.keys(values);
+    if (keys.length > LEARN_SESSION_LIMIT) {
+      keys.sort((a, b) => values[a].time - values[b].time)
+        .slice(0, keys.length - LEARN_SESSION_LIMIT).forEach(k => delete values[k]);
+    }
+  }
+
+  function learnSessionWork(tags, userId, weight) {
+    const p = sessionLearning();
+    for (const tag of normTags(tags)) {
+      addSessionValue(p.tags, tag, weight);
+      addSessionValue(p.fatigueTags, tag, -weight);
+    }
+    if (userId) {
+      addSessionValue(p.authors, String(userId), weight);
+      addSessionValue(p.fatigueAuthors, String(userId), -weight);
+    }
+  }
+
+  function sessionWork(id) {
+    const works = sessionLearning().works;
+    id = String(id);
+    if (!works.has(id)) {
+      if (works.size >= LEARN_SESSION_LIMIT) works.delete(works.keys().next().value);
+      works.set(id, {viewed: false, rewatched: 0, learned: 0, opened: false});
+    }
+    return works.get(id);
+  }
+
+  function customSessionScore(it) {
+    const p = sessionLearning();
+    const tags = normTags(it.tags);
+    const positive = tags.reduce((sum, tag) => sum + Math.log1p(sessionValue(p.tags, tag)), 0) *
+      LEARN_SESSION_TAG_WEIGHT + Math.log1p(sessionValue(p.authors, String(it.userId || ''))) *
+      LEARN_SESSION_AUTHOR_WEIGHT;
+    const fatigue = tags.reduce((sum, tag) => sum + sessionValue(p.fatigueTags, tag), 0) +
+      sessionValue(p.fatigueAuthors, String(it.userId || ''));
+    const negative = tags.reduce((sum, tag) => sum + Math.log1p(Number(skipProfile.tags[tag]) || 0), 0) *
+      LEARN_NEGATIVE_TAG_WEIGHT + Math.log1p(Number(skipProfile.authors[String(it.userId)]) || 0) *
+      LEARN_NEGATIVE_AUTHOR_WEIGHT;
+    return Math.min(LEARN_SESSION_SCORE_CAP, positive) -
+      Math.min(LEARN_FATIGUE_CAP, fatigue * LEARN_FATIGUE_WEIGHT) -
+      Math.min(LEARN_NEGATIVE_SCORE_CAP, negative);
+  }
+
+  function customFreshnessScore(it, now = Date.now()) {
+    const time = Date.parse(it.createDate || '');
+    return Number.isFinite(time) && time > 0 && time <= now
+      ? LEARN_FRESH_WEIGHT * Math.pow(0.5, (now - time) / LEARN_FRESH_HALF_LIFE_MS) : 0;
+  }
+
+  function customExplorationRate() {
+    const events = sessionLearning().events;
+    if (!events.length) return LEARN_EXPLORE_BASE;
+    const skipped = events.filter(e => e.skip).length / events.length;
+    const engaged = events.filter(e => e.engaged).length / events.length;
+    return Math.max(LEARN_EXPLORE_MIN, Math.min(LEARN_EXPLORE_MAX,
+      LEARN_EXPLORE_BASE + skipped * LEARN_EXPLORE_SKIP_GAIN - engaged * LEARN_EXPLORE_ENGAGE_GAIN));
+  }
+
+  function isFeedbackExcluded(it) {
+    return !!(skipProfile.dismissed[String(it.id)] ||
+      skipProfile.mutedAuthors[String(it.userId || '')]);
+  }
+
+  function removeFeedbackSlides() {
+    const current = slides[currentIndex()];
+    const index = Math.max(0, currentIndex());
+    slides = slides.filter(s => {
+      if (!isFeedbackExcluded(s)) return true;
+      if (activeView?.slide === s) activeView = null;
+      cleanupSlide(s);
+      s.sectionEl?.remove();
+      return false;
+    });
+    if (feedEl) {
+      const target = slides.includes(current) ? slides.indexOf(current) : Math.min(index, slides.length - 1);
+      feedEl.scrollTop = Math.max(0, target) * feedEl.clientHeight;
+      if (slides.length) markCurrentFromScroll();
+      else if (mode === 'custom') void customLoadMore();
+      else void searchLoadMore();
+    }
+    const g = searchGrid;
+    g.items = g.items.filter(it => {
+      if (!isFeedbackExcluded(it)) return true;
+      g.ids.delete(String(it.id));
+      [...(g.cards?.children || [])].find(el => el.dataset.ptsId === String(it.id))?.remove();
+      return false;
+    });
+    updateCounter();
+  }
+
+  async function dismissCurrentWork(muteAuthor = false) {
+    const s = slides[currentIndex()];
+    if (!s || feedbackPending || searchGrid.open) return;
+    feedbackPending = true;
+    const generation = feedGeneration;
+    try {
+      if (!s.resolved) await resolveSlide(s);
+      if (generation !== feedGeneration || !slides.includes(s)) return;
+      if (muteAuthor && !s.userId) {
+        window.alert('作者情報を取得できませんでした。再度お試しください。');
+        return;
+      }
+      if (muteAuthor && !skipProfile.mutedAuthors[String(s.userId)] &&
+          Object.keys(skipProfile.mutedAuthors).length >= LEARN_MUTE_LIMIT) {
+        window.alert('ミュートの上限です。「ミュート管理」から解除してください。');
+        return;
+      }
+      for (const tag of normTags(s.tags)) {
+        skipProfile.tags[tag] = Math.min(LEARN_NEGATIVE_CAP,
+          (Number(skipProfile.tags[tag]) || 0) + LEARN_DISLIKE_WEIGHT);
+      }
+      if (s.userId) skipProfile.authors[String(s.userId)] = Math.min(LEARN_NEGATIVE_CAP,
+        (Number(skipProfile.authors[String(s.userId)]) || 0) + LEARN_DISLIKE_WEIGHT);
+      skipProfile.dismissed[String(s.id)] = Date.now();
+      if (muteAuthor) skipProfile.mutedAuthors[String(s.userId)] = Date.now();
+      learnSessionWork(s.tags, s.userId, -LEARN_DISLIKE_WEIGHT);
+      saveSkipProfile();
+      navIntent = {reason: 'other', until: 0};
+      removeFeedbackSlides();
+    } finally {
+      feedbackPending = false;
+    }
+  }
+
+  async function learnOpenWork(s) {
+    const generation = feedGeneration;
+    const userId = getMyUserId();
+    if (sessionWork(s.id).opened) return;
+    try {
+      if (!s.tags?.length && !s.userId) await resolveSlide(s);
+      if (generation !== feedGeneration || userId !== getMyUserId() ||
+          (!s.tags?.length && !s.userId) || isFeedbackExcluded(s)) return;
+      const record = sessionWork(s.id);
+      if (record.opened) return;
+      record.opened = true;
+      learnFromWork(s.tags, s.userId, s.rawType, LEARN_OPEN_WEIGHT);
+    } catch (e) {
+      console.warn('[PTS] 開く操作の学習失敗', e);
+    }
+  }
+
+  function manageMutedAuthors() {
+    const ids = Object.keys(skipProfile.mutedAuthors);
+    const answer = window.prompt(`ミュート中の作者ID: ${ids.join(', ') || 'なし'}\n解除する作者ID、または「全て」を入力してください。`);
+    if (!answer) return;
+    if (answer.trim() === '全て') skipProfile.mutedAuthors = {};
+    else delete skipProfile.mutedAuthors[answer.trim()];
+    saveSkipProfile();
+  }
+
   const PROFILE_KEY = 'PTS_PROFILE_V2';
   const HISTORY_LIMIT = 500;
   const HISTORY_PAGE_SIZE = 48;
@@ -1331,6 +1573,9 @@
 
     if (!key) return;
 
+    profile.tags = trimLearningMap(profile.tags);
+    profile.authors = trimLearningMap(profile.authors);
+    profile.ugoira = Math.min(LEARN_PROFILE_CAP, Math.max(0, Number(profile.ugoira) || 0));
     try {
       localStorage.setItem(key, JSON.stringify({
         version: 2,
@@ -1343,16 +1588,17 @@
   }
 
   // ビューア内での保存操作・既存の表示解決時の学習に使う
-  function learnFromWork(tags, userId, illustType, weight = 1) {
+  function learnFromWork(tags, userId, illustType, weight = 1, shortTerm = true, persist = true) {
     const w = Number(weight) || 0;
     if (w <= 0) return;
-    for (const tag of normTags(tags)) profile.tags[tag] = (profile.tags[tag] || 0) + w;
+    if (shortTerm) learnSessionWork(tags, userId, w);
+    for (const tag of normTags(tags)) addProfileWeight(profile.tags, tag, w);
     if (userId != null && userId !== '') {
       const id = String(userId);
-      profile.authors[id] = (profile.authors[id] || 0) + w;
+      addProfileWeight(profile.authors, id, w);
     }
     if (Number(illustType) === 2) profile.ugoira += w;
-    saveProfile();
+    if (persist) saveProfile();
   }
 
   /* ---------- v3.12: 独立したスキップ学習 ---------- */
@@ -1361,7 +1607,7 @@
   const skipProfile = {
     tags: {},
     authors: {},
-    works: {}
+    works: {}, dismissed: {}, mutedAuthors: {}
   };
 
   const skippedThisSession = new Set();
@@ -1383,7 +1629,7 @@
         return;
       }
 
-      for (const key of ['tags', 'authors', 'works']) {
+      for (const key of ['tags', 'authors', 'works', 'dismissed', 'mutedAuthors']) {
         if (raw[key] &&
             typeof raw[key] === 'object' &&
             !Array.isArray(raw[key])) {
@@ -1406,8 +1652,14 @@
       );
 
     skipProfile.works =
-      Object.fromEntries(entries.slice(0, 2000));
+      Object.fromEntries(entries.slice(0, LEARN_WORK_LIMIT));
 
+    skipProfile.tags = trimLearningMap(skipProfile.tags);
+    skipProfile.authors = trimLearningMap(skipProfile.authors);
+    skipProfile.dismissed = Object.fromEntries(Object.entries(skipProfile.dismissed)
+      .sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, LEARN_WORK_LIMIT));
+    skipProfile.mutedAuthors = Object.fromEntries(Object.entries(skipProfile.mutedAuthors)
+      .slice(0, LEARN_MUTE_LIMIT));
     try {
       localStorage.setItem(key, JSON.stringify({
         userId: getMyUserId(),
@@ -1418,27 +1670,29 @@
     }
   }
 
-  function learnSkip(s) {
+  function learnSkip(s, elapsed = LEARN_SKIP_MS) {
     const id = String(s?.id || '');
 
-    if (!/^\d+$/.test(id) ||
-        skippedThisSession.has(id) ||
-        s.bookmarked || s.likedThisSession) return;
-
+    if (!/^\d+$/.test(id) || s.bookmarked || s.likedThisSession) return;
+    const weight = elapsed < LEARN_INSTANT_MS ? LEARN_INSTANT_WEIGHT : LEARN_SKIP_WEIGHT;
+    const p = sessionLearning();
+    for (const tag of normTags(s.tags)) addSessionValue(p.fatigueTags, tag, 1);
+    if (s.userId) addSessionValue(p.fatigueAuthors, String(s.userId), 1);
+    if (skippedThisSession.has(id)) return;
     skippedThisSession.add(id);
 
     for (const tag of normTags(s.tags)) {
       skipProfile.tags[tag] = Math.min(
-        50,
-        (Number(skipProfile.tags[tag]) || 0) + 0.15
+        LEARN_NEGATIVE_CAP,
+        (Number(skipProfile.tags[tag]) || 0) + weight
       );
     }
 
     if (s.userId) {
       const author = String(s.userId);
       skipProfile.authors[author] = Math.min(
-        50,
-        (Number(skipProfile.authors[author]) || 0) + 0.15
+        LEARN_NEGATIVE_CAP,
+        (Number(skipProfile.authors[author]) || 0) + weight
       );
     }
 
@@ -1944,7 +2198,7 @@
     for (const raw of rawItems || []) {
       if (!raw) continue;
       const it = normalizeCandidate(raw);
-      if (!it.id || excludeIds.has(it.id) || seen.has(it.id)) continue;
+      if (!it.id || isFeedbackExcluded(it) || excludeIds.has(it.id) || seen.has(it.id)) continue;
       if (it.bookmarked) { knownBookmarkedIds.add(it.id); continue; }
       seen.add(it.id);
       unique.push(it);
@@ -1957,13 +2211,17 @@
         .sort((a, b) => (b.score - a.score) || (a.index - b.index))
         .map((x) => x.it);
     }
-    const prelim = ranked(unique);
+    // ミュート中は作者不明の候補を確認してから採用する。
+    const hasMutedAuthors = Object.keys(skipProfile.mutedAuthors).length > 0;
+    const checked = hasMutedAuthors ? await mapLimited(unique, 4, async it =>
+      it.userId ? it : await enrichCandidate(it)) : unique;
+    const prelim = ranked(checked.filter(it => it && !isFeedbackExcluded(it)));
     const enrichTop = Math.max(0, Math.floor(options.enrichTop != null ? options.enrichTop : 24));
     const head = prelim.slice(0, enrichTop);
     const tail = prelim.slice(enrichTop);
     const enriched = await mapLimited(head, Math.min(4, Math.max(1, enrichTop)), enrichCandidate);
     const headOk = enriched.filter((it) => {
-      if (!it) return false;
+      if (!it || isFeedbackExcluded(it)) return false;
       if (it.bookmarked) { knownBookmarkedIds.add(it.id); return false; }
       return true;
     });
@@ -2095,7 +2353,8 @@
 
   function customBaseScore(it) {
     const sources = Array.isArray(it._customSources) ? it._customSources : [];
-    return tasteScore(it) + (Number(it._customVotes) || 0) * CUSTOM_VOTE_BONUS +
+    return tasteScore(it) + customSessionScore(it) + customFreshnessScore(it) +
+      (Number(it._customVotes) || 0) * CUSTOM_VOTE_BONUS +
       (sources.includes('discovery') ? 2 : 0) +
       (sources.includes('tag') ? 5 : 0) +
       (sources.includes('follow') ? 4 : 0) +
@@ -2149,8 +2408,9 @@
       tasteScore(it) <= median &&
       !skipStrong(it.id);
 
+    const explorationRate = customExplorationRate();
     const explorers = rest.filter(eligible)
-      .slice(0, Math.floor(total / 5));
+      .slice(0, Math.floor(total * explorationRate));
 
     const explorerIds = new Set(explorers.map(it => it.id));
     const ordinary = rest.filter(it => !explorerIds.has(it.id));
@@ -2160,7 +2420,9 @@
     for (let i = 0; i < total; i++) {
       let it = i < fav.length ? fav[i] : null;
 
-      if (!it && i % 5 === 4) it = explorers.shift();
+      if (!it && Math.floor((i + 1) * explorationRate) > Math.floor(i * explorationRate)) {
+        it = explorers.shift();
+      }
       if (!it) it = ordinary.shift() || explorers.shift();
       if (!it || used.has(it.id)) break;
 
@@ -2624,6 +2886,7 @@
 
   // スライド群を指定位置の直後に差し込む（ブックマーク時のおすすめ差し込み用）
   function insertSlidesAfter(posIdx, newSlides) {
+    newSlides = newSlides.filter(it => !isFeedbackExcluded(it));
     if (newSlides.length === 0) return;
     newSlides.forEach((s) => renderSlide(s, 99));
     slides.splice(posIdx + 1, 0, ...newSlides);
@@ -2642,24 +2905,6 @@
   const SEEN_MAX = 5000;
   const seenTimes = new Map();
   const sessionTrail = [];
-  const POSITIVE_KEY = 'PTS_POSITIVE_V1';
-  const positiveSignals = new Set();
-
-  try {
-    const saved = JSON.parse(
-      readAccountStorage(POSITIVE_KEY) || '[]'
-    );
-
-    if (Array.isArray(saved)) {
-      for (const key of saved.slice(-10000)) {
-        if (/^\d+:(long|loop|complete)$/.test(String(key))) {
-          positiveSignals.add(String(key));
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[PTS] ポジティブ履歴復元失敗', e);
-  }
   let sessionBackTarget = '';
   let activeView = null;
   let activeTick = null;
@@ -3008,7 +3253,11 @@
   }
   function isSeen(id) { return seenTimes.has(String(id)); }
   loadSeenTimes();
-  window.addEventListener('pagehide', saveSeenTimes);
+  window.addEventListener('pagehide', () => {
+    tickViewing();
+    saveProfile();
+    saveSeenTimes();
+  });
 
   function visibleReady(s) {
     if (!s || !s.resolved) return false;
@@ -3035,100 +3284,113 @@
     sessionTrail.push({ id, title: s.title || id, thumb: s.thumb || '' });
     if (sessionTrail.length > 50) sessionTrail.shift();
   }
+  function viewingMetrics(v) {
+    const s = v.slide;
+    const duration = Math.max(LEARN_ANIMATION_MIN_MS,
+      (s.frames || []).reduce((sum, f) => sum + (Number(f.delay) || 100), 0));
+    const pages = Math.max(1, s.pairs?.length || 1);
+    const expected = s.kind === 'multi'
+      ? Math.min(LEARN_MULTI_MAX_MS, pages * LEARN_PAGE_MS)
+      : s.kind === 'ugoira' ? duration * LEARN_ANIMATION_CYCLES : LEARN_SINGLE_MS;
+    const ratio = Math.min(LEARN_RATIO_CAP, v.elapsed / expected);
+    // ページ到達だけでは加点しない。実際に見た時間との積で評価する。
+    const progress = s.kind === 'multi' && pages > 1
+      ? Math.min(1, (v.maxPage || 0) / (pages - 1)) : 0;
+    const loops = s.kind === 'ugoira'
+      ? Math.min(LEARN_LOOP_CAP, v.played / duration, v.loops + 1) : 0;
+    return {ratio, score: ratio * LEARN_DWELL_WEIGHT +
+      progress * Math.min(1, ratio) * LEARN_PAGE_WEIGHT + loops * LEARN_LOOP_WEIGHT};
+  }
+
+  function learnViewing(v) {
+    if (!v?.readySeen || isFeedbackExcluded(v.slide)) return;
+    const s = v.slide;
+    if (!s.tags?.length && !s.userId) return;
+    const metrics = viewingMetrics(v);
+    const record = sessionWork(s.id);
+    const delta = Math.min(LEARN_VIEW_BUDGET - record.learned,
+      Math.max(0, metrics.score - v.scored));
+    if (delta <= 0) return;
+    v.scored = metrics.score;
+    record.learned += delta;
+    learnFromWork(s.tags, s.userId, s.rawType, delta, true, false);
+    if (!viewSaveTimer) viewSaveTimer = setTimeout(() => {
+      viewSaveTimer = null;
+      saveProfile();
+    }, LEARN_SAVE_INTERVAL_MS);
+  }
+
+  function finishViewing(v, manual) {
+    if (!v || v.finished) return;
+    v.finished = true;
+    if (v.counting && !document.hidden && !searchGrid.open) {
+      const dt = Math.max(0, Math.min(LEARN_TICK_MAX_MS, performance.now() - v.last));
+      v.elapsed += dt;
+      if (v.slide.kind === 'ugoira' && v.slide.animTimer) v.played += dt;
+    }
+    learnViewing(v);
+    if (!v.readySeen || !manual) return;
+    const s = v.slide;
+    const skip = v.elapsed < LEARN_SKIP_MS && !s.bookmarked && !s.likedThisSession;
+    if (skip) learnSkip(s, v.elapsed);
+    const events = sessionLearning().events;
+    events.push({skip, engaged: !!(s.likedThisSession || s.bookmarked ||
+      sessionWork(s.id).opened || viewingMetrics(v).ratio >= LEARN_ENGAGE_RATIO)});
+    if (events.length > LEARN_EVENT_LIMIT) events.shift();
+  }
+
   function onCurrentSlideChanged(s) {
     if (!s || activeView?.slide === s) return;
     const old = activeView;
-    if (old && old.slide !== s && old.mode === mode &&
-      old.generation === feedGeneration && slides.includes(old.slide)) {
-      const manual = navIntent.reason === 'user' &&
-        performance.now() <= navIntent.until;
-      if (manual && old.readySeen && old.elapsed < 2000 &&
-        !old.slide.bookmarked && !old.slide.likedThisSession) {
-        learnSkip(old.slide);
-      }
+    const manual = navIntent.reason === 'user' && performance.now() <= navIntent.until;
+    if (old && old.mode === mode && old.generation === feedGeneration && slides.includes(old.slide)) {
+      finishViewing(old, manual);
     }
     viewedThisSession.add(String(s.id));
+    const ready = visibleReady(s) && !document.hidden && !searchGrid.open;
     activeView = {
       slide: s, mode, generation: feedGeneration,
-      elapsed: 0, last: performance.now(),
-      readySeen: false, recorded: false, long: false,
-      loop: false, loopCompleted: false
+      elapsed: 0, played: 0, loops: 0, scored: 0, maxPage: s.pageIdx || 0,
+      last: performance.now(), counting: ready,
+      readySeen: ready, recorded: false, finished: false,
+      rewatch: !!(manual && sessionWork(s.id).viewed)
     };
     syncDock();
     ambientSchedule(140);
   }
-  function applyPositive(s, kind, weight) {
-    if (!s) return;
-
-    const signal = `${s.id}:${kind}`;
-
-    if (positiveSignals.has(signal) ||
-        !s.tags?.length) return;
-
-    positiveSignals.add(signal);
-
-    const recent = [...positiveSignals].slice(-10000);
-
-    if (positiveSignals.size > 10000) {
-      positiveSignals.clear();
-
-      recent.forEach(key => {
-        positiveSignals.add(key);
-      });
-    }
-
-    const key = accountStorageKey(POSITIVE_KEY);
-
-    if (key) {
-      try {
-        localStorage.setItem(
-          key,
-          JSON.stringify(recent)
-        );
-      } catch (e) {
-        console.warn('[PTS] 学習履歴保存失敗', e);
-      }
-    }
-
-    learnFromWork(
-      s.tags,
-      s.userId,
-      s.rawType,
-      weight
-    );
-  }
-
   function tickViewing() {
-    if (!overlay || overlay.style.display === 'none' || !activeView) return;
+    if (!activeView) return;
     const v = activeView, now = performance.now();
-    const dt = Math.max(0, Math.min(1000, now - v.last));
+    const dt = Math.max(0, Math.min(LEARN_TICK_MAX_MS, now - v.last));
     v.last = now;
-    // グリッドに覆われた作品は閲覧時間・既読・滞在学習の対象外。
-    if (searchGrid.open) return;
     const s = v.slide;
-    if (document.hidden || slides[currentIndex()] !== s || !s.isCurrent || !visibleReady(s)) return;
+    const wasCounting = v.counting;
+    v.counting = !!(overlay && overlay.style.display !== 'none' && !searchGrid.open &&
+      !document.hidden && slides[currentIndex()] === s && s.isCurrent && visibleReady(s));
+    if (!v.counting) return;
     v.readySeen = true;
-    v.elapsed += dt;
-    if (!v.recorded && v.elapsed >= 1000) {
+    const visibleTime = wasCounting ? dt : 0;
+    v.elapsed += visibleTime;
+    if (s.kind === 'ugoira' && s.animTimer) v.played += visibleTime;
+    if (s.kind === 'multi' && visibleReady(s)) v.maxPage = Math.max(v.maxPage, s.pageIdx || 0);
+    if (!v.recorded && v.elapsed >= LEARN_READY_MS) {
       v.recorded = true;
       markSeen(s.id);
       noteSessionVisit(s);
+      const record = sessionWork(s.id);
+      if (v.rewatch && record.rewatched < LEARN_REWATCH_LIMIT) {
+        record.rewatched++;
+        learnFromWork(s.tags, s.userId, s.rawType, LEARN_REWATCH_WEIGHT);
+      }
+      record.viewed = true;
     }
-    if (!v.long && v.elapsed >= 20000) {
-      v.long = true;
-      applyPositive(s, 'long', 0.25);
-    }
-    if (!v.loop && v.loopCompleted && v.elapsed >= 5000) {
-      v.loop = true;
-      applyPositive(s, 'loop', 0.4);
-    }
+    learnViewing(v);
   }
   function onUgoiraLoop(s) {
-    if (!searchGrid.open && activeView?.slide === s) {
-      activeView.loopCompleted = true;
+    if (!searchGrid.open && activeView?.slide === s && !document.hidden) {
+      activeView.loops++;
     }
   }
-
 
 
   const LIKE_TAP_WINDOW = 240;
@@ -3174,7 +3436,7 @@
       if (s.tags?.length ||
           s.userId ||
           Number(s.rawType) === 2) {
-        learnFromWork(s.tags, s.userId, s.rawType, 3);
+        learnFromWork(s.tags, s.userId, s.rawType, LEARN_LIKE_WEIGHT);
         s.tasteLearned = true;
       }
 
@@ -3553,9 +3815,14 @@
       dock.appendChild(close);
     }
 
+    addButton('pts-not-interested', '興味なし', () => { void dismissCurrentWork(); });
+    addButton('pts-mute-author', '作者をミュート', () => { void dismissCurrentWork(true); });
+    addButton('pts-manage-muted', 'ミュート管理', manageMutedAuthors);
     addButton('pts-open-original', 'pixivで開く', () => {
       const s = slides[currentIndex()];
-      if (s) window.open(s.page, '_blank', 'noopener');
+      if (!s || searchGrid.open) return;
+      window.open(s.page, '_blank', 'noopener');
+      void learnOpenWork(s);
     });
 
     const bar = overlay.querySelector('.pts-bar');
@@ -4137,7 +4404,7 @@
 
     for (const it of items) {
       const id = String(it.id);
-      if (!/^\d+$/.test(id) || g.ids.has(id) ||
+      if (!/^\d+$/.test(id) || isFeedbackExcluded(it) || g.ids.has(id) ||
           isSeen(id) || knownBookmarkedIds.has(id) ||
           it.bookmarked) continue;
 
@@ -4185,7 +4452,7 @@
       if (!s) return;
 
       if (byLike) {
-        learnFromWork(s.tags, s.userId, s.rawType, 3);
+        learnFromWork(s.tags, s.userId, s.rawType, LEARN_LIKE_WEIGHT);
         s.tasteLearned = true;
       }
 
@@ -5234,7 +5501,7 @@
         paintBookmarkBtn(s);
 
         if (!s.tasteLearned && s.tags?.length) {
-          learnFromWork(s.tags, s.userId, s.rawType, 3);
+          learnFromWork(s.tags, s.userId, s.rawType, LEARN_BOOKMARK_WEIGHT);
           s.tasteLearned = true;
         }
 
@@ -6871,6 +7138,11 @@
 
   function closeViewer() {
     if (!overlay) return;
+    tickViewing();
+    finishViewing(activeView, false);
+    clearTimeout(viewSaveTimer);
+    viewSaveTimer = null;
+    saveProfile();
     closeSearchGrid(false);
     closeDiagnosticPanel();
     clearTimeout(bookmarkToastTimer);
@@ -6892,6 +7164,7 @@
     if (feedEl) feedEl.replaceChildren();
     activeView = null;
     overlay.style.display = 'none';
+    resetSessionLearning();
     keepAwake(false);
     saveSeenTimes();
   }

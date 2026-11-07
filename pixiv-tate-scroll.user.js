@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.16
+// @version      3.13.17
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -2065,7 +2065,7 @@
   }
 
   // 数値を返す完成版。タグ×3、作者×9、うごイラ、R-18を評価。
-  function tasteScore(it) {
+  function tasteScore(it, breakdown = null) {
     const tags = normTags(it.tags);
     let tagScore = 0;
 
@@ -2078,7 +2078,9 @@
       tagScore += Math.log1p(count);
     }
 
-    let score = Math.min(30, tagScore * 3);
+    const tagRaw = tagScore * 3;
+    let authorRaw = 0;
+    let score = Math.min(30, tagRaw);
 
     const authorId =
       it.userId == null ? '' : String(it.userId);
@@ -2089,7 +2091,8 @@
         (Number(profile.authors[authorId]) || 0) * 1.5
       );
 
-      score += Math.min(27, Math.log1p(count) * 9);
+      authorRaw = Math.log1p(count) * 9;
+      score += Math.min(27, authorRaw);
     }
 
     if (Number(it.illustType) === 2 &&
@@ -2114,9 +2117,18 @@
       negTags + negAuthor
     );
 
-    return Number.isFinite(score)
-      ? Math.max(0, score - penalty)
-      : 0;
+    const total = Number.isFinite(score) ? Math.max(0, score - penalty) : 0;
+    if (breakdown && typeof breakdown === 'object') Object.assign(breakdown, {
+      total, tagRaw, tagCapped: Math.min(30, tagRaw),
+      authorRaw, authorCapped: Math.min(27, authorRaw),
+      ugoira: Number(it.illustType) === 2 &&
+        historyProfile.ugoira + profile.ugoira > 0 ? 4 : 0,
+      r18: tags.includes('R-18') ? 3 : 0,
+      negativePenalty: -penalty, other: 0,
+      tagSaturated: tagRaw > 30, authorSaturated: authorRaw > 27,
+      scoreRuleVersion: '3.13.16'
+    });
+    return total;
   }
 
   function sortByTaste(items) {
@@ -4591,13 +4603,7 @@
     try {
       for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
         if (page > 1000) { finished = true; break; }
-        const params = new URLSearchParams({
-          word: g.config.word, order: g.config.order,
-          mode: g.config.searchMode, s_mode: g.config.matchMode,
-          p: String(page)
-        });
-        const url = '/ajax/search/artworks/' +
-          encodeURIComponent(g.config.word) + '?' + params;
+        const url = searchApiUrl(g.config, page);
         let body;
         try { body = await fetchJson(url, controller.signal); }
         catch (e) { error = e; break; }
@@ -4986,13 +4992,7 @@
       for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
         page = nextPage;
         if (page > 1000) { reachedEnd = true; break; }
-        const params = new URLSearchParams({
-          word: searchConfig.word, order: searchConfig.order,
-          mode: searchConfig.searchMode, s_mode: searchConfig.matchMode,
-          p: String(page)
-        });
-        const url = '/ajax/search/artworks/' +
-          encodeURIComponent(searchConfig.word) + '?' + params;
+        const url = searchApiUrl(searchConfig, page);
         let body;
         try { body = await fetchJson(url); }
         catch (e) { failure = e; break; }
@@ -6285,6 +6285,7 @@
   }
 
   function closeDiagnosticPanel() {
+    cancelSearchDiagnostic();
     if (!ptsDiag.installed) return;
 
     // 古い診断結果が次の実行に混ざらないようにする。
@@ -6939,6 +6940,189 @@
       }
     }
   }
+  /* ---------- 検索ランキング診断（閲覧状態には書き込まない） ---------- */
+  const SEARCH_DIAG_PAGES = 3;
+  const SEARCH_DIAG_BANDS = [5, 3, 7];
+  const SEARCH_DIAG_LAMBDAS = [3, 1, 5];
+  const SEARCH_DIAG_RELEVANCE_CAP = 400;
+  let searchDiagnostic = null;
+  let searchDiagnosticGeneration = 0;
+
+  function searchApiUrl(config, page) {
+    const params = new URLSearchParams({word: config.word, order: config.order,
+      mode: config.searchMode, s_mode: config.matchMode, p: String(page)});
+    return '/ajax/search/artworks/' + encodeURIComponent(config.word) + '?' + params;
+  }
+
+  function searchDiagnosticContext() {
+    const config = searchGrid.open ? searchGrid.config :
+      mode === 'search' ? searchConfig : null;
+    if (!config || !overlay || overlay.style.display === 'none') return null;
+    return {search: {word: config.word, order: config.order || 'popular_d',
+      searchMode: config.searchMode, matchMode: config.matchMode},
+    grid: searchGrid.open, token: searchGrid.token, feed: feedGeneration,
+    route: location.href};
+  }
+
+  function searchDiagnosticMatch(it, word) {
+    const norm = v => String(v || '').normalize('NFKC').trim().toLocaleLowerCase();
+    const query = norm(word), tokens = [...new Set(query.split(/\s+/u).filter(Boolean))];
+    const title = norm(it.title), tags = normTags(it.tags).map(norm);
+    const tokenEvidence = tokens.map(token => ({token,
+      exactTags: tags.filter(t => t === token),
+      partialTags: tags.filter(t => t !== token && t.includes(token)),
+      titleContains: title.includes(token)}));
+    const coverageCount = tokenEvidence.filter(e =>
+      e.exactTags.length || e.partialTags.length || e.titleContains).length;
+    const exactTagTokenCount = tokenEvidence.filter(e => e.exactTags.length).length;
+    const titleTokenCount = tokenEvidence.filter(e => e.titleContains).length;
+    const titleContainsQuery = !!query && title.includes(query);
+    const exactTagMatches = tags.filter(t => t === query);
+    const partialTagMatches = tags.filter(t => t !== query && t.includes(query));
+    const multi = tokens.length > 1;
+    const tier = multi ? (coverageCount === tokens.length ?
+      (exactTagTokenCount ? 3 : 2) : coverageCount ? 1 : 0) :
+      (titleContainsQuery && exactTagMatches.length ? 3 : exactTagMatches.length ? 2 :
+        titleContainsQuery || partialTagMatches.length ? 1 : 0);
+    return {tier, tierReason: (multi ? 'multi-token' : 'single-token') + ':tier-' + tier,
+      appliedRule: multi ? 'multi-token' : 'single-token', titleContainsQuery,
+      titleExactQuery: !!query && title === query, exactTagMatches, partialTagMatches,
+      coverageCount, coverageTotal: tokens.length,
+      coverageRatio: tokens.length ? coverageCount / tokens.length : 0,
+      exactTagTokenCount, titleTokenCount, tokenEvidence, ruleVersion: '1.0.0'};
+  }
+
+  function rankSearchDiagnostic(result) {
+    const rows = result.candidates;
+    const tie = (a, b) => a.api.apiOrder - b.api.apiOrder;
+    const tier = (a, b) => b.match.tier - a.match.tier;
+    const taste = (a, b) => b.taste.total - a.taste.total;
+    const rel = (a, b) => b.relevance.legacyTotal - a.relevance.legacyTotal;
+    const models = {rankA: (a, b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b)};
+    for (const width of SEARCH_DIAG_BANDS) models['rankB' + width] = (a,b) =>
+      tier(a,b) || Math.floor(b.taste.total / width) - Math.floor(a.taste.total / width) ||
+      rel(a,b) || taste(a,b) || tie(a,b);
+    for (const weight of SEARCH_DIAG_LAMBDAS) models['rankC' + weight] = (a,b) =>
+      tier(a,b) || (b.taste.total + weight * b.relevance.legacyTotal / SEARCH_DIAG_RELEVANCE_CAP) -
+      (a.taste.total + weight * a.relevance.legacyTotal / SEARCH_DIAG_RELEVANCE_CAP) || tie(a,b);
+    result.modelRanks = {};
+    for (const [name, compare] of Object.entries(models)) {
+      result.modelRanks[name] = rows.slice().sort(compare).map((row, i) => {
+        row[name] = i + 1;
+        return {apiOrder: row.api.apiOrder, id: row.api.id, rank: i + 1};
+      });
+    }
+    result.counts = {candidates: rows.length,
+      uniqueIds: new Set(rows.map(r => r.api.id)).size,
+      duplicates: rows.filter(r => r.api.duplicateOf !== null).length};
+  }
+
+  function searchDiagnosticJson() {
+    if (searchDiagnostic?.result) searchDiagnostic.result.contextCurrent =
+      JSON.stringify(searchDiagnostic.context) === JSON.stringify(searchDiagnosticContext());
+    return searchDiagnostic?.result ? JSON.stringify(searchDiagnostic.result,
+      (key, value) => typeof value === 'number' && !Number.isFinite(value) ? null : value, 2) : '';
+  }
+
+  function renderSearchDiagnostic() {
+    const out = overlay?.querySelector('.pts-diag-output');
+    if (out && searchDiagnostic?.result) out.value = searchDiagnosticJson();
+  }
+
+  function cancelSearchDiagnostic(reason = 'cancelled') {
+    const run = searchDiagnostic;
+    if (!run?.running) return;
+    run.running = false;
+    run.controller.abort();
+    run.result.errors.push({page: run.page, code: reason});
+    run.result.status = run.result.completedPages.length ? 'partial' : 'failed';
+    renderSearchDiagnostic();
+  }
+
+  async function runSearchDiagnostic() {
+    cancelSearchDiagnostic('superseded');
+    const context = searchDiagnosticContext();
+    const generation = ++searchDiagnosticGeneration;
+    const search = context?.search || null;
+    const result = {schemaVersion: '1.0.0', scriptVersion: '3.13.17',
+      capturedAt: new Date().toISOString(), diagnosticId: 'search-' + Date.now() + '-' + generation,
+      search, requestedPages: Array.from({length: SEARCH_DIAG_PAGES}, (_, i) => i + 1),
+      completedPages: [], apiTotal: null, relatedTags: [],
+      queryTokens: search ? searchDiagnosticMatch({}, search.word).tokenEvidence.map(e => e.token) : [],
+      tokenizationRule: 'NFKC; trim; locale lowercase; whitespace split; unique tokens',
+      counts: {}, status: 'failed', errors: [], candidates: []};
+    const run = {result, context, generation, controller: new AbortController(), running: true, page: null};
+    searchDiagnostic = run;
+    const current = () => run === searchDiagnostic && run.running &&
+      generation === searchDiagnosticGeneration &&
+      JSON.stringify(context) === JSON.stringify(searchDiagnosticContext());
+    const timer = setInterval(() => {
+      if (run.running && !current()) cancelSearchDiagnostic('context-changed');
+    }, 100);
+    const displayed = new Set([...slides, ...searchGrid.items].map(it => String(it.id)));
+    const ids = new Map();
+    try {
+      if (!context) { result.errors.push({page: null, code: 'no-active-search'}); return; }
+      for (const page of result.requestedPages) {
+        run.page = page;
+        if (!current()) { cancelSearchDiagnostic('context-changed'); break; }
+        const body = await fetchJson(searchApiUrl(search, page), run.controller.signal);
+        if (!current()) { cancelSearchDiagnostic('context-changed'); break; }
+        const data = body?.illustManga?.data;
+        if (!Array.isArray(data)) throw new Error('invalid-candidates');
+        result.apiTotal = body.illustManga.total == null ? null : Number(body.illustManga.total);
+        result.relatedTags = [...new Set([...result.relatedTags, ...searchRelatedTags(body)])];
+        for (const [index, raw] of data.entries()) {
+          const it = normalizeCandidate(raw), apiOrder = result.candidates.length;
+          const taste = {};
+          tasteScore(it, taste);
+          const sum = taste.tagCapped + taste.authorCapped + taste.ugoira + taste.r18 +
+            taste.negativePenalty + taste.other;
+          if (Math.abs(sum - taste.total) > 1e-9 || !Number.isFinite(sum))
+            result.errors.push({page, apiOrder, code: 'taste-sum-mismatch'});
+          result.candidates.push({api: {id: String(it.id), apiPage: page,
+            apiIndexInPage: index, apiOrder, title: typeof raw.title === 'string' ? raw.title : null,
+            tags: it.tags, userId: it.userId, illustType: it.illustType,
+            bookmarked: it.bookmarked, bookmarkStateKnown: it.bookmarkStateKnown,
+            dataAvailability: {title: typeof raw.title === 'string', tags: raw.tags != null,
+              userId: raw.userId != null, illustType: raw.illustType != null},
+            duplicateOf: ids.has(it.id) ? ids.get(it.id) : null},
+          match: searchDiagnosticMatch(it, search.word), legacy: {matchTier: searchWordTier(it, search.word)},
+          taste, relevance: null,
+          feedEligibility: {alreadyDisplayed: displayed.has(it.id), seen: isSeen(it.id),
+            stronglySkipped: skipStrong(it.id), knownBookmarked: knownBookmarkedIds.has(it.id),
+            apiBookmarked: it.bookmarked},
+          humanEvaluation: {relevance: null, taste: null, centralityReason: null, notes: null}});
+          if (!ids.has(it.id)) ids.set(it.id, apiOrder);
+        }
+        result.completedPages.push(page);
+        renderSearchDiagnostic();
+      }
+    } catch (e) {
+      // レスポンス本文・URL・例外メッセージは出力しない。
+      if (run.running) result.errors.push({page: run.page,
+        code: e?.name === 'AbortError' ? 'aborted' : 'request-or-processing-failed'});
+    } finally {
+      clearInterval(timer);
+      for (const row of result.candidates) {
+        const tags = [...new Set(row.api.tags.map(t => t.normalize('NFKC').toLocaleLowerCase()))];
+        const query = search.word.normalize('NFKC').trim().toLocaleLowerCase();
+        const exactTagContribution = Math.min(8, tags.filter(t => t.includes(query)).length) * SEARCH_WORD_TAG_WEIGHT;
+        const relatedTagsUsed = tags.filter(t => t !== query && result.relatedTags.includes(t));
+        const relatedTagContribution = Math.min(8, relatedTagsUsed.length) * SEARCH_RELATED_TAG_WEIGHT;
+        row.relevance = {legacyTotal: searchWordRelevance(row.api, search.word, result.relatedTags),
+          exactTagContribution, relatedTagContribution,
+          capped: exactTagContribution + relatedTagContribution > SEARCH_DIAG_RELEVANCE_CAP,
+          relatedTagsUsed, exactTagContributionRule: 'legacy substring tag matches'};
+      }
+      result.status = result.completedPages.length === SEARCH_DIAG_PAGES && !result.errors.length ?
+        'complete' : result.completedPages.length ? 'partial' : 'failed';
+      run.running = false;
+      rankSearchDiagnostic(result);
+      if (run === searchDiagnostic) renderSearchDiagnostic();
+    }
+  }
+
   /* ---------- 診断UIの設置 ---------- */
 
   function installDiagnosticUI() {
@@ -6968,6 +7152,10 @@
            aria-label="API診断">
         <div class="pts-diag-toolbar">
           <strong>pixiv API診断（読み取り専用）</strong>
+          <button type="button" class="pts-search-diag-run">検索ランキング診断を実行</button>
+          <button type="button" class="pts-search-diag-copy">診断JSONをコピー</button>
+          <button type="button" class="pts-search-diag-save">診断JSONをファイル保存</button>
+          <button type="button" class="pts-search-diag-cancel">診断をキャンセル</button>
           <button type="button" class="pts-diag-copy">コピー</button>
           <button type="button" class="pts-diag-close">閉じる</button>
         </div>
@@ -6980,6 +7168,21 @@
     `;
 
     overlay.appendChild(panel);
+    panel.querySelector('.pts-search-diag-run').onclick = () => { void runSearchDiagnostic(); };
+    panel.querySelector('.pts-search-diag-cancel').onclick = () => cancelSearchDiagnostic();
+    panel.querySelector('.pts-search-diag-copy').onclick = () => {
+      renderSearchDiagnostic();
+      if (searchDiagnostic && !searchDiagnostic.running) void copyDiagnosticReport();
+    };
+    panel.querySelector('.pts-search-diag-save').onclick = () => {
+      if (searchDiagnostic?.running) return;
+      const json = searchDiagnosticJson();
+      if (!json) return;
+      const url = URL.createObjectURL(new Blob([json], {type: 'application/json;charset=utf-8'}));
+      const a = document.createElement('a');
+      a.href = url; a.download = searchDiagnostic.result.diagnosticId + '.json'; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
 
     const style = document.createElement('style');
 
@@ -7041,6 +7244,7 @@
       }
 
       #pts-overlay .pts-diag-toolbar {
+        flex-wrap: wrap;
         display: flex;
         align-items: center;
         gap: 8px;

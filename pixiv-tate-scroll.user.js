@@ -4111,6 +4111,8 @@
           for (const tag of searchRelatedTags(body)) ctx.relatedTags.add(tag);
           for (const raw of data) {
             const it = normalizeCandidate(raw);
+            // null/欠落したillustTypeはrawTypeの救済用に保持する。
+            if (raw.illustType == null) it.illustType = null;
             const id = String(it.id || '');
             if (!/^\d+$/.test(id) || ctx.searchHitIds.has(id)) continue;
             ctx.searchHitIds.add(id);
@@ -4192,18 +4194,20 @@
       candidate.isSearchApiHit !== true ||
       candidate.queryKey !== ctx.queryKey) return null;
     const cached = ctx.records.get(id) || candidate;
+    const rawType = candidate.rawType ?? cached.rawType;
+    const normalizedType = cached.illustType == null && rawType != null
+      ? Number(rawType)
+      : candidate.illustType != null &&
+        Number.isFinite(Number(candidate.illustType))
+          ? Number(candidate.illustType)
+          : rawType != null ? Number(rawType)
+          : Number(cached.illustType);
     const it = {
       ...cached, ...candidate,
       title: candidate.title || cached.title || '',
       tags: normTags(candidate.tags).length ? candidate.tags : cached.tags,
       userId: candidate.userId ?? cached.userId,
-      illustType: candidate.illustType != null &&
-        Number.isFinite(Number(candidate.illustType))
-          ? Number(candidate.illustType)
-          : candidate.rawType != null &&
-            Number.isFinite(Number(candidate.rawType))
-              ? Number(candidate.rawType)
-              : Number(cached.illustType ?? cached.rawType)
+      illustType: Number.isFinite(normalizedType) ? normalizedType : 0
     };
     const match = searchDiagnosticMatch(it, ctx.word);
     return {

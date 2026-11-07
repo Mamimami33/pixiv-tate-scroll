@@ -4048,6 +4048,10 @@
         nextPage: page, finished: false, busy: null, firstBody: null,
         total: null, failure: null
       };
+      // モバイル端末のメモリを圧迫しないよう、過去の検索プールを制限。
+      if (searchRankPools.size >= 8) {
+        searchRankPools.delete(searchRankPools.keys().next().value);
+      }
       searchRankPools.set(queryKey, ctx);
     } else if (page < ctx.nextPage && !ctx.fetchedPages.has(page)) {
       ctx.nextPage = page;
@@ -4333,8 +4337,8 @@
 
   function searchConfigForContext(ctx) {
     if (!ctx) return null;
-    const [word, order, searchMode, matchMode] = JSON.parse(ctx.queryKey);
-    return { word, order, searchMode, matchMode };
+    const [, order, searchMode, matchMode] = JSON.parse(ctx.queryKey);
+    return { word:ctx.word, order, searchMode, matchMode };
   }
 
   // 差し込み・テール双方で使う共通の資格判定/順位。通常の検索API経路だけで補充。
@@ -7161,16 +7165,22 @@
     const taste = (a, b) => b.taste.total - a.taste.total;
     const rel = (a, b) => b.relevance.legacyTotal - a.relevance.legacyTotal;
     const direct = (a, b) => {
-      for (const key of ['coverageCount','exactTagTokenCount',
-        'titleTokenCount','partialTagTokenCount']) {
-        const d = b.match[key] - a.match[key];
+      for (let i = 0; i < 4; i++) {
+        const d = b.match.directRelevanceKey[i] -
+          a.match.directRelevanceKey[i];
         if (d) return d;
       }
       return 0;
     };
+    // A-directは本番と同一の単一比較関数を使う。
+    const productionModel = row => ({
+      tier: row.match.tier, taste: row.taste.total,
+      directRelevanceKey: row.match.directRelevanceKey,
+      apiOrder: row.api.apiOrder
+    });
     const models = {
       rankA: (a, b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b),
-      rankADirect: (a,b) => tier(a,b) || taste(a,b) || direct(a,b) || tie(a,b),
+      rankADirect: (a,b) => compareSearchRank(productionModel(a), productionModel(b)),
       rankALegacy: (a,b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b),
       rankATasteRaw: (a,b) => tier(a,b) ||
         b.tasteVariants.raw - a.tasteVariants.raw || direct(a,b) || tie(a,b),

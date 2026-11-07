@@ -4606,7 +4606,11 @@
 
     for (const it of items) {
       const id = String(it.id);
-      if (!/^\d+$/.test(id) || isFeedbackExcluded(it) || g.ids.has(id) ||
+      const ctx = g.rankContext;
+      if (!ctx || !searchContextValid(ctx) ||
+          !ctx.searchHitIds.has(id) || !ctx.records.has(id) ||
+          it.isSearchApiHit !== true || it.queryKey !== ctx.queryKey ||
+          !/^\d+$/.test(id) || isFeedbackExcluded(it) || g.ids.has(id) ||
           isSeen(id) || knownBookmarkedIds.has(id) ||
           it.bookmarked) continue;
 

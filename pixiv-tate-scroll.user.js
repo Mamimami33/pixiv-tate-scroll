@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.16
+// @version      3.13.17
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -3991,18 +3991,31 @@
     })();
   }
 
+  // 検索専用。完全一致(5〜8) > タイトル・部分一致(1〜4) > 非一致(0)。
+  const SEARCH_EXACT_TIER = 5;
+  const SEARCH_PARTIAL_TIER = 1;
+  const SEARCH_TITLE_TIER_BONUS = 2;
+  const SEARCH_MULTI_TAG_TIER_BONUS = 1;
+  const SEARCH_INSERT_BOOST = 14;
+  const SEARCH_AUTHOR_LAST_PENALTY = 12;
+  const SEARCH_AUTHOR_SECOND_PENALTY = 5;
+
   function searchWordTier(it, word) {
     const query = String(word || '').normalize('NFKC')
       .trim().toLocaleLowerCase();
     if (!query) return 0;
-    const tags = normTags(it.tags).map(t =>
-      String(t).normalize('NFKC').toLocaleLowerCase());
-    if (tags.includes(query)) return 2;
-    return tags.some(t => t.includes(query)) ? 1 : 0;
+    const tags = [...new Set(normTags(it.tags).map(t =>
+      String(t).normalize('NFKC').toLocaleLowerCase()))];
+    const matches = tags.filter(t => t.includes(query)).length;
+    const titleMatch = String(it.title || '').normalize('NFKC')
+      .toLocaleLowerCase().includes(query);
+    if (!matches && !titleMatch) return 0;
+    return (tags.includes(query) ? SEARCH_EXACT_TIER : SEARCH_PARTIAL_TIER) +
+      (titleMatch ? SEARCH_TITLE_TIER_BONUS : 0) +
+      (matches > 1 ? SEARCH_MULTI_TAG_TIER_BONUS : 0);
   }
 
-  // 検索専用。関連度は最大400点に収め、1000点刻みのtierを維持する。
-  const SEARCH_TASTE_WEIGHT = 0.3;
+  // 関連度は同じtier・好みスコアでの補助にのみ使う。
   const SEARCH_WORD_TAG_WEIGHT = 40;
   const SEARCH_RELATED_TAG_WEIGHT = 24;
 
@@ -4049,6 +4062,9 @@
 
       let best = -1;
       let highest = -Infinity;
+      let highestTier = -Infinity;
+      let highestTaste = -Infinity;
+      let highestRelevance = -Infinity;
 
       for (let i = 0; i < pool.length; i++) {
         const it = pool[i];
@@ -4060,20 +4076,26 @@
           ...it, illustType: it.illustType ?? it.rawType
         };
 
-        // 検索一致の1000点刻みは分散点より優先。
-        let score = searchWordTier(it, word) * 1000 +
-          searchWordRelevance(it, word, relatedTags) +
-          tasteScore(normalized) * SEARCH_TASTE_WEIGHT +
-          (boosts.has(String(it.id)) ? 14 : 0);
+        // 加算でtierをまたがせず、各段階の中は圧縮しない好み順。
+        const tier = searchWordTier(it, word);
+        const taste = tasteScore(normalized);
+        const relevance = searchWordRelevance(it, word, relatedTags);
+        let score = boosts.has(String(it.id)) ? SEARCH_INSERT_BOOST : 0;
 
-        if (author && author === a) score -= 12;
-        if (author && author === b) score -= 5;
+        if (author && author === a) score -= SEARCH_AUTHOR_LAST_PENALTY;
+        if (author && author === b) score -= SEARCH_AUTHOR_SECOND_PENALTY;
 
         score -= identityDiversityPenalty(
           it, source, last, second, repeated
         );
 
-        if (score > highest) {
+        if (tier > highestTier || (tier === highestTier &&
+          (taste > highestTaste || (taste === highestTaste &&
+          (relevance > highestRelevance || (relevance === highestRelevance &&
+          score > highest)))))) {
+          highestTier = tier;
+          highestTaste = taste;
+          highestRelevance = relevance;
           highest = score;
           best = i;
         }

@@ -7276,13 +7276,11 @@
     result.modelRanks.rankADirectBeforeDiversity = rankList(before);
     result.modelRanks.rankADirectAfterDiversity = rankList(after);
 
-    // rankADirectは全API行の比較。その部分集合を比較対象として抽出。
-    const eligibleIds = new Set(preparedRows.map(row => row.id));
-    const directSubset = result.modelRanks.rankADirect
-      .filter(row => eligibleIds.has(String(row.id)))
-      .filter((row, index, all) =>
-        all.findIndex(x => x.id === row.id) === index)
-      .map(row => String(row.id));
+    // 診断rankADirectの同一適格作品集合を、同一の計算済みtasteで比較。
+    // 全API行の順位からの抽出だと別スナップショット/重複行に依存する。
+    const directSubset = eligibleRows.slice().sort((a,b) =>
+      compareSearchRank(productionModel(a), productionModel(b))
+    ).map(row => String(row.api.id));
     const beforeIds = before.map(it => String(it.id));
     const afterIds = after.map(it => String(it.id));
     const sameInputOrder =

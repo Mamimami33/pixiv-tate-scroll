@@ -4022,13 +4022,19 @@
   const searchRankPools = new Map();
   let searchPoolGeneration = 0;
 
+  // APIリクエストで結果集合を決める条件を一箇所で定義する。
+  // ページ番号は共有結果集合の資格とは別に管理する。
+  function searchApiConditions(config) {
+    return {
+      word: String(config.word || ''),
+      order: String(config.order || 'popular_d'),
+      mode: String(config.searchMode || 'all'),
+      s_mode: String(config.matchMode || 's_tag')
+    };
+  }
+
   function searchQueryKey(config) {
-    return JSON.stringify([
-      searchNormalize(config.word),
-      String(config.order || 'popular_d'),
-      String(config.searchMode || 'all'),
-      String(config.matchMode || 's_tag')
-    ]);
+    return JSON.stringify(searchApiConditions(config));
   }
 
   function getSearchRankContext(config, startPage = 1) {
@@ -4041,6 +4047,12 @@
       )];
       ctx = {
         queryKey, word: config.word, queryTokens,
+        config: Object.freeze({
+          word: String(config.word || ''),
+          order: String(config.order || 'popular_d'),
+          searchMode: String(config.searchMode || 'all'),
+          matchMode: String(config.matchMode || 's_tag')
+        }),
         queryType: queryTokens.length > 1 ? 'multi-token' : 'single-token',
         relatedTags: new Set(), searchOrderById: new Map(),
         searchHitIds: new Set(), generation: ++searchPoolGeneration,
@@ -4064,68 +4076,69 @@
     return !!ctx && searchRankPools.get(ctx.queryKey) === ctx;
   }
 
+  // 共有API取得はルートのAbortSignalから独立。各ルートは自分の反映だけ中止する。
   async function loadSearchApiBatch(ctx, config, isCurrent, signal) {
-    if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) {
-      return { stale: true };
+    const routeValid = () => isCurrent() && searchContextValid(ctx) &&
+      !signal?.aborted && searchQueryKey(config) === ctx.queryKey;
+    if (!routeValid()) return { stale: true };
+
+    if (!ctx.busy) {
+      const job = (async () => {
+        let fetched = 0, first = null, error = null;
+        for (let attempt = 0; attempt < SEARCH_BATCH_PAGES;) {
+          if (!searchContextValid(ctx)) return { stale: true };
+          if (ctx.finished) break;
+          const page = ctx.nextPage;
+          if (page > 1000) { ctx.finished = true; break; }
+          if (ctx.fetchedPages.has(page)) { ctx.nextPage++; continue; }
+          let body;
+          try {
+            // ここにはフィード/グリッド固有のsignalを渡さない。
+            body = await fetchJson(searchApiUrl(ctx.config, page));
+          } catch (e) {
+            error = e;
+            break;
+          }
+          if (!searchContextValid(ctx)) return { stale: true };
+          const data = body?.illustManga?.data;
+          if (!Array.isArray(data)) {
+            error = new Error('検索API候補配列なし (p=' + page + ')');
+            break;
+          }
+          if (!first) first = body;
+          if (!ctx.firstBody) ctx.firstBody = body;
+          for (const tag of searchRelatedTags(body)) ctx.relatedTags.add(tag);
+          for (const raw of data) {
+            const it = normalizeCandidate(raw);
+            const id = String(it.id || '');
+            if (!/^\d+$/.test(id) || ctx.searchHitIds.has(id)) continue;
+            ctx.searchHitIds.add(id);
+            ctx.searchOrderById.set(id, ctx.searchOrderById.size);
+            ctx.records.set(id, {
+              ...it, isSearchApiHit: true, queryKey: ctx.queryKey
+            });
+          }
+          ctx.fetchedPages.add(page);
+          ctx.nextPage = page + 1;
+          ctx.total = Number(body?.illustManga?.total);
+          fetched++;
+          attempt++;
+          if (!data.length || (Number.isFinite(ctx.total) &&
+              ctx.total >= 0 && page * 36 >= ctx.total)) ctx.finished = true;
+        }
+        if (!searchContextValid(ctx)) return { stale: true };
+        ctx.failure = error;
+        return { fetched, error, body: first || ctx.firstBody, stale: false };
+      })();
+      ctx.busy = job;
     }
-    if (ctx.busy) {
-      await ctx.busy;
-      return { stale: !isCurrent() || signal?.aborted, shared: true,
-        error: ctx.failure, body: ctx.firstBody, fetched: 0 };
-    }
-    const job = (async () => {
-      let fetched = 0, first = null, error = null;
-      for (let attempt = 0; attempt < SEARCH_BATCH_PAGES;) {
-        if (ctx.finished) break;
-        const page = ctx.nextPage;
-        if (page > 1000) { ctx.finished = true; break; }
-        if (ctx.fetchedPages.has(page)) { ctx.nextPage++; continue; }
-        let body;
-        try {
-          body = await fetchJson(searchApiUrl(config, page), signal);
-        } catch (e) {
-          error = e;
-          break;
-        }
-        if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) {
-          return { stale: true };
-        }
-        const data = body?.illustManga?.data;
-        if (!Array.isArray(data)) {
-          error = new Error('検索API候補配列なし (p=' + page + ')');
-          break;
-        }
-        if (!first) first = body;
-        if (!ctx.firstBody) ctx.firstBody = body;
-        for (const tag of searchRelatedTags(body)) ctx.relatedTags.add(tag);
-        for (const raw of data) {
-          const it = normalizeCandidate(raw);
-          const id = String(it.id || '');
-          if (!/^\d+$/.test(id) || ctx.searchHitIds.has(id)) continue;
-          ctx.searchHitIds.add(id);
-          ctx.searchOrderById.set(id, ctx.searchOrderById.size);
-          ctx.records.set(id, {
-            ...it, isSearchApiHit: true, queryKey: ctx.queryKey
-          });
-        }
-        ctx.fetchedPages.add(page);
-        ctx.nextPage = page + 1;
-        ctx.total = Number(body?.illustManga?.total);
-        fetched++;
-        attempt++;
-        if (!data.length || (Number.isFinite(ctx.total) &&
-            ctx.total >= 0 && page * 36 >= ctx.total)) {
-          ctx.finished = true;
-        }
-      }
-      ctx.failure = error;
-      return { fetched, error, body: first || ctx.firstBody, stale: false };
-    })();
-    ctx.busy = job;
+
+    const sharedJob = ctx.busy;
     try {
-      return await job;
+      const outcome = await sharedJob;
+      return routeValid() ? outcome : { stale: true };
     } finally {
-      if (ctx.busy === job) ctx.busy = null;
+      if (ctx.busy === sharedJob) ctx.busy = null;
     }
   }
 
@@ -4183,9 +4196,13 @@
       title: candidate.title || cached.title || '',
       tags: normTags(candidate.tags).length ? candidate.tags : cached.tags,
       userId: candidate.userId ?? cached.userId,
-      illustType: Number.isFinite(Number(candidate.illustType))
-        ? Number(candidate.illustType)
-        : Number(candidate.rawType ?? cached.illustType)
+      illustType: candidate.illustType != null &&
+        Number.isFinite(Number(candidate.illustType))
+          ? Number(candidate.illustType)
+          : candidate.rawType != null &&
+            Number.isFinite(Number(candidate.rawType))
+              ? Number(candidate.rawType)
+              : Number(cached.illustType ?? cached.rawType)
     };
     const match = searchDiagnosticMatch(it, ctx.word);
     return {
@@ -4335,9 +4352,7 @@
   }
 
   function searchConfigForContext(ctx) {
-    if (!ctx) return null;
-    const [, order, searchMode, matchMode] = JSON.parse(ctx.queryKey);
-    return { word:ctx.word, order, searchMode, matchMode };
+    return ctx ? {...ctx.config} : null;
   }
 
   // 差し込み・テール双方で使う共通の資格判定/順位。通常の検索API経路だけで補充。
@@ -7065,9 +7080,10 @@
   let searchDiagnosticGeneration = 0;
 
   function searchApiUrl(config, page) {
-    const params = new URLSearchParams({word: config.word, order: config.order,
-      mode: config.searchMode, s_mode: config.matchMode, p: String(page)});
-    return '/ajax/search/artworks/' + encodeURIComponent(config.word) + '?' + params;
+    const conditions = searchApiConditions(config);
+    const params = new URLSearchParams({...conditions, p: String(page)});
+    return '/ajax/search/artworks/' +
+      encodeURIComponent(conditions.word) + '?' + params;
   }
 
   function searchDiagnosticContext() {

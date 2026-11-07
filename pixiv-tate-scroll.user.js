@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.17
+// @version      3.13.18
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -4429,53 +4429,16 @@
     return work;
   }
 
-  // 検索専用: 検索API候補のみを検索ワード一致優先で並べ替える。
-  async function buildSearchRankedBatch(rawSearch, word, previous = [], excludeIds = [], signal, relatedTags = []) {
-    const exclusions = [...seenTimes.keys(), ...excludeIds];
-    const prepared = await prepareCandidates(rawSearch, {
-      excludeIds: exclusions, enrichTop: 0, rank: tasteScore
-    });
-    const searchItems = prepared.filter(it =>
-      !skipStrong(it.id) && !isSeen(it.id) &&
-      !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
+
+  // 共通プールの未表示候補を現在の表示済みセットから除外して評価。
+  async function buildSearchRankedBatch(
+    ctx, previous = [], excludeIds = [], isCurrent = () => true, signal
+  ) {
+    const candidates = await prepareSearchRankCandidates(
+      ctx, excludeIds, isCurrent, signal
     );
-    if (signal?.aborted || !searchItems.length) return [];
-    return searchPrioritize(
-      searchItems, word, previous, new Set(), null, Infinity, relatedTags
-    );
-  }
-
-  function searchGridDiversify(items) {
-    if (searchGrid.searchBoosted && searchGrid.config?.word) {
-      return searchPrioritize(
-        items, searchGrid.config.word, searchGrid.items.slice(-2)
-      );
-    }
-
-    const pool = items.map(it => ({ it, base: tasteScore(it) }));
-    const output = [];
-    const previous = searchGrid.items.slice(-2);
-
-    while (pool.length) {
-      const tail = [...previous, ...output];
-      const last = String(tail.at(-1)?.userId || '');
-      const second = String(tail.at(-2)?.userId || '');
-      let best = 0, high = -Infinity;
-
-      for (let i = 0; i < pool.length; i++) {
-        const author = String(pool[i].it.userId || '');
-        let score = pool[i].base;
-        if (author && author === last) score -= 12;
-        if (author && author === second) score -= 5;
-        if (score > high) {
-          high = score;
-          best = i;
-        }
-      }
-
-      output.push(pool.splice(best, 1)[0].it);
-    }
-    return output;
+    if (!candidates || !isCurrent()) return null;
+    return searchRankCandidates(ctx, candidates, { previous });
   }
 
   function searchGridThumbnail(it) {
@@ -4771,73 +4734,56 @@
     }
   }
 
+
   async function searchGridLoadMore() {
     const g = searchGrid;
     if (!g.open || g.busy || g.finished || !g.config) return false;
     g.busy = true;
     g.retry.hidden = true;
     g.status.textContent = '読み込み中…';
-    const token = g.token;
+    const token = g.token, config = g.config;
     const controller = new AbortController();
     g.controller = controller;
-    const collected = [];
-    const relatedTags = new Set();
-    let page = g.page, finished = false, error = null;
+    const ctx = getSearchRankContext(config, g.page);
+    const valid = () => g.open && token === g.token &&
+      g.config === config && searchContextValid(ctx);
     try {
-      for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
-        if (page > 1000) { finished = true; break; }
-        const url = searchApiUrl(g.config, page);
-        let body;
-        try { body = await fetchJson(url, controller.signal); }
-        catch (e) { error = e; break; }
-        if (!g.open || token !== g.token) return false;
-        const data = body?.illustManga?.data;
-        if (!Array.isArray(data)) {
-          error = new Error(`検索 p=${page}: 候補配列がありません`);
-          break;
-        }
-        if (!g.tagsReady) {
-          renderGridTags(body);
-          g.tagsReady = true;
-        }
-        searchRelatedTags(body).forEach(tag => relatedTags.add(tag));
-        collected.push(...data);
-        const total = Number(body?.illustManga?.total);
-        if (!data.length || (Number.isFinite(total) && total >= 0 &&
-          page * 36 >= total)) finished = true;
-        page++;
-        if (finished) break;
+      const loaded = await loadSearchApiBatch(
+        ctx, config, valid, controller.signal
+      );
+      if (!valid() || loaded.stale) return false;
+      if (!g.tagsReady && ctx.firstBody) {
+        renderGridTags(ctx.firstBody);
+        g.tagsReady = true;
       }
-      if (!g.open || token !== g.token) return false;
-      if (collected.length) {
-        const previous = g.items.slice(-2);
-        const ranked = await buildSearchRankedBatch(
-          collected, g.config.word, previous, [...g.ids], controller.signal,
-          [...relatedTags]
-        );
-        if (!g.open || token !== g.token) return false;
-        appendGridCards(ranked); // 今あるカードは移動しない
-      }
-      g.page = page; // 失敗ページは飛ばさない
-      g.finished = finished;
-      if (error) {
-        g.status.textContent = `読み込み失敗: ${error.message || error}`;
+      const ranked = await buildSearchRankedBatch(
+        ctx, g.items.slice(-2), [...g.ids], valid, controller.signal
+      );
+      if (!valid() || !ranked || controller.signal.aborted) return false;
+      // 表示済みカードは移動せず、新規取得候補だけを末尾へ追加。
+      if (!valid()) return false;
+      appendGridCards(ranked);
+      g.page = ctx.nextPage;
+      g.finished = ctx.finished;
+      if (loaded.error) {
+        g.status.textContent =
+          '読み込み失敗: ' + (loaded.error.message || loaded.error);
         g.retry.textContent = '再試行';
         g.retry.hidden = false;
-        console.warn('[PTS grid]', error);
-      } else if (finished) {
-        g.status.textContent = g.items.length ? `${g.items.length}件` : '該当がありません';
+      } else if (ctx.finished) {
+        g.status.textContent = g.items.length ? g.items.length + '件' :
+          '該当がありません';
       } else {
-        g.status.textContent = `${g.items.length}件表示中`;
+        g.status.textContent = g.items.length + '件表示中';
         if (g.scroll.scrollHeight <= g.scroll.clientHeight + 4) {
           g.retry.textContent = '続きを取得';
           g.retry.hidden = false;
         }
       }
-      return !error;
+      return !loaded.error;
     } catch (e) {
-      if (g.open && token === g.token) {
-        g.status.textContent = `読み込み失敗: ${e.message || e}`;
+      if (valid()) {
+        g.status.textContent = '読み込み失敗: ' + (e.message || e);
         g.retry.textContent = '再試行';
         g.retry.hidden = false;
         console.warn('[PTS grid]', e);
@@ -5161,81 +5107,57 @@
     bar.hidden = false;
   }
 
+
   async function searchLoadMore() {
     if (mode !== 'search' || !searchConfig || searchBusy ||
-        searchFinished || overlay?.style.display === 'none') return;
+      searchFinished || overlay?.style.display === 'none') return;
     if (Date.now() - searchLastFailure < 4000) return;
     searchBusy = true;
-    searchLastFailure = 0;
     const generation = feedGeneration;
-    const collected = [];
-    const relatedTags = new Set();
-    let page = searchPage, nextPage = searchPage, reachedEnd = false, failure = null;
+    const config = searchConfig;
+    const ctx = getSearchRankContext(config, searchPage);
+    const valid = () => generation === feedGeneration &&
+      mode === 'search' && searchConfig === config &&
+      searchContextValid(ctx);
     try {
-      for (let n = 0; n < SEARCH_BATCH_PAGES; n++) {
-        page = nextPage;
-        if (page > 1000) { reachedEnd = true; break; }
-        const url = searchApiUrl(searchConfig, page);
-        let body;
-        try { body = await fetchJson(url); }
-        catch (e) { failure = e; break; }
-        if (generation !== feedGeneration || mode !== 'search') return;
-        const data = body?.illustManga?.data;
-        if (!Array.isArray(data)) {
-          failure = new Error(`検索API p=${page}: dataが配列ではありません`);
-          break;
-        }
-        if (page === searchConfig.page) {
-          searchTagCandidates = findSearchTagCandidates(body, searchConfig.word);
-          renderSearchTagCandidates();
-        }
-        searchRelatedTags(body).forEach(tag => relatedTags.add(tag));
-        collected.push(...data);
-        nextPage = page + 1;
-        const total = Number(body?.illustManga?.total);
-        if (!data.length || (Number.isFinite(total) && total >= 0 &&
-          page * 36 >= total)) {
-          reachedEnd = true;
-          break;
-        }
+      const loaded = await loadSearchApiBatch(ctx, config, valid);
+      if (!valid() || loaded.stale) return; // 取得後の世代検証
+      if (!searchTagCandidates.length && ctx.firstBody) {
+        searchTagCandidates = findSearchTagCandidates(ctx.firstBody, config.word);
+        renderSearchTagCandidates();
       }
-      if (generation !== feedGeneration || mode !== 'search') return;
-      if (collected.length) {
-        const previous = slides.slice(-2);
-        const ranked = await buildSearchRankedBatch(
-          collected, searchConfig.word, previous, [], undefined, [...relatedTags]
-        );
-        if (generation !== feedGeneration || mode !== 'search') return;
-        const ids = new Set(slides.map(s => String(s.id)));
-        const selected = ranked.filter(it => {
-          const id = String(it.id);
-          if (ids.has(id) || isSeen(id) || skipStrong(id) ||
-              knownBookmarkedIds.has(id) || it.bookmarked) return false;
-          ids.add(id);
-          return true;
-        });
-        const first = slides.length === 0;
-        if (selected.length) {
-          addItems(candidatesToSlides(selected));
-          if (first) markCurrentFromScroll();
-        }
+      const ids = new Set(slides.map(s => String(s.id)));
+      const ranked = await buildSearchRankedBatch(
+        ctx, slides.slice(-2), [...ids], valid
+      );
+      if (!valid() || !ranked) return; // 候補準備後の世代検証
+      const selected = ranked.filter(it => {
+        const id = String(it.id);
+        if (ids.has(id) || isSeen(id) || skipStrong(id) ||
+          knownBookmarkedIds.has(id) || it.bookmarked) return false;
+        ids.add(id);
+        return true;
+      });
+      if (!valid()) return; // DOM反映直前の世代検証
+      const first = slides.length === 0;
+      if (selected.length) {
+        addItems(markSearchSlides(candidatesToSlides(selected), ctx));
+        if (first) markCurrentFromScroll();
       }
-      searchPage = nextPage;
-      searchFinished = reachedEnd;
-      searchLastFailure = failure ? Date.now() : 0;
-      if (failure) console.warn('[PTS search]', failure);
-      if (!slides.length && (searchFinished || failure)) {
+      searchPage = ctx.nextPage;
+      searchFinished = ctx.finished;
+      searchLastFailure = loaded.error ? Date.now() : 0;
+      if (loaded.error) console.warn('[PTS search]', loaded.error);
+      if (!slides.length && (ctx.finished || loaded.error)) {
         const counter = overlay?.querySelector('.pts-counter');
-        if (counter) counter.textContent = failure
-          ? '検索取得失敗: ' + (failure.message || failure)
+        if (counter) counter.textContent = loaded.error
+          ? '検索取得失敗: ' + (loaded.error.message || loaded.error)
           : '表示可能な検索結果がありません';
       }
     } catch (e) {
-      searchLastFailure = Date.now();
-      console.warn('[PTS search]', e);
-      if (!slides.length) {
-        const counter = overlay?.querySelector('.pts-counter');
-        if (counter) counter.textContent = '検索取得失敗： ' + (e.message || e);
+      if (valid()) {
+        searchLastFailure = Date.now();
+        console.warn('[PTS search]', e);
       }
     } finally {
       if (generation === feedGeneration) searchBusy = false;

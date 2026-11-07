@@ -47,6 +47,7 @@
       frames: null, zipUrl: null, frameBase: null, frameExt: null,
       sectionEl: null, mainImg: null, titleEl: null, authorEl: null, pageChip: null,
       animTimer: null, animIdx: 0, frameUrls: null, isCurrent: false,
+      ugoiraPlayer:null, ugoiraCanvas:null, animSeekMs:null,
       tags: null, userId: null, bookmarked: false, bookmarkBtn: null,
     };
   }
@@ -352,7 +353,7 @@
           if (target && s.mainImg.getAttribute('src') !== target) {
             s.mainImg.src = target;
           }
-        } else if (s.isCurrent) {
+        } else if (s.isCurrent && s.kind !== 'ugoira') {
           swapToOriginal(s, s.mainImg, pair);
         }
       }
@@ -526,94 +527,205 @@
       : '↻ うごイラ読み込み中…';
   }
 
-  function startUgoira(s) {
-    if (s.animTimer || !s.frameUrls?.length ||
-        !s.frames?.length || !s.isCurrent) return;
+  // v3.13.19: 画面表示は1枚のcanvas。時刻を基準にrAFで表示コマを決める。
+  // エンコードされたフレームURLは維持し、デコード済み画像のみ最大4枚に制限。
+  const UGOIRA_DECODE_AHEAD = 2;
+  const UGOIRA_DECODE_LIMIT = 4;
 
-    setUgoiraStatus(s, 'playing');
-    upgradeUgoiraHiRes(s);
-
-    if (s.pageChip) {
-      s.pageChip.style.display = 'block';
-      s.pageChip.textContent = 'うごイラ再生中';
-    }
-
-    const total = s.frames.reduce(
-      (sum, f) => sum + (f.delay || 100), 0
-    );
-
-    s.animTotal = total;
-    if (s.seekEl) s.seekEl.style.display = 'block';
-
-    const step = () => {
-      if (!s.frameUrls?.length || !s.isCurrent) {
-        s.animTimer = null;
-        return;
-      }
-
-      const i = s.animIdx % s.frameUrls.length;
-      const url = s.frameUrls[i];
-
-      if (url && s.mainImg && s.mainImg.src !== url) {
-        s.mainImg.src = url;
-      }
-
-      let elapsed = 0;
-      for (let k = 0; k < i; k++) {
-        elapsed += s.frames[k]?.delay || 100;
-      }
-
-      const pct = total > 0 ? elapsed / total * 100 : 0;
-
-      if (s.seekFill) s.seekFill.style.width = pct + '%';
-      if (s.seekKnob) s.seekKnob.style.left = pct + '%';
-
-      const delay = s.frames[i]?.delay || 100;
-
-      s.animIdx++;
-      s.loopSteps = (s.loopSteps || 0) + 1;
-
-      s.animTimer = setTimeout(() => {
-        s.animTimer = null;
-        if (!s.isCurrent) return;
-
-        if (s.loopSteps >= s.frameUrls.length) {
-          s.loopSteps = 0;
-          onUgoiraLoop(s);
-        }
-
-        step();
-      }, delay);
-    };
-
-    step();
+  function ugoiraTimeline(frames) {
+    const starts = [0];
+    for (const frame of frames) starts.push(starts.at(-1) +
+      (Number(frame?.delay) > 0 ? Number(frame.delay) : 100));
+    return starts;
   }
 
-  // シークバーの位置に合わせてフレームを表示する（ドラッグ中のプレビュー）
-  function dragUgoira(s, ratio) {
-    if (!s.frameUrls || !s.frames) return;
-    const total = s.animTotal || s.frames.reduce((a, f) => a + (f.delay || 100), 0);
-    s.animTotal = total;
-    let target = ratio * total;
-    let idx = 0;
-    let elapsed = 0;
-    while (idx < s.frames.length - 1 && target >= (s.frames[idx].delay || 100)) {
-      target -= (s.frames[idx].delay || 100);
-      elapsed += (s.frames[idx].delay || 100);
-      idx++;
+  function ugoiraFrameAt(starts, time) {
+    let low = 0, high = starts.length - 2;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (starts[mid] <= time) low = mid;
+      else high = mid - 1;
     }
-    // 表示したフレームの次から再生を再開する（animIdxは「次に表示するフレーム」の意味で統一）
-    s.animIdx = idx + 1;
-    const url = s.frameUrls[idx % s.frameUrls.length];
-    if (url && s.mainImg) s.mainImg.src = url;
-    const pct = total > 0 ? (elapsed / total) * 100 : 0;
-    if (s.seekFill) s.seekFill.style.width = pct + '%';
-    if (s.seekKnob) s.seekKnob.style.left = pct + '%';
+    return Math.max(0, low);
+  }
+
+  function ensureUgoiraCanvas(s) {
+    const holder = s.sectionEl?.querySelector('.pts-holder');
+    if (!holder) return null;
+    if (s.ugoiraCanvas?.parentElement !== holder) {
+      s.ugoiraCanvas?.remove();
+      const canvas = document.createElement('canvas');
+      canvas.className = 'pts-ugoira-canvas';
+      holder.appendChild(canvas);
+      s.ugoiraCanvas = canvas;
+      if (s.ugoiraPlayer) s.ugoiraPlayer.displayed = -1;
+    }
+    return s.ugoiraCanvas;
+  }
+
+  function clearUgoiraDecodeCache(s) {
+    const player = s.ugoiraPlayer;
+    if (!player) return;
+    player.generation++;
+    player.ready.clear();
+    player.loading.clear();
+    player.urls = s.frameUrls;
+  }
+
+  function queueUgoiraFrame(s, index) {
+    const player = s.ugoiraPlayer;
+    const urls = s.frameUrls;
+    if (!player || !urls?.length) return;
+    const i = (index + urls.length) % urls.length;
+    if (player.ready.has(i) || player.loading.has(i)) return;
+    if (player.loading.size >= UGOIRA_DECODE_AHEAD + 1) return;
+    const url = urls[i];
+    if (!url) return;
+    const img = new Image();
+    img.decoding = 'async';
+    const generation = player.generation;
+    const task = new Promise((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('ugoira frame load failed'));
+      img.src = url;
+    }).then(() => img.decode ? img.decode() : undefined)
+      .then(() => {
+        if (s.ugoiraPlayer !== player || player.generation !== generation ||
+            s.frameUrls !== urls || !s.isCurrent) return;
+        if (!img.naturalWidth || !img.naturalHeight) return;
+        // Insertion order acts as a small decoded image LRU.
+        player.ready.delete(i);
+        player.ready.set(i, img);
+        if (s.seekDragging && s.animIdx === i) renderUgoiraFrame(s, i);
+        while (player.ready.size > UGOIRA_DECODE_LIMIT) {
+          const victim = [...player.ready.keys()].find(
+            key => key !== player.displayed
+          );
+          if (victim === undefined) break;
+          player.ready.delete(victim);
+        }
+      }).catch(() => {
+        // Decode may fail; retain the last fully painted canvas frame.
+      }).finally(() => {
+        if (player.generation === generation) player.loading.delete(i);
+      });
+    player.loading.set(i, task);
+  }
+
+  function renderUgoiraFrame(s, index) {
+    const player = s.ugoiraPlayer;
+    const img = player?.ready.get(index);
+    const canvas = ensureUgoiraCanvas(s);
+    if (!player || !img || !canvas) return false;
+    const width = img.naturalWidth, height = img.naturalHeight;
+    if (!width || !height) return false;
+    const ctx = canvas.getContext('2d', {alpha:false});
+    if (!ctx) return false;
+    // Resize only if dimensions change; never clear the visible frame first.
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    try {
+      ctx.drawImage(img, 0, 0, width, height);
+    } catch (_) {
+      return false;
+    }
+    player.displayed = index;
+    s.animIdx = index;
+    s.sectionEl?.querySelector('.pts-holder')?.classList.add('pts-ugoira-active');
+    return true;
+  }
+
+  function startUgoira(s) {
+    if (s.animTimer != null || !s.frameUrls?.length ||
+        !s.frames?.length || !s.isCurrent) return;
+    if (!ensureUgoiraCanvas(s)) return;
+    const timeline = ugoiraTimeline(s.frames);
+    const total = timeline.at(-1);
+    if (!(total > 0)) return;
+    s.animTotal = total;
+    if (!s.ugoiraPlayer) s.ugoiraPlayer = {
+      urls:s.frameUrls, ready:new Map(), loading:new Map(),
+      generation:0, displayed:-1, elapsed:0, started:null,
+      loops:0, timeline, total
+    };
+    const player=s.ugoiraPlayer;
+    if (player.urls !== s.frameUrls) clearUgoiraDecodeCache(s);
+    player.timeline=timeline;
+    player.total=total;
+    player.started=null;
+    player.loops=0;
+    player.elapsed=Number.isFinite(s.animSeekMs)
+      ? ((s.animSeekMs % total) + total) % total : 0;
+    s.animSeekMs=null;
+    setUgoiraStatus(s,'playing');
+    void upgradeUgoiraHiRes(s);
+    if (s.pageChip) {
+      s.pageChip.style.display='block';
+      s.pageChip.textContent='うごイラ再生中';
+    }
+    if (s.seekEl) s.seekEl.style.display='block';
+
+    const tick = now => {
+      if (!s.isCurrent || s.ugoiraPlayer !== player ||
+          !s.frameUrls?.length || s.seekDragging) {
+        s.animTimer=null;
+        return;
+      }
+      if (player.urls !== s.frameUrls) {
+        clearUgoiraDecodeCache(s);
+        player.displayed=-1;
+      }
+      if (player.started == null) player.started=now-player.elapsed;
+      const elapsed=Math.max(0, now-player.started);
+      const cycles=Math.floor(elapsed / total);
+      if (cycles > player.loops) {
+        // rAF background throttling must not replay thousands of callbacks.
+        for (let i=0;i<Math.min(cycles-player.loops,20);i++) onUgoiraLoop(s);
+        player.loops=cycles;
+      }
+      player.elapsed=elapsed % total;
+      const index=ugoiraFrameAt(timeline,player.elapsed);
+      queueUgoiraFrame(s,index);
+      for(let n=1;n<=UGOIRA_DECODE_AHEAD;n++) queueUgoiraFrame(s,index+n);
+      if(player.ready.has(index)&&player.displayed!==index)renderUgoiraFrame(s,index);
+      const pct=timeline[index]/total*100;
+      if(s.seekFill)s.seekFill.style.width=pct+'%';
+      if(s.seekKnob)s.seekKnob.style.left=pct+'%';
+      s.animTimer=requestAnimationFrame(tick);
+    };
+    s.animTimer=requestAnimationFrame(tick);
+  }
+
+  function dragUgoira(s,ratio) {
+    if(!s.frameUrls?.length||!s.frames?.length)return;
+    const timeline=ugoiraTimeline(s.frames);
+    const total=timeline.at(-1);
+    s.animTotal=total;
+    const elapsed=Math.max(0,Math.min(total-0.001,ratio*total));
+    const index=ugoiraFrameAt(timeline,elapsed);
+    s.animSeekMs=elapsed;
+    s.animIdx=index;
+    if(s.ugoiraPlayer) {
+      s.ugoiraPlayer.elapsed=elapsed;
+      s.ugoiraPlayer.started=null;
+      queueUgoiraFrame(s,index);
+      if(s.ugoiraPlayer.ready.has(index))renderUgoiraFrame(s,index);
+    }
+    const pct=timeline[index]/total*100;
+    if(s.seekFill)s.seekFill.style.width=pct+'%';
+    if(s.seekKnob)s.seekKnob.style.left=pct+'%';
   }
 
   function stopUgoira(s) {
-    if (s.animTimer) { clearTimeout(s.animTimer); s.animTimer = null; }
-    s.loopSteps = 0;
+    if(s.animTimer!=null){
+      cancelAnimationFrame(s.animTimer);
+      s.animTimer=null;
+    }
+    if(s.ugoiraPlayer){
+      s.animSeekMs=s.animSeekMs??s.ugoiraPlayer.elapsed;
+      clearUgoiraDecodeCache(s);
+      s.ugoiraPlayer.started=null;
+    }
   }
 
   function setChip(s, text) {
@@ -669,11 +781,6 @@
 
         s.frameUrls = urls;
 
-        urls.forEach(url => {
-          const img = new Image();
-          img.src = url;
-        });
-
         if (s.isCurrent) startUgoira(s);
         return;
       }
@@ -704,6 +811,7 @@
         const old = s.frameUrls;
         s.frameUrls = urls;
         s.hiDone = true;
+        clearUgoiraDecodeCache(s);
         // 旧フレームは表示中imgがまだ参照していることがある。即解放すると画像が消えるので遅らせて解放
         if (old) setTimeout(() => {
           old.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
@@ -3742,6 +3850,13 @@
         max-width:100%;max-height:100%;
         object-fit:contain!important;animation:none!important
       }
+      #pts-overlay .pts-holder .pts-ugoira-canvas{
+        display:block;position:absolute;inset:0;width:100%;height:100%;
+        object-fit:contain;pointer-events:none
+      }
+      #pts-overlay .pts-holder.pts-ugoira-active > .pts-img{
+        visibility:hidden
+      }
       #pts-overlay .pts-holder{touch-action:pan-x pan-y}
       #pts-overlay .pts-slide.pts-current .pts-holder{
         animation:ptsIn .16s ease-out
@@ -5848,6 +5963,11 @@
   // スライドの後片付け（タイマー・通信・Blobを残さない。長時間閲覧でのメモリ圧迫対策）
   function cleanupSlide(s) {
     stopUgoira(s);
+    s.ugoiraPlayer=null;
+    s.animSeekMs=null;
+    s.ugoiraCanvas?.remove();
+    s.ugoiraCanvas=null;
+    s.sectionEl?.querySelector('.pts-holder')?.classList.remove('pts-ugoira-active');
     if (s.loadWatch) { clearTimeout(s.loadWatch); s.loadWatch = null; }
     if (s.ugoiraAbort) { try { s.ugoiraAbort.abort(); } catch (e) {} s.ugoiraAbort = null; }
     if (s.resolveAbort) { try { s.resolveAbort.abort(); } catch (e) {} }
@@ -5903,6 +6023,11 @@
       s.metaPromise = null;
 
       s.frameUrls = null;
+      s.ugoiraPlayer = null;
+      s.animSeekMs = null;
+      s.ugoiraCanvas?.remove();
+      s.ugoiraCanvas = null;
+      s.sectionEl?.querySelector('.pts-holder')?.classList.remove('pts-ugoira-active');
       s.frames = null;
       s.pairs = null;
       s.zipUrl = null;
@@ -5910,7 +6035,6 @@
       s.zipFull = null;
       s.hiDone = false;
       s.animIdx = 0;
-      s.loopSteps = 0;
       s.origLoading = false;
       s.forceRefetch = true;
 

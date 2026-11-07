@@ -151,6 +151,7 @@
       s.tags = normTags(body.tags);
       s.userId = body.userId == null
         ? null : String(body.userId);
+      if (s.isCurrent) syncDock();
 
       if (isFeedbackExcluded(s)) {
         removeFeedbackSlides();
@@ -3909,6 +3910,171 @@
     document.head.appendChild(style);
   }
 
+  // 作者フォローはpixivの既存Web API。既フォロー状態は作者情報から検証する。
+  const followState = {
+    account: '', cache: new Map(), pending: new Map(), sending: new Set()
+  };
+
+  function followAccountSync() {
+    const account = getMyUserId();
+    if (followState.account !== account) {
+      followState.account = account;
+      followState.cache.clear();
+      followState.pending.clear();
+      followState.sending.clear();
+    }
+    return account;
+  }
+
+  function followButtonState(s) {
+    const account = followAccountSync();
+    const id = String(s?.userId || '');
+    if (!s || !/^[1-9]\d*$/.test(id)) return 'no-author';
+    if (!account) return 'login-required';
+    if (account === id) return 'self';
+    if (followState.sending.has(id)) return 'sending';
+    if (!followState.cache.has(id)) return 'unknown';
+    return followState.cache.get(id) === true ? 'following' :
+      followState.cache.get(id) === false ? 'not-following' : 'error';
+  }
+
+  function syncFollowButton() {
+    const button = overlay?.querySelector('.pts-follow-author');
+    if (!button) return;
+    const slide = slides[currentIndex()];
+    const id = String(slide?.userId || '');
+    const state = followButtonState(slide);
+    const labels = {
+      'no-author': '作者情報を取得中',
+      'login-required': 'フォロー（ログインが必要）',
+      self: '自分の作品',
+      sending: 'フォロー処理中…',
+      unknown: 'フォロー確認中…',
+      following: '✓ フォロー済み',
+      'not-following': '作者をフォロー',
+      error: 'フォロー状態を再確認'
+    };
+    button.textContent = labels[state];
+    button.disabled = searchGrid.open ||
+      !['not-following', 'error'].includes(state);
+    if (state === 'unknown') {
+      void checkFollowStatus(id);
+    }
+  }
+
+  async function readFollowStatus(authorId) {
+    const response = await fetch(
+      '/ajax/user/' + encodeURIComponent(authorId) + '?full=1',
+      {credentials:'same-origin',cache:'no-store'}
+    );
+    if (!response.ok) throw new Error('作者情報の取得失敗（HTTP '+response.status+'）');
+    const json = await response.json();
+    if (json?.error !== false || typeof json?.body?.isFollowed !== 'boolean') {
+      throw new Error('フォロー状態を確認できません');
+    }
+    return json.body.isFollowed;
+  }
+
+  async function checkFollowStatus(authorId, force = false) {
+    const account = followAccountSync();
+    if (!account || !/^[1-9]\d*$/.test(authorId) ||
+        account === authorId) return null;
+    if (!force && followState.cache.has(authorId))
+      return followState.cache.get(authorId);
+    if (followState.pending.has(authorId))
+      return followState.pending.get(authorId);
+    const promise = (async () => {
+      try {
+        const following = await readFollowStatus(authorId);
+        if (getMyUserId() === account) {
+          followState.cache.set(authorId, following);
+        }
+        return following;
+      } catch (e) {
+        if (getMyUserId() === account) {
+          followState.cache.set(authorId, null);
+          console.warn('[PTS follow]', e);
+        }
+        return null;
+      } finally {
+        if (getMyUserId() === account) {
+          followState.pending.delete(authorId);
+          // 描画更新に再照会を走らせない。失敗時はユーザー操作で再試行。
+          const shown = slides[currentIndex()];
+          if (String(shown?.userId || '') === authorId) syncFollowButton();
+        }
+      }
+    })();
+    followState.pending.set(authorId, promise);
+    return promise;
+  }
+
+  async function followCurrentAuthor() {
+    const slide = slides[currentIndex()];
+    if (!slide || searchGrid.open || !overlay ||
+        overlay.style.display === 'none') return;
+    if (!slide.userId && !slide.resolved) {
+      try { await resolveSlide(slide); } catch (_) {}
+    }
+    if (slides[currentIndex()] !== slide || searchGrid.open) return;
+    const id = String(slide.userId || '');
+    if (!/^[1-9]\d*$/.test(id)) {
+      window.alert('作者IDを取得できませんでした。');
+      return;
+    }
+    const account = followAccountSync();
+    if (!account) {
+      window.alert('作者をフォローするにはpixivへのログインが必要です。');
+      return;
+    }
+    if (account === id || followState.sending.has(id)) return;
+    const state = await checkFollowStatus(id, true);
+    if (state === true || state === null) {
+      syncFollowButton();
+      if (state === null) window.alert('フォロー状態を確認できません。再試行してください。');
+      return;
+    }
+    if (slides[currentIndex()] !== slide || searchGrid.open ||
+        getMyUserId() !== account) return;
+    followState.sending.add(id);
+    syncFollowButton();
+    try {
+      const token = await getCsrfToken();
+      if (!token) throw new Error('CSRFトークンを取得できません');
+      // pixiv Webの作者フォロー操作。成功とは限らないため必ずGETで検証する。
+      const body = new URLSearchParams({
+        mode:'add', type:'user', user_id:id,
+        tag:'', restrict:'0', format:'json'
+      });
+      const response = await fetch('/bookmark_add.php', {
+        method:'POST',credentials:'same-origin',
+        headers:{'x-csrf-token':token,'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+        body:body.toString()
+      });
+      if (!response.ok) {
+        if ([401,403].includes(response.status)) {
+          csrfToken=null;csrfTokenSource='';csrfPreferHome=true;
+        }
+        throw new Error('フォローAPI HTTP '+response.status);
+      }
+      // 当該Web APIの応答形式には差異があるため、状態確認結果を唯一の成功根拠とする。
+      const verified = await readFollowStatus(id);
+      if (getMyUserId() !== account) return;
+      if (verified !== true) throw new Error(
+        'フォロー済み状態を確認できません。pixiv側の認証／追加認証を確認してください'
+      );
+      followState.cache.set(id, true);
+    } catch (e) {
+      followState.cache.delete(id);
+      console.warn('[PTS follow] フォロー失敗', e);
+      window.alert('作者をフォローできませんでした: ' +
+        String(e?.message || e).slice(0,160));
+    } finally {
+      if (getMyUserId() === account) followState.sending.delete(id);
+      syncFollowButton();
+    }
+  }
+
   function installExperienceUI() {
     if (experienceInstalled || !overlay) return;
     experienceInstalled = true;
@@ -3952,6 +4118,8 @@
 
     addButton('pts-not-interested', '興味なし', () => { void dismissCurrentWork(); });
     addButton('pts-mute-author', '作者をミュート', () => { void dismissCurrentWork(true); });
+    addButton('pts-follow-author', '作者をフォロー',
+      () => { void followCurrentAuthor(); });
     addButton('pts-return-grid', '検索結果へ戻る',
       returnToSearchGrid).hidden = true;
     addButton('pts-open-original', 'pixivで開く', () => {

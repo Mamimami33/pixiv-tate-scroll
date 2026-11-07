@@ -7077,18 +7077,22 @@
     route: location.href};
   }
 
+
+  // 診断と本番で共用する4段階tierと直接一致の証拠。
   function searchDiagnosticMatch(it, word) {
-    const norm = v => String(v || '').normalize('NFKC').trim().toLocaleLowerCase();
-    const query = norm(word), tokens = [...new Set(query.split(/\s+/u).filter(Boolean))];
-    const title = norm(it.title), tags = normTags(it.tags).map(norm);
-    const tokenEvidence = tokens.map(token => ({token,
-      exactTags: tags.filter(t => t === token),
+    const query = searchNormalize(word);
+    const tokens = [...new Set(query.split(/\s+/u).filter(Boolean))];
+    const title = searchNormalize(it.title), tags = normTags(it.tags).map(searchNormalize);
+    const tokenEvidence = tokens.map(token => ({
+      token, exactTags: tags.filter(t => t === token),
       partialTags: tags.filter(t => t !== token && t.includes(token)),
-      titleContains: title.includes(token)}));
+      titleContains: title.includes(token)
+    }));
     const coverageCount = tokenEvidence.filter(e =>
       e.exactTags.length || e.partialTags.length || e.titleContains).length;
     const exactTagTokenCount = tokenEvidence.filter(e => e.exactTags.length).length;
     const titleTokenCount = tokenEvidence.filter(e => e.titleContains).length;
+    const partialTagTokenCount = tokenEvidence.filter(e => e.partialTags.length).length;
     const titleContainsQuery = !!query && title.includes(query);
     const exactTagMatches = tags.filter(t => t === query);
     const partialTagMatches = tags.filter(t => t !== query && t.includes(query));
@@ -7096,14 +7100,59 @@
     const tier = multi ? (coverageCount === tokens.length ?
       (exactTagTokenCount ? 3 : 2) : coverageCount ? 1 : 0) :
       (titleContainsQuery && exactTagMatches.length ? 3 : exactTagMatches.length ? 2 :
-        titleContainsQuery || partialTagMatches.length ? 1 : 0);
-    return {tier, tierReason: (multi ? 'multi-token' : 'single-token') + ':tier-' + tier,
+       titleContainsQuery || partialTagMatches.length ? 1 : 0);
+    return {
+      tier, tierReason: (multi ? 'multi-token' : 'single-token') + ':tier-' + tier,
       appliedRule: multi ? 'multi-token' : 'single-token', titleContainsQuery,
       titleExactQuery: !!query && title === query, exactTagMatches, partialTagMatches,
       coverageCount, coverageTotal: tokens.length,
       coverageRatio: tokens.length ? coverageCount / tokens.length : 0,
-      exactTagTokenCount, titleTokenCount, tokenEvidence, ruleVersion: '1.0.0'};
+      exactTagTokenCount, titleTokenCount, partialTagTokenCount,
+      directRelevanceKey: [coverageCount, exactTagTokenCount,
+        titleTokenCount, partialTagTokenCount],
+      tokenEvidence, ruleVersion: '3.13.18'
+    };
   }
+
+  // Raw/Softは実験専用。履歴・tasteScore本体は変更しない。
+  function searchDiagnosticTasteVariants(taste) {
+    const tagCap = 30, authorCap = 27;
+    const soft = (v, cap) => v <= cap
+      ? v : cap + cap * (1 - Math.exp(-(v-cap)/cap));
+    const common = taste.ugoira + taste.r18 +
+      taste.negativePenalty + taste.other;
+    return {
+      raw: Math.max(0, taste.tagRaw + taste.authorRaw + common),
+      soft: Math.max(0,
+        soft(taste.tagRaw, tagCap) + soft(taste.authorRaw, authorCap) + common),
+      rule: 'diagnostic-only; raw uncapped; soft=cap+cap*(1-exp(-(raw-cap)/cap)); legacy penalty fixed'
+    };
+  }
+
+  function searchDiagnosticSaturation(rows) {
+    const n = rows.length;
+    const totals = rows.map(r => r.taste.total);
+    const top = n ? Math.max(...totals) : null;
+    const topTied = top === null ? 0 : totals.filter(v => v === top).length;
+    const tag = rows.filter(r => r.taste.tagRaw >= 30).length;
+    const author = rows.filter(r => r.taste.authorRaw >= 27).length;
+    const both = rows.filter(r => r.taste.tagRaw >= 30 &&
+      r.taste.authorRaw >= 27).length;
+    return {
+      sampleSize: n, maxObservedTotal: top,
+      maxObservedTotalTieCount: topTied,
+      maxObservedTotalTieRate: n ? topTied / n : 0,
+      exactly25Count: totals.filter(v => v === 25).length,
+      tagCap: 30, tagAtOrOverCap: tag, tagSaturationRate: n ? tag / n : 0,
+      authorCap: 27, authorAtOrOverCap: author,
+      authorSaturationRate: n ? author / n : 0,
+      bothAtOrOverCap: both,
+      anyComponentSaturationCount: tag + author - both,
+      anyComponentSaturationRate: n ? (tag + author - both) / n : 0,
+      note: 'Observed maximum is not a theoretical cap; totals can differ after penalties'
+    };
+  }
+
 
   function rankSearchDiagnostic(result) {
     const rows = result.candidates;
@@ -7111,7 +7160,23 @@
     const tier = (a, b) => b.match.tier - a.match.tier;
     const taste = (a, b) => b.taste.total - a.taste.total;
     const rel = (a, b) => b.relevance.legacyTotal - a.relevance.legacyTotal;
-    const models = {rankA: (a, b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b)};
+    const direct = (a, b) => {
+      for (const key of ['coverageCount','exactTagTokenCount',
+        'titleTokenCount','partialTagTokenCount']) {
+        const d = b.match[key] - a.match[key];
+        if (d) return d;
+      }
+      return 0;
+    };
+    const models = {
+      rankA: (a, b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b),
+      rankADirect: (a,b) => tier(a,b) || taste(a,b) || direct(a,b) || tie(a,b),
+      rankALegacy: (a,b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b),
+      rankATasteRaw: (a,b) => tier(a,b) ||
+        b.tasteVariants.raw - a.tasteVariants.raw || direct(a,b) || tie(a,b),
+      rankATasteSoft: (a,b) => tier(a,b) ||
+        b.tasteVariants.soft - a.tasteVariants.soft || direct(a,b) || tie(a,b)
+    };
     for (const width of SEARCH_DIAG_BANDS) models['rankB' + width] = (a,b) =>
       tier(a,b) || Math.floor(b.taste.total / width) - Math.floor(a.taste.total / width) ||
       rel(a,b) || taste(a,b) || tie(a,b);
@@ -7125,9 +7190,53 @@
         return {apiOrder: row.api.apiOrder, id: row.api.id, rank: i + 1};
       });
     }
-    result.counts = {candidates: rows.length,
+
+    // 本番の候補資格と同じ作品ID単位での分散前後比較。
+    const search = result.search;
+    const ctx = {
+      queryKey: searchQueryKey(search),
+      word: search.word,
+      searchHitIds: new Set(),
+      searchOrderById: new Map(),
+      records: new Map()
+    };
+    const distinct = [];
+    for (const row of rows) {
+      const id = String(row.api.id);
+      if (!id || ctx.searchHitIds.has(id)) continue;
+      ctx.searchHitIds.add(id);
+      ctx.searchOrderById.set(id, row.api.apiOrder);
+      const it = {
+        id, title: row.api.title, tags: row.api.tags,
+        userId: row.api.userId, illustType: row.api.illustType,
+        isSearchApiHit: true, queryKey: ctx.queryKey
+      };
+      distinct.push(it);
+      ctx.records.set(id, it);
+    }
+    const eligible = distinct.filter(it => {
+      const row = rows.find(r => r.api.id === it.id);
+      return row && !row.feedEligibility.alreadyDisplayed &&
+        !row.feedEligibility.seen && !row.feedEligibility.stronglySkipped &&
+        !row.feedEligibility.knownBookmarked && !row.feedEligibility.apiBookmarked;
+    });
+    const orderedBefore = searchRankCandidates(ctx, eligible, {diversify:false});
+    const orderedAfter = searchRankCandidates(ctx, eligible, {diversify:true});
+    const rankList = arr => arr.map((it,i) => ({id:String(it.id),rank:i+1}));
+    result.modelRanks.rankADirectBeforeDiversity = rankList(orderedBefore);
+    result.modelRanks.rankADirectAfterDiversity = rankList(orderedAfter);
+    result.productionComparable = {
+      queryKey:ctx.queryKey, eligibleCount:eligible.length,
+      beforeDiversityIds:orderedBefore.map(it=>String(it.id)),
+      afterDiversityIds:orderedAfter.map(it=>String(it.id)),
+      scope:'eligible unique search API hits; excludes displayed/seen/bookmarked/skipped'
+    };
+    result.saturation = searchDiagnosticSaturation(rows);
+    result.counts = {
+      candidates: rows.length,
       uniqueIds: new Set(rows.map(r => r.api.id)).size,
-      duplicates: rows.filter(r => r.api.duplicateOf !== null).length};
+      duplicates: rows.filter(r => r.api.duplicateOf !== null).length
+    };
   }
 
   function searchDiagnosticJson() {
@@ -7157,7 +7266,7 @@
     const context = searchDiagnosticContext();
     const generation = ++searchDiagnosticGeneration;
     const search = context?.search || null;
-    const result = {schemaVersion: '1.0.0', scriptVersion: '3.13.17',
+    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.18',
       capturedAt: new Date().toISOString(), diagnosticId: 'search-' + Date.now() + '-' + generation,
       search, requestedPages: Array.from({length: SEARCH_DIAG_PAGES}, (_, i) => i + 1),
       completedPages: [], apiTotal: null, relatedTags: [],
@@ -7201,7 +7310,7 @@
               userId: raw.userId != null, illustType: raw.illustType != null},
             duplicateOf: ids.has(it.id) ? ids.get(it.id) : null},
           match: searchDiagnosticMatch(it, search.word), legacy: {matchTier: legacySearchWordTier(it, search.word)},
-          taste, relevance: null,
+          taste, tasteVariants: searchDiagnosticTasteVariants(taste), relevance: null,
           feedEligibility: {alreadyDisplayed: displayed.has(it.id), seen: isSeen(it.id),
             stronglySkipped: skipStrong(it.id), knownBookmarked: knownBookmarkedIds.has(it.id),
             apiBookmarked: it.bookmarked},
@@ -7231,7 +7340,7 @@
       result.status = result.completedPages.length === SEARCH_DIAG_PAGES && !result.errors.length ?
         'complete' : result.completedPages.length ? 'partial' : 'failed';
       run.running = false;
-      rankSearchDiagnostic(result);
+      if (search) rankSearchDiagnostic(result);
       if (run === searchDiagnostic) renderSearchDiagnostic();
     }
   }

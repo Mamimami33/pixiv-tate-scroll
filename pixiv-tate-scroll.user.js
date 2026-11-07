@@ -1055,6 +1055,7 @@
     });
 
     const s = slides[idx];
+    if (mode === 'search') s.searchFixed = true; // 一度表示した作品は固定
     onCurrentSlideChanged(s);
 
     for (
@@ -4301,12 +4302,14 @@
   }
 
   function markSearchSlides(items, ctx) {
-    for (const slide of items) {
-      if (!ctx.searchHitIds.has(String(slide.id))) continue;
+    if (!searchContextValid(ctx)) return [];
+    return items.filter(slide => {
+      const id = String(slide.id);
+      if (!ctx.searchHitIds.has(id) || !ctx.records.has(id)) return false;
       slide.isSearchApiHit = true;
       slide.queryKey = ctx.queryKey;
-    }
-    return items;
+      return true;
+    });
   }
 
   async function fetchBookmarkRelatedCandidates(id) {
@@ -4602,6 +4605,8 @@
     }
 
     if (!accepted.length) return;
+    if (!g.fixedIds) g.fixedIds = new Set();
+    accepted.forEach(it => g.fixedIds.add(String(it.id)));
 
     const anchor = afterId == null ? null :
       [...g.cards.children].find(el =>
@@ -4669,14 +4674,11 @@
   // 画面に一度でも現れたカードは固定。表示中・既読・保存済みも移動しない。
   function lockVisibleSearchGridCards() {
     const g = searchGrid;
-    if (!g.open || !g.scroll || !g.cards) return;
+    if (!g.open || !g.cards) return;
     if (!g.fixedIds) g.fixedIds = new Set();
-    const viewport = g.scroll.getBoundingClientRect();
+    // グリッドに一度追加されたカードは画面外も含めすべて固定。
     for (const el of g.cards.children) {
-      const rect = el.getBoundingClientRect();
-      if (rect.bottom > viewport.top && rect.top < viewport.bottom) {
-        g.fixedIds.add(String(el.dataset.ptsId));
-      }
+      g.fixedIds.add(String(el.dataset.ptsId));
     }
   }
 
@@ -4707,12 +4709,17 @@
       el => [el.dataset.ptsId,el]
     ));
     const top = g.scroll.scrollTop;
-    const fragment = document.createDocumentFragment();
-    for (const it of g.items) {
-      const el = nodes.get(String(it.id));
-      if (el) fragment.appendChild(el);
+    // 固定ノードを再接続しない。可動スロットのノードだけ操作。
+    const movable = new Set(slots);
+    for (let i = g.items.length - 1; i > pos; i--) {
+      if (!movable.has(i)) continue;
+      const node = nodes.get(String(g.items[i].id));
+      const following = g.items[i + 1]
+        ? nodes.get(String(g.items[i + 1].id)) : null;
+      if (node && node.nextElementSibling !== following) {
+        g.cards.insertBefore(node, following || null);
+      }
     }
-    g.cards.appendChild(fragment);
     g.scroll.scrollTop = top;
   }
 
@@ -4824,7 +4831,10 @@
 
     const word = searchGrid.config?.word || '';
     const gridContext = searchGrid.rankContext;
-    if (gridContext) it = {...it, isSearchApiHit:true, queryKey:gridContext.queryKey};
+    if (!gridContext || !searchContextValid(gridContext) ||
+      !gridContext.searchHitIds.has(id) || !gridContext.records.has(id) ||
+      !searchGrid.ids.has(id) || it.isSearchApiHit !== true ||
+      it.queryKey !== gridContext.queryKey) return;
     closeSearchGrid();
 
     let idx = slides.findIndex(s => String(s.id) === id);
@@ -4834,8 +4844,7 @@
       if (!selected) return;
 
       selected.gridSearchWord = word;
-      selected.isSearchApiHit = !!it.isSearchApiHit;
-      selected.queryKey = it.queryKey;
+      if (!markSearchSlides([selected], gridContext).length) return;
 
       if (slides.length) {
         insertSlidesAfter(
@@ -4852,8 +4861,7 @@
     if (mode === 'custom') customSeenIds.add(id);
     else {
       slides[idx].gridSearchWord = word;
-      slides[idx].isSearchApiHit = !!it.isSearchApiHit;
-      slides[idx].queryKey = it.queryKey;
+      if (!markSearchSlides([slides[idx]], gridContext).length) return;
     }
 
     navIntent = { reason: 'other', until: 0 };
@@ -5688,7 +5696,8 @@
 
   // ブックマークした作品のおすすめを、その作品の直後に最大12件差し込む
   async function insertSeriesAfter(s) {
-    if (!s || s.seriesInsertStarted ||
+    // シリーズ続編は検索APIヒット資格がないため検索系では追加しない。
+    if (mode === 'search' || !s || s.seriesInsertStarted ||
         !slides.includes(s)) return;
 
     s.seriesInsertStarted = true;

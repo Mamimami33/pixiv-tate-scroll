@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.19
+// @version      3.13.20
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -172,6 +172,8 @@
       }
 
       paintBookmarkBtn(s);
+      if (s.bookmarked) syncSearchGridBookmark(s.id);
+      if (s.isCurrent) syncDock();
 
       if (body.title && !s.title) {
         s.title = body.title;
@@ -1581,7 +1583,7 @@
       }
       if (muteAuthor && !skipProfile.mutedAuthors[String(s.userId)] &&
           Object.keys(skipProfile.mutedAuthors).length >= LEARN_MUTE_LIMIT) {
-        window.alert('ミュートの上限です。「ミュート管理」から解除してください。');
+        window.alert('ミュートの上限です。現在ビューアに解除用の管理画面はありません。解除には保存済みミュート設定の手動整理が必要です。');
         return;
       }
       for (const tag of normTags(s.tags)) {
@@ -3402,6 +3404,10 @@
 
   function syncDock() {
     if (!overlay) return;
+    const returnButton = overlay.querySelector('.pts-return-grid');
+    if (returnButton) returnButton.hidden = !gridReturnState ||
+      searchGrid.open || overlay.style.display === 'none';
+    syncFollowButton();
     const button = overlay.querySelector(
       '.pts-ambient-toggle'
     );
@@ -3774,6 +3780,9 @@
       #pts-overlay .pts-dock .pts-close{
         position:static;right:auto
       }
+      #pts-overlay .pts-dock .pts-return-grid[hidden]{
+        display:none!important
+      }
 
       #pts-overlay .pts-history-panel[hidden],
       #pts-overlay .pts-search-tags[hidden]{
@@ -3943,7 +3952,8 @@
 
     addButton('pts-not-interested', '興味なし', () => { void dismissCurrentWork(); });
     addButton('pts-mute-author', '作者をミュート', () => { void dismissCurrentWork(true); });
-    addButton('pts-manage-muted', 'ミュート管理', manageMutedAuthors);
+    addButton('pts-return-grid', '検索結果へ戻る',
+      returnToSearchGrid).hidden = true;
     addButton('pts-open-original', 'pixivで開く', () => {
       const s = slides[currentIndex()];
       if (!s || searchGrid.open) return;
@@ -4035,7 +4045,60 @@
     cards: null, chips: null, title: null, status: null, retry: null
   };
 
+  // グリッドで開いた作品からのみ有効な「検索結果へ戻る」。
+  // card/取得済みitemsはcloseSearchGridでは破棄しない。
+  let gridReturnState = null;
   let gridTap = null;
+
+  function syncSearchGridBookmark(id) {
+    const g = searchGrid;
+    id = String(id);
+    const item = g.items.find(it => String(it.id) === id);
+    if (item) item.bookmarked = true;
+    const slide = slides.find(it => String(it.id) === id);
+    if (slide) slide.bookmarked = true;
+    const card = [...(g.cards?.children || [])]
+      .find(el => el.dataset.ptsId === id);
+    if (card) {
+      card.classList.add('pts-grid-bookmarked');
+      const button = card.querySelector('.pts-grid-save');
+      if (button) {
+        button.textContent = '✓';
+        button.disabled = true;
+        button.setAttribute('aria-label', '保存済み');
+      }
+    }
+  }
+
+  function reconcileSearchGridBookmarks() {
+    for (const it of searchGrid.items) {
+      const id = String(it.id);
+      if (it.bookmarked || knownBookmarkedIds.has(id) ||
+          slides.some(s => String(s.id) === id && s.bookmarked)) {
+        syncSearchGridBookmark(id);
+      }
+    }
+  }
+
+  function returnToSearchGrid() {
+    const g = searchGrid, back = gridReturnState;
+    if (!back || g.open || !overlay || overlay.style.display === 'none' ||
+        !g.root || !g.config || !g.rankContext ||
+        g.rankContext.queryKey !== back.queryKey ||
+        !searchContextValid(g.rankContext)) return false;
+    const current = slides[currentIndex()];
+    if (current?.kind === 'ugoira') stopUgoira(current);
+    reconcileSearchGridBookmarks();
+    g.open = true;
+    g.root.hidden = false;
+    overlay.classList.add('pts-grid-open');
+    g.scroll.scrollTop = back.scrollTop;
+    if (activeView) activeView.last = performance.now();
+    syncDock();
+    // 開いていた時点の読み込み進捗を引き継ぐ。再検索はしない。
+    return true;
+  }
+
 
   function clearGridTap() {
     if (gridTap?.timer) clearTimeout(gridTap.timer);
@@ -4065,13 +4128,16 @@
         startUgoira(s);
       }
     }
+    syncDock();
   }
 
   function openSearchGrid(value) {
     const word = String(value || '').trim();
     if (!word || !overlay || !searchGrid.root) return;
 
+    gridReturnState = null;
     closeSearchGrid(false);
+    syncDock();
 
     const current = slides[currentIndex()];
     if (current?.kind === 'ugoira') stopUgoira(current);
@@ -4974,6 +5040,10 @@
       !gridContext.searchHitIds.has(id) || !gridContext.records.has(id) ||
       !searchGrid.ids.has(id) || it.isSearchApiHit !== true ||
       it.queryKey !== gridContext.queryKey) return;
+    const returnSnapshot = {
+      queryKey: gridContext.queryKey,
+      scrollTop: searchGrid.scroll.scrollTop
+    };
     closeSearchGrid();
 
     let idx = slides.findIndex(s => String(s.id) === id);
@@ -5006,6 +5076,8 @@
     navIntent = { reason: 'other', until: 0 };
     feedEl.scrollTop = idx * feedEl.clientHeight;
     markCurrentFromScroll();
+    gridReturnState = returnSnapshot;
+    syncDock();
     void resolveSlide(slides[idx]);
   }
 
@@ -5694,6 +5766,7 @@
       s.bookmarked = true;
       knownBookmarkedIds.add(id);
       paintBookmarkBtn(s);
+      syncSearchGridBookmark(id);
       return false;
     }
 
@@ -5777,6 +5850,7 @@
         s.bookmarked = true;
         knownBookmarkedIds.add(id);
         paintBookmarkBtn(s);
+        syncSearchGridBookmark(id);
 
         if (!s.tasteLearned && s.tags?.length) {
           learnFromWork(s.tags, s.userId, s.rawType, LEARN_BOOKMARK_WEIGHT);
@@ -7755,6 +7829,7 @@
 
     searchConfig = getSearchPageConfig();
     mode = searchConfig ? 'search' : 'custom';
+    gridReturnState = null;
 
     overlay.style.display = 'block';
     keepAwake(true);
@@ -7774,6 +7849,7 @@
     clearTimeout(viewSaveTimer);
     viewSaveTimer = null;
     saveProfile();
+    gridReturnState = null;
     closeSearchGrid(false);
     closeDiagnosticPanel();
     clearTimeout(bookmarkToastTimer);

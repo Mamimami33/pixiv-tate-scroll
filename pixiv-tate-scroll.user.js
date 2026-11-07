@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.18
+// @version      3.13.19
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -2927,7 +2927,6 @@
   let experienceInstalled = false;
   let touchStart = null;
   let lastTap = null;
-  let singleTapTimer = null;
 
   /* ---------- v3.13.4: ambient glow ---------- */
   const ambient = {
@@ -3472,73 +3471,62 @@
     }
   }
 
+  // シングルタップは画面遷移しない。2回目のタップで即座にいいねする。
   function handleImageTap(e) {
     const holder = e.target.closest?.('.pts-holder');
-    if (!holder) return;
-    e.stopImmediatePropagation();
-
-    if (e.isPrimary === false || !touchStart) return;
-
-    if (
-      touchStart.pointerId !== e.pointerId ||
-      Math.hypot(
-        e.clientX - touchStart.x,
-        e.clientY - touchStart.y
-      ) > 12
-    ) return;
-
-    const s = slides[currentIndex()];
-
-    if (!s || holder.closest('.pts-slide') !== s.sectionEl) {
+    if (!holder || e.isPrimary === false || !touchStart) return;
+    if (touchStart.pointerId !== e.pointerId ||
+        Math.hypot(e.clientX-touchStart.x,e.clientY-touchStart.y)>12) return;
+    const slide = slides[currentIndex()];
+    if (!slide || holder.closest('.pts-slide') !== slide.sectionEl) return;
+    const now=performance.now();
+    if (lastTap && lastTap.id===String(slide.id) &&
+        now-lastTap.time<=LIKE_TAP_WINDOW &&
+        Math.hypot(e.clientX-lastTap.x,e.clientY-lastTap.y)<=46) {
+      lastTap=null;
+      e.stopImmediatePropagation();
+      void likeArtwork(slide,e.clientX,e.clientY);
       return;
     }
+    lastTap={id:String(slide.id),time:now,x:e.clientX,y:e.clientY};
+  }
 
-    const now = performance.now();
-
-    if (
-      lastTap &&
-      lastTap.id === String(s.id) &&
-      now - lastTap.time <= LIKE_TAP_WINDOW &&
-      Math.hypot(
-        e.clientX - lastTap.x,
-        e.clientY - lastTap.y
-      ) <= 46
-    ) {
-      clearTimeout(singleTapTimer);
-      singleTapTimer = null;
-      lastTap = null;
-
-      void likeArtwork(s, e.clientX, e.clientY);
-      return;
+  // キーボードによる移動はビューア表示中のみ。入力操作・修飾キーを優先。
+  function handleViewerKeyboard(e) {
+    if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.altKey ||
+        e.metaKey || !overlay || overlay.style.display==='none' ||
+        searchGrid.open) return;
+    const focused=document.activeElement;
+    const target=e.target?.nodeType===1 ? e.target : focused;
+    const editable='input,textarea,select,[contenteditable]:not([contenteditable="false"]),' +
+      '[role="textbox"],[role="combobox"]';
+    if (target?.closest?.(editable) || focused?.closest?.(editable) ||
+        focused?.isContentEditable) return;
+    if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) return;
+    const index=currentIndex(), slide=slides[index];
+    if (!slide) return;
+    let handled=false;
+    if (e.key==='ArrowUp'||e.key==='ArrowDown') {
+      const next=index+(e.key==='ArrowDown'?1:-1);
+      if (next>=0&&next<slides.length) gotoSlide(next,'user');
+      handled=true;
+    } else if (slide.kind==='multi'&&slide.pairs?.length>1) {
+      const pager=slide.sectionEl?.querySelector('.pts-pager');
+      if (!pager) return;
+      const width=Math.max(1,pager.clientWidth);
+      const page=Math.max(0,Math.min(slide.pairs.length-1,
+        Math.round(pager.scrollLeft/width)));
+      const next=page+(e.key==='ArrowRight'?1:-1);
+      if (next>=0&&next<slide.pairs.length) {
+        loadHorizontalNeighbors(slide,next);
+        pager.scrollTo({left:next*width,behavior:'smooth'});
+      }
+      handled=true;
     }
-
-    lastTap = {
-      id: String(s.id),
-      time: now,
-      x: e.clientX,
-      y: e.clientY
-    };
-
-    clearTimeout(singleTapTimer);
-
-    singleTapTimer = setTimeout(() => {
-      singleTapTimer = null;
-      lastTap = null;
-
-      if (
-        !slides.includes(s) ||
-        slides[currentIndex()] !== s ||
-        overlay?.style.display === 'none'
-      ) return;
-
-      if (s.kind === 'multi') return;
-
-      const r = holder.getBoundingClientRect();
-      const step =
-        (e.clientX - r.left) /
-          Math.max(1, r.width) < 0.33 ? -1 : 1;
-      gotoSlide(currentIndex() + step, 'user');
-    }, LIKE_TAP_WINDOW);
+    if (handled) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
   }
 
   function bindExperienceGestures() {
@@ -3548,8 +3536,6 @@
       if (!e.isPrimary) {
         touchStart = null;
         lastTap = null;
-        clearTimeout(singleTapTimer);
-        singleTapTimer = null;
         return;
       }
 
@@ -3569,8 +3555,6 @@
     feedEl.addEventListener('pointercancel', () => {
       touchStart = null;
       lastTap = null;
-      clearTimeout(singleTapTimer);
-      singleTapTimer = null;
     }, true);
   }
 
@@ -3888,6 +3872,7 @@
       });
 
     bindExperienceGestures();
+    document.addEventListener('keydown', handleViewerKeyboard, true);
 
     document.addEventListener('keydown', e => {
       if (
@@ -7659,7 +7644,8 @@
       toast.classList.remove('is-visible');
       toast.hidden = true;
     }
-    clearTimeout(singleTapTimer);
+    lastTap = null;
+    touchStart = null;
     clearTimeout(closeConfirmTimer);
     ambientReset();
     overlay.querySelector('.pts-history-panel')

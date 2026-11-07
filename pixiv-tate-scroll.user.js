@@ -4151,65 +4151,139 @@
     );
   }
 
-  function searchPrioritize(
-    items, word, previous = [], boosts = new Set(), source = null,
-    limit = Infinity, relatedTags = []
-  ) {
-    // 保存後は一致候補だけを選ぶ。既存テールの非一致作品は末尾に残す。
-    const unmatched = source ? items.filter(it => !searchWordTier(it, word)) : [];
-    const pool = source ? items.filter(it => searchWordTier(it, word) > 0) : items.slice();
-    const ordered = [];
-    let repeated = 0;
 
-    while (pool.length && ordered.length < limit) {
-      const tail = [...previous.slice(-2), ...ordered];
-      const last = tail.at(-1);
-      const second = tail.at(-2);
-      const a = String(last?.userId || '');
-      const b = String(second?.userId || '');
-
-      let best = -1;
-      let highest = -Infinity;
-
-      for (let i = 0; i < pool.length; i++) {
-        const it = pool[i];
-        if (source && ordered.length < INSERT_RECOMMENDATION_LIMIT &&
-          repeated >= INSERT_IDENTITY_CAP &&
-          commonIdentityTags(it, source)) continue;
-        const author = String(it.userId || '');
-        const normalized = {
-          ...it, illustType: it.illustType ?? it.rawType
-        };
-
-        // 検索一致の1000点刻みは分散点より優先。
-        let score = searchWordTier(it, word) * 1000 +
-          searchWordRelevance(it, word, relatedTags) +
-          tasteScore(normalized) * SEARCH_TASTE_WEIGHT +
-          (boosts.has(String(it.id)) ? 14 : 0);
-
-        if (author && author === a) score -= 12;
-        if (author && author === b) score -= 5;
-
-        score -= identityDiversityPenalty(
-          it, source, last, second, repeated
-        );
-
-        if (score > highest) {
-          highest = score;
-          best = i;
-        }
-      }
-
-      if (best < 0) break;
-      const chosen = pool.splice(best, 1)[0];
-      ordered.push(chosen);
-
-      if (source && commonIdentityTags(chosen, source)) {
-        repeated++;
-      }
+  // 辞書式比較。分散は同点集合内の動的選択だけで適用する。
+  function compareSearchRank(a, b, includeApiOrder = true) {
+    const tier = b.tier - a.tier;
+    if (tier) return tier;
+    const taste = b.taste - a.taste;
+    if (taste) return taste;
+    for (let i = 0; i < 4; i++) {
+      const direct = b.directRelevanceKey[i] - a.directRelevanceKey[i];
+      if (direct) return direct;
     }
+    return includeApiOrder ? a.apiOrder - b.apiOrder : 0;
+  }
 
-    return Number.isFinite(limit) ? ordered : [...ordered, ...pool, ...unmatched];
+  // 第1層の資格・第2層のtierは、検索APIから証拠を得たctxだけで計算。
+  function searchRankRow(ctx, candidate) {
+    const id = candidateId(candidate);
+    if (!ctx || !ctx.searchHitIds.has(id) ||
+      candidate.isSearchApiHit !== true ||
+      candidate.queryKey !== ctx.queryKey) return null;
+    const cached = ctx.records.get(id) || candidate;
+    const it = {
+      ...cached, ...candidate,
+      title: candidate.title || cached.title || '',
+      tags: normTags(candidate.tags).length ? candidate.tags : cached.tags,
+      userId: candidate.userId ?? cached.userId,
+      illustType: Number.isFinite(Number(candidate.illustType))
+        ? Number(candidate.illustType)
+        : Number(candidate.rawType ?? cached.illustType)
+    };
+    const match = searchDiagnosticMatch(it, ctx.word);
+    return {
+      it: candidate, meta: it, id, tier: match.tier,
+      taste: tasteScore(it),
+      directRelevanceKey: [
+        match.coverageCount, match.exactTagTokenCount,
+        match.titleTokenCount, match.partialTagTokenCount
+      ],
+      apiOrder: ctx.searchOrderById.get(id) ?? Number.MAX_SAFE_INTEGER
+    };
+  }
+
+  function searchTiePenalty(row, previous, source = null, repeated = 0) {
+    const last = previous.at(-1), second = previous.at(-2);
+    const a = String(row.meta.userId || '');
+    let penalty = 0;
+    if (a && a === String(last?.userId || '')) penalty += 12;
+    if (a && a === String(second?.userId || '')) penalty += 5;
+    if (last && String(last.id) !== String(source?.id || '')) {
+      penalty += Math.min(8, commonIdentityTags(row.meta, last) * 4);
+    }
+    if (second && String(second.id) !== String(source?.id || '')) {
+      penalty += Math.min(4, commonIdentityTags(row.meta, second) * 2);
+    }
+    if (source) {
+      const shared = commonIdentityTags(row.meta, source);
+      penalty += Math.min(12, shared * 5);
+      if (shared) penalty += Math.min(6, repeated * 1.5);
+    }
+    return penalty;
+  }
+
+  function searchRankCandidates(ctx, candidates, options = {}) {
+    const { previous = [], source = null, onlyMatching = false,
+      limit = Infinity, diversify = true } = options;
+    const ids = new Set(), rows = [];
+    for (const candidate of candidates || []) {
+      const id = candidateId(candidate);
+      if (ids.has(id)) continue;
+      const row = searchRankRow(ctx, candidate);
+      if (!row || (onlyMatching && row.tier === 0)) continue;
+      ids.add(id);
+      rows.push(row);
+    }
+    rows.sort(compareSearchRank);
+    if (!diversify) return rows.slice(0, limit).map(row => row.it);
+
+    const result = [], used = previous.slice(-2);
+    let repeated = 0;
+    for (let start = 0; start < rows.length;) {
+      let end = start + 1;
+      while (end < rows.length &&
+        compareSearchRank(rows[start], rows[end], false) === 0) end++;
+      const tie = rows.slice(start, end);
+      while (tie.length && result.length < limit) {
+        let best = 0, lowest = Infinity;
+        for (let i = 0; i < tie.length; i++) {
+          const p = searchTiePenalty(tie[i], used, source, repeated);
+          if (p < lowest || (p === lowest &&
+              tie[i].apiOrder < tie[best].apiOrder)) {
+            lowest = p;
+            best = i;
+          }
+        }
+        const chosen = tie.splice(best, 1)[0];
+        result.push(chosen.it);
+        used.push(chosen.meta);
+        if (source && commonIdentityTags(chosen.meta, source)) repeated++;
+      }
+      if (result.length >= limit) break;
+      start = end;
+    }
+    return result;
+  }
+
+  async function prepareSearchRankCandidates(ctx, excludeIds, isCurrent, signal) {
+    if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) return null;
+    const excluded = new Set((excludeIds || []).map(String));
+    const raw = [...ctx.records.values()].filter(it =>
+      !excluded.has(String(it.id)) && !isSeen(it.id) &&
+      !skipStrong(it.id) && !knownBookmarkedIds.has(String(it.id)) &&
+      !it.bookmarked && !isFeedbackExcluded(it)
+    );
+    const prepared = await prepareCandidates(raw, {
+      excludeIds: [...excluded, ...seenTimes.keys()],
+      enrichTop: 0, rank: tasteScore
+    });
+    if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) return null;
+    return prepared.filter(it => ctx.searchHitIds.has(String(it.id)) &&
+      !isSeen(it.id) && !skipStrong(it.id) &&
+      !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
+    ).map(it => ({
+      ...it, isSearchApiHit: true, queryKey: ctx.queryKey
+    }));
+  }
+
+  function markSearchSlides(items, ctx) {
+    for (const slide of items) {
+      if (!ctx.searchHitIds.has(String(slide.id))) continue;
+      slide.isSearchApiHit = true;
+      slide.queryKey = ctx.queryKey;
+    }
+    return items;
   }
 
   async function fetchBookmarkRelatedCandidates(id) {

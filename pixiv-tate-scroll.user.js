@@ -4003,18 +4003,127 @@
     })();
   }
 
-  function searchWordTier(it, word) {
-    const query = String(word || '').normalize('NFKC')
-      .trim().toLocaleLowerCase();
+
+  // v3.13.18: 検索APIヒットの証拠・ページ進捗を queryKey 単位で共有する。
+  function searchNormalize(value) {
+    return String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
+  }
+
+  function legacySearchWordTier(it, word) {
+    const query = searchNormalize(word);
     if (!query) return 0;
-    const tags = normTags(it.tags).map(t =>
-      String(t).normalize('NFKC').toLocaleLowerCase());
+    const tags = normTags(it.tags).map(searchNormalize);
     if (tags.includes(query)) return 2;
     return tags.some(t => t.includes(query)) ? 1 : 0;
   }
 
+  const searchRankPools = new Map();
+  let searchPoolGeneration = 0;
+
+  function searchQueryKey(config) {
+    return JSON.stringify([
+      searchNormalize(config.word),
+      String(config.order || 'popular_d'),
+      String(config.searchMode || 'all'),
+      String(config.matchMode || 's_tag')
+    ]);
+  }
+
+  function getSearchRankContext(config, startPage = 1) {
+    const queryKey = searchQueryKey(config);
+    let ctx = searchRankPools.get(queryKey);
+    const page = Math.max(1, Number(startPage) || 1);
+    if (!ctx) {
+      const queryTokens = [...new Set(
+        searchNormalize(config.word).split(/\s+/u).filter(Boolean)
+      )];
+      ctx = {
+        queryKey, word: config.word, queryTokens,
+        queryType: queryTokens.length > 1 ? 'multi-token' : 'single-token',
+        relatedTags: new Set(), searchOrderById: new Map(),
+        searchHitIds: new Set(), generation: ++searchPoolGeneration,
+        records: new Map(), fetchedPages: new Set(),
+        nextPage: page, finished: false, busy: null, firstBody: null,
+        total: null, failure: null
+      };
+      searchRankPools.set(queryKey, ctx);
+    } else if (page < ctx.nextPage && !ctx.fetchedPages.has(page)) {
+      ctx.nextPage = page;
+      ctx.finished = false;
+    }
+    return ctx;
+  }
+
+  function searchContextValid(ctx) {
+    return !!ctx && searchRankPools.get(ctx.queryKey) === ctx;
+  }
+
+  async function loadSearchApiBatch(ctx, config, isCurrent, signal) {
+    if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) {
+      return { stale: true };
+    }
+    if (ctx.busy) {
+      await ctx.busy;
+      return { stale: !isCurrent() || signal?.aborted, shared: true,
+        error: ctx.failure, body: ctx.firstBody, fetched: 0 };
+    }
+    const job = (async () => {
+      let fetched = 0, first = null, error = null;
+      for (let attempt = 0; attempt < SEARCH_BATCH_PAGES;) {
+        if (ctx.finished) break;
+        const page = ctx.nextPage;
+        if (page > 1000) { ctx.finished = true; break; }
+        if (ctx.fetchedPages.has(page)) { ctx.nextPage++; continue; }
+        let body;
+        try {
+          body = await fetchJson(searchApiUrl(config, page), signal);
+        } catch (e) {
+          error = e;
+          break;
+        }
+        if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) {
+          return { stale: true };
+        }
+        const data = body?.illustManga?.data;
+        if (!Array.isArray(data)) {
+          error = new Error('検索API候補配列なし (p=' + page + ')');
+          break;
+        }
+        if (!first) first = body;
+        if (!ctx.firstBody) ctx.firstBody = body;
+        for (const tag of searchRelatedTags(body)) ctx.relatedTags.add(tag);
+        for (const raw of data) {
+          const it = normalizeCandidate(raw);
+          const id = String(it.id || '');
+          if (!/^\d+$/.test(id) || ctx.searchHitIds.has(id)) continue;
+          ctx.searchHitIds.add(id);
+          ctx.searchOrderById.set(id, ctx.searchOrderById.size);
+          ctx.records.set(id, {
+            ...it, isSearchApiHit: true, queryKey: ctx.queryKey
+          });
+        }
+        ctx.fetchedPages.add(page);
+        ctx.nextPage = page + 1;
+        ctx.total = Number(body?.illustManga?.total);
+        fetched++;
+        attempt++;
+        if (!data.length || (Number.isFinite(ctx.total) &&
+            ctx.total >= 0 && page * 36 >= ctx.total)) {
+          ctx.finished = true;
+        }
+      }
+      ctx.failure = error;
+      return { fetched, error, body: first || ctx.firstBody, stale: false };
+    })();
+    ctx.busy = job;
+    try {
+      return await job;
+    } finally {
+      if (ctx.busy === job) ctx.busy = null;
+    }
+  }
+
   // 検索専用。関連度は最大400点に収め、1000点刻みのtierを維持する。
-  const SEARCH_TASTE_WEIGHT = 0.3;
   const SEARCH_WORD_TAG_WEIGHT = 40;
   const SEARCH_RELATED_TAG_WEIGHT = 24;
 
@@ -7087,7 +7196,7 @@
             dataAvailability: {title: typeof raw.title === 'string', tags: raw.tags != null,
               userId: raw.userId != null, illustType: raw.illustType != null},
             duplicateOf: ids.has(it.id) ? ids.get(it.id) : null},
-          match: searchDiagnosticMatch(it, search.word), legacy: {matchTier: searchWordTier(it, search.word)},
+          match: searchDiagnosticMatch(it, search.word), legacy: {matchTier: legacySearchWordTier(it, search.word)},
           taste, relevance: null,
           feedEligibility: {alreadyDisplayed: displayed.has(it.id), seen: isSeen(it.id),
             stronglySkipped: skipStrong(it.id), knownBookmarked: knownBookmarkedIds.has(it.id),

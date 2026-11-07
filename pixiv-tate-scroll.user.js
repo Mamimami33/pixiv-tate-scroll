@@ -558,6 +558,7 @@
       canvas.className = 'pts-ugoira-canvas';
       holder.appendChild(canvas);
       s.ugoiraCanvas = canvas;
+      holder.classList.remove('pts-ugoira-active');
       if (s.ugoiraPlayer) s.ugoiraPlayer.displayed = -1;
     }
     return s.ugoiraCanvas;
@@ -569,6 +570,7 @@
     player.generation++;
     player.ready.clear();
     player.loading.clear();
+    player.displayed = -1;
     player.urls = s.frameUrls;
   }
 
@@ -726,6 +728,17 @@
       clearUgoiraDecodeCache(s);
       s.ugoiraPlayer.started=null;
     }
+  }
+
+  // スクロールで離れたうごイラは大きなCanvas/デコード画像を解放。
+  // シーク中のstopUgoiraとは分離し、ドラッグ中に表示が消えるのを防ぐ。
+  function releaseUgoiraCanvas(s) {
+    if (s.kind !== 'ugoira') return;
+    s.ugoiraCanvas?.remove();
+    s.ugoiraCanvas = null;
+    s.sectionEl?.querySelector('.pts-holder')
+      ?.classList.remove('pts-ugoira-active');
+    s.ugoiraPlayer = null;
   }
 
   function setChip(s, text) {
@@ -1158,6 +1171,7 @@
       } else if (!current && s.isCurrent) {
         s.isCurrent = false;
         stopUgoira(s);
+        releaseUgoiraCanvas(s);
         if (s.resolved) upgradeSlide(s);
       }
     });

@@ -3972,6 +3972,8 @@
     searchGrid.page = 1;
     searchGrid.finished = false;
     searchGrid.searchBoosted = false;
+    searchGrid.fixedIds = new Set();
+    searchGrid.rankContext = getSearchRankContext(searchGrid.config, 1);
     searchGrid.items = [];
     searchGrid.ids.clear();
     searchGrid.tagsReady = false;
@@ -4320,115 +4322,125 @@
     );
   }
 
+
+  function searchContextForSlide(s) {
+    if (s?.queryKey && searchRankPools.has(s.queryKey)) {
+      return searchRankPools.get(s.queryKey);
+    }
+    if (!searchConfig) return null;
+    return getSearchRankContext(searchConfig, searchConfig.page);
+  }
+
+  function searchConfigForContext(ctx) {
+    if (!ctx) return null;
+    const [word, order, searchMode, matchMode] = JSON.parse(ctx.queryKey);
+    return { word, order, searchMode, matchMode };
+  }
+
+  // 差し込み・テール双方で使う共通の資格判定/順位。通常の検索API経路だけで補充。
+  async function searchBookmarkCandidates(
+    ctx, config, excludedIds, source, previous, isCurrent, signal
+  ) {
+    if (!ctx || !isCurrent()) return null;
+    let result = [];
+    for (let n = 0; n <= 2; n++) {
+      const available = await prepareSearchRankCandidates(
+        ctx, excludedIds, isCurrent, signal
+      );
+      if (!available || !isCurrent()) return null;
+      result = searchRankCandidates(ctx, available, {
+        previous, source, onlyMatching: true,
+        limit: INSERT_RECOMMENDATION_LIMIT
+      });
+      if (result.length >= INSERT_RECOMMENDATION_LIMIT || ctx.finished ||
+        n === 2) break;
+      const fetched = await loadSearchApiBatch(ctx, config, isCurrent, signal);
+      if (!isCurrent() || fetched.stale) return null;
+      if (fetched.error || !fetched.fetched) break;
+    }
+    return result;
+  }
+
+
   function reorderSearchFeedTail(anchor, word) {
-    if (mode !== 'search' ||
-      !slides.includes(anchor) || !feedEl) return;
-
-    const pos = slides.indexOf(anchor);
-    const slots = [];
-
+    if (mode !== 'search' || !slides.includes(anchor) || !feedEl) return;
+    const ctx = searchContextForSlide(anchor);
+    if (!ctx) return;
+    const pos = slides.indexOf(anchor), slots = [];
     for (let i = pos + 1; i < slides.length; i++) {
       const s = slides[i];
-      if (!s.isCurrent && s.seriesParentId !== String(anchor.id) &&
-        !viewedThisSession.has(String(s.id))) {
+      if (!s.isCurrent && !s.searchFixed &&
+        s.seriesParentId !== String(anchor.id) &&
+        !viewedThisSession.has(String(s.id)) &&
+        s.isSearchApiHit === true && s.queryKey === ctx.queryKey) {
         slots.push(i);
       }
     }
-
     if (!slots.length) return;
-
-    const boosts = anchor.searchInsertedIds || new Set();
-    const candidates = slots.map(i => slides[i]);
-    const sorted = searchPrioritize(
-      candidates, word, [anchor], boosts, anchor
+    const sorted = searchRankCandidates(ctx,
+      slots.map(i => slides[i]), {previous:[anchor],source:anchor}
     );
-
-    slots.forEach((i, j) => {
-      slides[i] = sorted[j];
-    });
-
+    if (sorted.length !== slots.length) return; // 資格を再検証、既存は落とさない
+    slots.forEach((i,j) => { slides[i] = sorted[j]; });
     const top = feedEl.scrollTop;
-
     for (let i = slides.length - 1; i > pos; i--) {
       const node = slides[i].sectionEl;
       const following = slides[i + 1]?.sectionEl || null;
-
       if (node && node.nextElementSibling !== following) {
         feedEl.insertBefore(node, following);
       }
     }
-
     feedEl.scrollTop = top;
   }
 
+
   async function improveSearchFeedAfterBookmark(s) {
     if (!s || mode !== 'search' || !slides.includes(s) ||
-      !searchConfig?.word || s.searchImprovePromise) return;
-
+      s.searchImprovePromise) return;
     const generation = feedGeneration;
-    const word = s.gridSearchWord || searchConfig.word;
-
+    const ctx = searchContextForSlide(s);
+    const config = searchConfigForContext(ctx);
+    if (!ctx || !config) return;
+    const valid = () => generation === feedGeneration &&
+      mode === 'search' && slides.includes(s) &&
+      searchContextValid(ctx);
     const work = (async () => {
       try {
-        const raw = await fetchBookmarkRelatedCandidates(s.id);
-
-        if (generation !== feedGeneration ||
-          !slides.includes(s)) return;
-
-        const prepared = await prepareCandidates(raw, {
-          excludeIds: [
-            s.id, s.seriesNextId, ...new Set(slides.map(x => x.id))
-          ].filter(Boolean),
-          enrichTop: 8
-        });
-
-        const available = prepared.filter(it =>
-          !isSeen(String(it.id)) &&
-          !knownBookmarkedIds.has(String(it.id))
+        const excluded = [
+          s.id, s.seriesNextId, ...slides.map(x => x.id),
+          ...searchGrid.items.map(x => x.id)
+        ];
+        const chosen = await searchBookmarkCandidates(
+          ctx, config, excluded, s, [s], valid
         );
-
-        const ranked = searchPrioritize(
-          available, word, [s], new Set(), s, INSERT_RECOMMENDATION_LIMIT
-        );
-        const chosen = ranked.slice(0, 12);
-
-        s.searchInsertedIds = new Set(
-          chosen.map(it => String(it.id))
-        );
-
+        if (!valid() || chosen === null) return;
+        s.searchInsertedIds = new Set(chosen.map(it => String(it.id)));
         if (chosen.length) {
           const current = slides[currentIndex()];
           const oldTop = feedEl.scrollTop;
           const height = Math.max(1, feedEl.clientHeight);
-
           let pos = slides.indexOf(s);
-          if (slides[pos + 1]?.seriesParentId === String(s.id)) {
-            pos++;
-          }
-
-          insertSlidesAfter(pos, candidatesToSlides(chosen));
-
+          if (slides[pos + 1]?.seriesParentId === String(s.id)) pos++;
+          if (!valid()) return;
+          insertSlidesAfter(pos,
+            markSearchSlides(candidatesToSlides(chosen), ctx));
           if (current && current !== s && slides.includes(current)) {
             feedEl.scrollTop =
               slides.indexOf(current) * height + oldTop % height;
           }
         }
       } catch (e) {
-        console.warn('[PTS search] 関連取得失敗', e);
+        console.warn('[PTS search] 検索API差し込み失敗', e);
       } finally {
-        if (generation === feedGeneration &&
-          mode === 'search' && slides.includes(s)) {
-          reorderSearchFeedTail(s, word);
+        if (valid()) {
+          reorderSearchFeedTail(s, config.word);
           markCurrentFromScroll();
         }
       }
     })();
-
     s.searchImprovePromise = work;
-
     return work;
   }
-
 
   // 共通プールの未表示候補を現在の表示済みセットから除外して評価。
   async function buildSearchRankedBatch(
@@ -4635,105 +4647,92 @@
     }
   }
 
-  function reorderSearchGridTail(
-    anchorId, word, boosts = new Set()
-  ) {
+
+  // 画面に一度でも現れたカードは固定。表示中・既読・保存済みも移動しない。
+  function lockVisibleSearchGridCards() {
+    const g = searchGrid;
+    if (!g.open || !g.scroll || !g.cards) return;
+    if (!g.fixedIds) g.fixedIds = new Set();
+    const viewport = g.scroll.getBoundingClientRect();
+    for (const el of g.cards.children) {
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom > viewport.top && rect.top < viewport.bottom) {
+        g.fixedIds.add(String(el.dataset.ptsId));
+      }
+    }
+  }
+
+  function reorderSearchGridTail(anchorId, word) {
     const g = searchGrid;
     if (!g.open || !g.cards) return;
-
-    const pos = g.items.findIndex(
-      it => String(it.id) === String(anchorId)
-    );
+    const ctx = g.rankContext;
+    if (!ctx || !searchContextValid(ctx)) return;
+    lockVisibleSearchGridCards();
+    const pos = g.items.findIndex(it => String(it.id) === String(anchorId));
     if (pos < 0) return;
-
-    const head = g.items.slice(0, pos + 1);
-    const anchor = head.at(-1);
-    const tail = searchPrioritize(
-      g.items.slice(pos + 1),
-      word,
-      head.slice(-2),
-      boosts,
-      anchor
-    );
-
-    const nodes = new Map(
-      [...g.cards.children].map(
-        el => [el.dataset.ptsId, el]
-      )
-    );
-
+    const slots = [];
+    for (let i = pos + 1; i < g.items.length; i++) {
+      const it = g.items[i], id = String(it.id);
+      if (!g.fixedIds.has(id) && !viewedThisSession.has(id) &&
+        !isSeen(id) && !knownBookmarkedIds.has(id) &&
+        it.isSearchApiHit === true && it.queryKey === ctx.queryKey) {
+        slots.push(i);
+      }
+    }
+    if (!slots.length) return;
+    const sorted = searchRankCandidates(ctx, slots.map(i => g.items[i]),
+      {previous: g.items.slice(Math.max(0,pos-1),pos+1),
+       source:g.items[pos]});
+    if (sorted.length !== slots.length) return;
+    slots.forEach((i,j) => { g.items[i] = sorted[j]; });
+    const nodes = new Map([...g.cards.children].map(
+      el => [el.dataset.ptsId,el]
+    ));
+    const top = g.scroll.scrollTop;
     const fragment = document.createDocumentFragment();
-
-    for (const it of tail) {
+    for (const it of g.items) {
       const el = nodes.get(String(it.id));
       if (el) fragment.appendChild(el);
     }
-
-    const top = g.scroll.scrollTop;
     g.cards.appendChild(fragment);
-    g.items = [...head, ...tail];
     g.scroll.scrollTop = top;
   }
+
 
   async function improveSearchGridAfterBookmark(it, card, token) {
     const g = searchGrid;
     if (card.dataset.improved === '1' || !g.config?.word) return;
-
+    const ctx = g.rankContext;
+    if (!ctx) return;
     card.dataset.improved = '1';
-    g.searchBoosted = true;
-
-    const word = g.config.word;
     const id = String(it.id);
-    const recommended = new Set();
-
+    const valid = () => g.open && g.token === token &&
+      g.rankContext === ctx && searchContextValid(ctx);
     try {
-      const raw = await fetchBookmarkRelatedCandidates(id);
-
-      if (!g.open || token !== g.token) return;
-
-      const prepared = await prepareCandidates(raw, {
-        excludeIds: [id, ...g.ids, ...seenTimes.keys()],
-        enrichTop: 0, rank: tasteScore
-      });
-
-      if (!g.open || token !== g.token) return;
-
-      const pos = g.items.findIndex(
-        x => String(x.id) === id
-      );
+      const excluded = [
+        id, ...g.ids, ...slides.map(s => s.id)
+      ];
+      const pos = g.items.findIndex(x => String(x.id) === id);
       const anchor = pos >= 0 ? g.items[pos] : it;
       const previous = pos >= 0
-        ? g.items.slice(Math.max(0, pos - 1), pos + 1)
-        : [anchor];
-
-      const available = prepared.filter(x =>
-        !skipStrong(x.id) && !isSeen(x.id) &&
-        !knownBookmarkedIds.has(String(x.id))
+        ? g.items.slice(Math.max(0,pos-1),pos+1) : [anchor];
+      const selected = await searchBookmarkCandidates(
+        ctx, g.config, excluded, anchor, previous, valid, g.controller?.signal
       );
-
-      const ranked = searchPrioritize(
-        available, word, previous, new Set(), anchor,
-        INSERT_RECOMMENDATION_LIMIT
-      );
-
-      const selected = ranked.slice(0, 12);
-
-      for (const item of selected) {
-        recommended.add(String(item.id));
-      }
-
+      if (!valid() || selected === null) return;
+      lockVisibleSearchGridCards();
+      if (!valid()) return;
       appendGridCards(selected, id);
     } catch (e) {
-      console.warn('[PTS grid] 関連取得失敗', e);
+      console.warn('[PTS grid] 検索API差し込み失敗', e);
       delete card.dataset.improved;
     } finally {
-      if (g.open && token === g.token) {
-        reorderSearchGridTail(id, word, recommended);
-        g.status.textContent = `${g.items.length}件表示中`;
+      if (valid()) {
+        reorderSearchGridTail(id, g.config.word);
+        g.status.textContent = g.items.length + '件表示中';
       }
     }
   }
-
 
   async function searchGridLoadMore() {
     const g = searchGrid;
@@ -4745,6 +4744,7 @@
     const controller = new AbortController();
     g.controller = controller;
     const ctx = getSearchRankContext(config, g.page);
+    g.rankContext = ctx;
     const valid = () => g.open && token === g.token &&
       g.config === config && searchContextValid(ctx);
     try {
@@ -4763,6 +4763,7 @@
       // 表示済みカードは移動せず、新規取得候補だけを末尾へ追加。
       if (!valid()) return false;
       appendGridCards(ranked);
+      lockVisibleSearchGridCards();
       g.page = ctx.nextPage;
       g.finished = ctx.finished;
       if (loaded.error) {
@@ -4804,6 +4805,8 @@
     if (!/^\d+$/.test(id)) return;
 
     const word = searchGrid.config?.word || '';
+    const gridContext = searchGrid.rankContext;
+    if (gridContext) it = {...it, isSearchApiHit:true, queryKey:gridContext.queryKey};
     closeSearchGrid();
 
     let idx = slides.findIndex(s => String(s.id) === id);
@@ -4813,6 +4816,8 @@
       if (!selected) return;
 
       selected.gridSearchWord = word;
+      selected.isSearchApiHit = !!it.isSearchApiHit;
+      selected.queryKey = it.queryKey;
 
       if (slides.length) {
         insertSlidesAfter(
@@ -4829,6 +4834,8 @@
     if (mode === 'custom') customSeenIds.add(id);
     else {
       slides[idx].gridSearchWord = word;
+      slides[idx].isSearchApiHit = !!it.isSearchApiHit;
+      slides[idx].queryKey = it.queryKey;
     }
 
     navIntent = { reason: 'other', until: 0 };
@@ -4923,6 +4930,7 @@
     searchGrid.retry.addEventListener('click', () => void searchGridLoadMore());
     searchGrid.scroll.addEventListener('scroll', () => {
       const el = searchGrid.scroll;
+      lockVisibleSearchGridCards();
       if (el.scrollHeight - el.scrollTop - el.clientHeight <
         el.clientHeight * 1.5) void searchGridLoadMore();
     }, { passive: true });

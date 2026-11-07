@@ -4328,9 +4328,8 @@
 
 
   function searchContextForSlide(s) {
-    if (s?.queryKey && searchRankPools.has(s.queryKey)) {
-      return searchRankPools.get(s.queryKey);
-    }
+    // 固有の検索条件に紐づいた作品を別検索へ誤帰属させない。
+    if (s?.queryKey) return searchRankPools.get(s.queryKey) || null;
     if (!searchConfig) return null;
     return getSearchRankContext(searchConfig, searchConfig.page);
   }
@@ -7228,7 +7227,8 @@
       const row = rows.find(r => r.api.id === it.id);
       return row && !row.feedEligibility.alreadyDisplayed &&
         !row.feedEligibility.seen && !row.feedEligibility.stronglySkipped &&
-        !row.feedEligibility.knownBookmarked && !row.feedEligibility.apiBookmarked;
+        !row.feedEligibility.knownBookmarked && !row.feedEligibility.apiBookmarked &&
+        !row.feedEligibility.feedbackExcluded;
     });
     const orderedBefore = searchRankCandidates(ctx, eligible, {diversify:false});
     const orderedAfter = searchRankCandidates(ctx, eligible, {diversify:true});
@@ -7323,7 +7323,7 @@
           taste, tasteVariants: searchDiagnosticTasteVariants(taste), relevance: null,
           feedEligibility: {alreadyDisplayed: displayed.has(it.id), seen: isSeen(it.id),
             stronglySkipped: skipStrong(it.id), knownBookmarked: knownBookmarkedIds.has(it.id),
-            apiBookmarked: it.bookmarked},
+            apiBookmarked: it.bookmarked, feedbackExcluded: isFeedbackExcluded(it)},
           humanEvaluation: {relevance: null, taste: null, centralityReason: null, notes: null}});
           if (!ids.has(it.id)) ids.set(it.id, apiOrder);
         }

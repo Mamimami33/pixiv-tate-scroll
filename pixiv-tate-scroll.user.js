@@ -4237,21 +4237,12 @@
     return penalty;
   }
 
-  function searchRankCandidates(ctx, candidates, options = {}) {
-    const { previous = [], source = null, onlyMatching = false,
+  // モデルAの並べ替え本体。診断も同じ計算済み順位行を使う。
+  function orderSearchRankRows(input, options = {}) {
+    const { previous = [], source = null,
       limit = Infinity, diversify = true } = options;
-    const ids = new Set(), rows = [];
-    for (const candidate of candidates || []) {
-      const id = candidateId(candidate);
-      if (ids.has(id)) continue;
-      const row = searchRankRow(ctx, candidate);
-      if (!row || (onlyMatching && row.tier === 0)) continue;
-      ids.add(id);
-      rows.push(row);
-    }
-    rows.sort(compareSearchRank);
+    const rows = input.slice().sort(compareSearchRank);
     if (!diversify) return rows.slice(0, limit).map(row => row.it);
-
     const result = [], used = previous.slice(-2);
     let repeated = 0;
     for (let start = 0; start < rows.length;) {
@@ -4262,10 +4253,10 @@
       while (tie.length && result.length < limit) {
         let best = 0, lowest = Infinity;
         for (let i = 0; i < tie.length; i++) {
-          const p = searchTiePenalty(tie[i], used, source, repeated);
-          if (p < lowest || (p === lowest &&
+          const penalty = searchTiePenalty(tie[i], used, source, repeated);
+          if (penalty < lowest || (penalty === lowest &&
               tie[i].apiOrder < tie[best].apiOrder)) {
-            lowest = p;
+            lowest = penalty;
             best = i;
           }
         }
@@ -4278,6 +4269,19 @@
       start = end;
     }
     return result;
+  }
+
+  function searchRankCandidates(ctx, candidates, options = {}) {
+    const ids = new Set(), rows = [];
+    for (const candidate of candidates || []) {
+      const id = candidateId(candidate);
+      if (ids.has(id)) continue;
+      const row = searchRankRow(ctx, candidate);
+      if (!row || (options.onlyMatching && row.tier === 0)) continue;
+      ids.add(id);
+      rows.push(row);
+    }
+    return orderSearchRankRows(rows, options);
   }
 
   async function prepareSearchRankCandidates(ctx, excludeIds, isCurrent, signal) {
@@ -4404,7 +4408,10 @@
     if (sorted.length !== slots.length) return; // 資格を再検証、既存は落とさない
     slots.forEach((i,j) => { slides[i] = sorted[j]; });
     const top = feedEl.scrollTop;
+    // 固定済みノードには触れず、実際に可動だったスロットだけを操作。
+    const movable = new Set(slots);
     for (let i = slides.length - 1; i > pos; i--) {
+      if (!movable.has(i)) continue;
       const node = slides[i].sectionEl;
       const following = slides[i + 1]?.sectionEl || null;
       if (node && node.nextElementSibling !== following) {
@@ -7233,47 +7240,62 @@
       });
     }
 
-    // 本番の候補資格と同じ作品ID単位での分散前後比較。
-    const search = result.search;
-    const ctx = {
-      queryKey: searchQueryKey(search),
-      word: search.word,
-      searchHitIds: new Set(),
-      searchOrderById: new Map(),
-      records: new Map()
-    };
-    const distinct = [];
+    // 同じ候補・同じ事前計算済みtaste値で診断A-directと
+    // 本番モデルAの分散前後を比較する。再計算しない。
+    const firstById = new Map();
     for (const row of rows) {
       const id = String(row.api.id);
-      if (!id || ctx.searchHitIds.has(id)) continue;
-      ctx.searchHitIds.add(id);
-      ctx.searchOrderById.set(id, row.api.apiOrder);
-      const it = {
-        id, title: row.api.title, tags: row.api.tags,
-        userId: row.api.userId, illustType: row.api.illustType,
-        isSearchApiHit: true, queryKey: ctx.queryKey
-      };
-      distinct.push(it);
-      ctx.records.set(id, it);
+      if (!id || firstById.has(id)) continue;
+      firstById.set(id, row);
     }
-    const eligible = distinct.filter(it => {
-      const row = rows.find(r => r.api.id === it.id);
-      return row && !row.feedEligibility.alreadyDisplayed &&
-        !row.feedEligibility.seen && !row.feedEligibility.stronglySkipped &&
-        !row.feedEligibility.knownBookmarked && !row.feedEligibility.apiBookmarked &&
-        !row.feedEligibility.feedbackExcluded;
+    const eligibleRows = [...firstById.values()].filter(row => {
+      const e = row.feedEligibility;
+      return !e.alreadyDisplayed && !e.seen &&
+        !e.stronglySkipped && !e.knownBookmarked &&
+        !e.apiBookmarked && !e.feedbackExcluded;
     });
-    const orderedBefore = searchRankCandidates(ctx, eligible, {diversify:false});
-    const orderedAfter = searchRankCandidates(ctx, eligible, {diversify:true});
-    const rankList = arr => arr.map((it,i) => ({id:String(it.id),rank:i+1}));
-    result.modelRanks.rankADirectBeforeDiversity = rankList(orderedBefore);
-    result.modelRanks.rankADirectAfterDiversity = rankList(orderedAfter);
+    const preparedRows = eligibleRows.map(row => ({
+      id: String(row.api.id),
+      it: { id: String(row.api.id) },
+      meta: { id: String(row.api.id),
+        userId: row.api.userId, tags: row.api.tags },
+      tier: row.match.tier,
+      taste: row.taste.total,
+      directRelevanceKey: row.match.directRelevanceKey,
+      apiOrder: row.api.apiOrder
+    }));
+    const before = orderSearchRankRows(preparedRows, {diversify:false});
+    const after = orderSearchRankRows(preparedRows, {diversify:true});
+    const rankList = arr => arr.map((it,i) => ({
+      id: String(it.id), rank: i + 1
+    }));
+    result.modelRanks.rankADirectBeforeDiversity = rankList(before);
+    result.modelRanks.rankADirectAfterDiversity = rankList(after);
+
+    // rankADirectは全API行の比較。その部分集合を比較対象として抽出。
+    const eligibleIds = new Set(preparedRows.map(row => row.id));
+    const directSubset = result.modelRanks.rankADirect
+      .filter(row => eligibleIds.has(String(row.id)))
+      .filter((row, index, all) =>
+        all.findIndex(x => x.id === row.id) === index)
+      .map(row => String(row.id));
+    const beforeIds = before.map(it => String(it.id));
+    const afterIds = after.map(it => String(it.id));
+    const sameInputOrder =
+      JSON.stringify(directSubset) === JSON.stringify(beforeIds);
     result.productionComparable = {
-      queryKey:ctx.queryKey, eligibleCount:eligible.length,
-      beforeDiversityIds:orderedBefore.map(it=>String(it.id)),
-      afterDiversityIds:orderedAfter.map(it=>String(it.id)),
-      scope:'eligible unique search API hits; excludes displayed/seen/bookmarked/skipped'
+      queryKey: searchQueryKey(result.search),
+      eligibleCount: preparedRows.length,
+      tasteSource: 'diagnostic precomputed taste.total (no recomputation)',
+      diagnosticADirectEligibleIds: directSubset,
+      beforeDiversityIds: beforeIds,
+      afterDiversityIds: afterIds,
+      sameInputOrder,
+      scope: 'same eligible unique search API hits, same taste values'
     };
+    if (!sameInputOrder) result.errors.push({
+      page: null, code: 'a-direct-production-comparator-mismatch'
+    });
     result.saturation = searchDiagnosticSaturation(rows);
     result.counts = {
       candidates: rows.length,

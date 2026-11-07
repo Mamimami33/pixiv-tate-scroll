@@ -7133,16 +7133,24 @@
   }
 
   function searchDiagnosticSaturation(rows) {
-    const n = rows.length;
-    const totals = rows.map(r => r.taste.total);
+    // 同じ作品が複数ページに現れても飽和率を二重計上しない。
+    const seen = new Set();
+    const uniqueRows = rows.filter(row => {
+      const id = String(row.api.id);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    const n = uniqueRows.length;
+    const totals = uniqueRows.map(r => r.taste.total);
     const top = n ? Math.max(...totals) : null;
     const topTied = top === null ? 0 : totals.filter(v => v === top).length;
-    const tag = rows.filter(r => r.taste.tagRaw >= 30).length;
-    const author = rows.filter(r => r.taste.authorRaw >= 27).length;
-    const both = rows.filter(r => r.taste.tagRaw >= 30 &&
+    const tag = uniqueRows.filter(r => r.taste.tagRaw >= 30).length;
+    const author = uniqueRows.filter(r => r.taste.authorRaw >= 27).length;
+    const both = uniqueRows.filter(r => r.taste.tagRaw >= 30 &&
       r.taste.authorRaw >= 27).length;
     return {
-      sampleSize: n, maxObservedTotal: top,
+      sampleSize: n, rawApiRows: rows.length, maxObservedTotal: top,
       maxObservedTotalTieCount: topTied,
       maxObservedTotalTieRate: n ? topTied / n : 0,
       exactly25Count: totals.filter(v => v === 25).length,

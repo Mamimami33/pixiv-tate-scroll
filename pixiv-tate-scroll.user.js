@@ -153,10 +153,6 @@
         ? null : String(body.userId);
       if (s.isCurrent) syncDock();
 
-      if (isFeedbackExcluded(s)) {
-        removeFeedbackSlides();
-        return;
-      }
       s.bookmarked = s.bookmarked ||
         knownBookmarkedIds.has(String(s.id)) ||
         !!body.bookmarkData;
@@ -1126,7 +1122,6 @@
   }
 
   function addItems(items) {
-    items = items.filter(it => !isFeedbackExcluded(it));
     if (items.length === 0) { updateCounter(); return; }
     items.forEach((s) => {
       slides.push(s);
@@ -1390,42 +1385,27 @@
   const LEARN_TICK_MAX_MS = 250;
   const LEARN_SAVE_INTERVAL_MS = 1500;
   let viewSaveTimer = null;
-  const LEARN_SKIP_MS = 2000;
-  const LEARN_INSTANT_MS = 1000;
-  const LEARN_SKIP_WEIGHT = 0.15;
-  const LEARN_INSTANT_WEIGHT = 0.6;
-  const LEARN_DISLIKE_WEIGHT = 12;
   const LEARN_PROFILE_LIMIT = 2000;
   const LEARN_PROFILE_CAP = 1000;
-  const LEARN_NEGATIVE_CAP = 50;
-  const LEARN_WORK_LIMIT = 2000;
-  const LEARN_MUTE_LIMIT = 500;
   const LEARN_SESSION_LIMIT = 1000;
   const LEARN_SESSION_VALUE_CAP = 100;
   const LEARN_SESSION_HALF_LIFE_MS = 10 * 60 * 1000;
   const LEARN_SESSION_TAG_WEIGHT = 7;
   const LEARN_SESSION_AUTHOR_WEIGHT = 9;
   const LEARN_SESSION_SCORE_CAP = 35;
-  const LEARN_FATIGUE_WEIGHT = 3;
-  const LEARN_FATIGUE_CAP = 24;
-  const LEARN_NEGATIVE_TAG_WEIGHT = 1.5;
-  const LEARN_NEGATIVE_AUTHOR_WEIGHT = 3;
-  const LEARN_NEGATIVE_SCORE_CAP = 36;
   const LEARN_EVENT_LIMIT = 40;
   const LEARN_EXPLORE_BASE = 0.2;
   const LEARN_EXPLORE_MIN = 0.1;
   const LEARN_EXPLORE_MAX = 0.4;
-  const LEARN_EXPLORE_SKIP_GAIN = 0.3;
   const LEARN_EXPLORE_ENGAGE_GAIN = 0.15;
   const LEARN_ENGAGE_RATIO = 0.6;
   const LEARN_FRESH_WEIGHT = 8;
   const LEARN_FRESH_HALF_LIFE_MS = 7 * 86400000;
   const sessionProfile = {
-    tags: {}, authors: {}, fatigueTags: {}, fatigueAuthors: {},
+    tags: {}, authors: {},
     works: new Map(), events: []
   };
   let sessionProfileOwner = '';
-  let feedbackPending = false;
 
   function trimLearningMap(values, limit = LEARN_PROFILE_LIMIT) {
     return Object.fromEntries(Object.entries(values)
@@ -1446,12 +1426,11 @@
   }
 
   function resetSessionLearning() {
-    for (const key of ['tags', 'authors', 'fatigueTags', 'fatigueAuthors']) {
+    for (const key of ['tags', 'authors']) {
       sessionProfile[key] = {};
     }
     sessionProfile.works.clear();
     sessionProfile.events = [];
-    skippedThisSession.clear();
     sessionProfileOwner = getMyUserId();
   }
 
@@ -1479,11 +1458,9 @@
     const p = sessionLearning();
     for (const tag of normTags(tags)) {
       addSessionValue(p.tags, tag, weight);
-      addSessionValue(p.fatigueTags, tag, -weight);
     }
     if (userId) {
       addSessionValue(p.authors, String(userId), weight);
-      addSessionValue(p.fatigueAuthors, String(userId), -weight);
     }
   }
 
@@ -1503,14 +1480,7 @@
     const positive = tags.reduce((sum, tag) => sum + Math.log1p(sessionValue(p.tags, tag)), 0) *
       LEARN_SESSION_TAG_WEIGHT + Math.log1p(sessionValue(p.authors, String(it.userId || ''))) *
       LEARN_SESSION_AUTHOR_WEIGHT;
-    const fatigue = tags.reduce((sum, tag) => sum + sessionValue(p.fatigueTags, tag), 0) +
-      sessionValue(p.fatigueAuthors, String(it.userId || ''));
-    const negative = tags.reduce((sum, tag) => sum + Math.log1p(Number(skipProfile.tags[tag]) || 0), 0) *
-      LEARN_NEGATIVE_TAG_WEIGHT + Math.log1p(Number(skipProfile.authors[String(it.userId)]) || 0) *
-      LEARN_NEGATIVE_AUTHOR_WEIGHT;
-    return Math.min(LEARN_SESSION_SCORE_CAP, positive) -
-      Math.min(LEARN_FATIGUE_CAP, fatigue * LEARN_FATIGUE_WEIGHT) -
-      Math.min(LEARN_NEGATIVE_SCORE_CAP, negative);
+    return Math.min(LEARN_SESSION_SCORE_CAP, positive);
   }
 
   function customFreshnessScore(it, now = Date.now()) {
@@ -1522,76 +1492,9 @@
   function customExplorationRate() {
     const events = sessionLearning().events;
     if (!events.length) return LEARN_EXPLORE_BASE;
-    const skipped = events.filter(e => e.skip).length / events.length;
     const engaged = events.filter(e => e.engaged).length / events.length;
     return Math.max(LEARN_EXPLORE_MIN, Math.min(LEARN_EXPLORE_MAX,
-      LEARN_EXPLORE_BASE + skipped * LEARN_EXPLORE_SKIP_GAIN - engaged * LEARN_EXPLORE_ENGAGE_GAIN));
-  }
-
-  function isFeedbackExcluded(it) {
-    return !!(skipProfile.dismissed[String(it.id)] ||
-      skipProfile.mutedAuthors[String(it.userId || '')]);
-  }
-
-  function removeFeedbackSlides() {
-    const current = slides[currentIndex()];
-    const index = Math.max(0, currentIndex());
-    slides = slides.filter(s => {
-      if (!isFeedbackExcluded(s)) return true;
-      if (activeView?.slide === s) activeView = null;
-      cleanupSlide(s);
-      s.sectionEl?.remove();
-      return false;
-    });
-    if (feedEl) {
-      const target = slides.includes(current) ? slides.indexOf(current) : Math.min(index, slides.length - 1);
-      feedEl.scrollTop = Math.max(0, target) * feedEl.clientHeight;
-      if (slides.length) markCurrentFromScroll();
-      else if (mode === 'custom') void customLoadMore();
-      else void searchLoadMore();
-    }
-    const g = searchGrid;
-    g.items = g.items.filter(it => {
-      if (!isFeedbackExcluded(it)) return true;
-      g.ids.delete(String(it.id));
-      [...(g.cards?.children || [])].find(el => el.dataset.ptsId === String(it.id))?.remove();
-      return false;
-    });
-    updateCounter();
-  }
-
-  async function dismissCurrentWork(muteAuthor = false) {
-    const s = slides[currentIndex()];
-    if (!s || feedbackPending || searchGrid.open) return;
-    feedbackPending = true;
-    const generation = feedGeneration;
-    try {
-      if (!s.resolved) await resolveSlide(s);
-      if (generation !== feedGeneration || !slides.includes(s)) return;
-      if (muteAuthor && !s.userId) {
-        window.alert('作者情報を取得できませんでした。再度お試しください。');
-        return;
-      }
-      if (muteAuthor && !skipProfile.mutedAuthors[String(s.userId)] &&
-          Object.keys(skipProfile.mutedAuthors).length >= LEARN_MUTE_LIMIT) {
-        window.alert('ミュートの上限です。現在ビューアに解除用の管理画面はありません。解除には保存済みミュート設定の手動整理が必要です。');
-        return;
-      }
-      for (const tag of normTags(s.tags)) {
-        skipProfile.tags[tag] = Math.min(LEARN_NEGATIVE_CAP,
-          (Number(skipProfile.tags[tag]) || 0) + LEARN_DISLIKE_WEIGHT);
-      }
-      if (s.userId) skipProfile.authors[String(s.userId)] = Math.min(LEARN_NEGATIVE_CAP,
-        (Number(skipProfile.authors[String(s.userId)]) || 0) + LEARN_DISLIKE_WEIGHT);
-      skipProfile.dismissed[String(s.id)] = Date.now();
-      if (muteAuthor) skipProfile.mutedAuthors[String(s.userId)] = Date.now();
-      learnSessionWork(s.tags, s.userId, -LEARN_DISLIKE_WEIGHT);
-      saveSkipProfile();
-      navIntent = {reason: 'other', until: 0};
-      removeFeedbackSlides();
-    } finally {
-      feedbackPending = false;
-    }
+      LEARN_EXPLORE_BASE - engaged * LEARN_EXPLORE_ENGAGE_GAIN));
   }
 
   async function learnOpenWork(s) {
@@ -1601,7 +1504,7 @@
     try {
       if (!s.tags?.length && !s.userId) await resolveSlide(s);
       if (generation !== feedGeneration || userId !== getMyUserId() ||
-          (!s.tags?.length && !s.userId) || isFeedbackExcluded(s)) return;
+          (!s.tags?.length && !s.userId) ) return;
       const record = sessionWork(s.id);
       if (record.opened) return;
       record.opened = true;
@@ -1609,15 +1512,6 @@
     } catch (e) {
       console.warn('[PTS] 開く操作の学習失敗', e);
     }
-  }
-
-  function manageMutedAuthors() {
-    const ids = Object.keys(skipProfile.mutedAuthors);
-    const answer = window.prompt(`ミュート中の作者ID: ${ids.join(', ') || 'なし'}\n解除する作者ID、または「全て」を入力してください。`);
-    if (!answer) return;
-    if (answer.trim() === '全て') skipProfile.mutedAuthors = {};
-    else delete skipProfile.mutedAuthors[answer.trim()];
-    saveSkipProfile();
   }
 
   const PROFILE_KEY = 'PTS_PROFILE_V2';
@@ -1717,142 +1611,22 @@
     if (persist) saveProfile();
   }
 
-  /* ---------- v3.12: 独立したスキップ学習 ---------- */
-
-  const SKIP_KEY = 'PTS_SKIP_V1';
-  const skipProfile = {
-    tags: {},
-    authors: {},
-    works: {}, dismissed: {}, mutedAuthors: {}
-  };
-
-  const skippedThisSession = new Set();
+  // 手動ナビゲーション識別は再閲覧学習で使用する。
   const viewedThisSession = new Set();
-
-  let navIntent = { reason: 'other', until: 0 };
-  let skipNavigationBound = false;
-
-  function loadSkipProfile() {
-    if (!getMyUserId()) return;
-
-    try {
-      const raw = JSON.parse(
-        readAccountStorage(SKIP_KEY) || 'null'
-      );
-
-      if (!raw ||
-          String(raw.userId || '') !== getMyUserId()) {
-        return;
-      }
-
-      for (const key of ['tags', 'authors', 'works', 'dismissed', 'mutedAuthors']) {
-        if (raw[key] &&
-            typeof raw[key] === 'object' &&
-            !Array.isArray(raw[key])) {
-          Object.assign(skipProfile[key], raw[key]);
-        }
-      }
-    } catch (e) {
-      console.warn('[PTS] スキップ履歴読み込み失敗', e);
-    }
-  }
-
-  function saveSkipProfile() {
-    const key = accountStorageKey(SKIP_KEY);
-    if (!key) return;
-
-    const entries = Object.entries(skipProfile.works)
-      .sort((a, b) =>
-        (Number(b[1]?.time) || 0) -
-        (Number(a[1]?.time) || 0)
-      );
-
-    skipProfile.works =
-      Object.fromEntries(entries.slice(0, LEARN_WORK_LIMIT));
-
-    skipProfile.tags = trimLearningMap(skipProfile.tags);
-    skipProfile.authors = trimLearningMap(skipProfile.authors);
-    skipProfile.dismissed = Object.fromEntries(Object.entries(skipProfile.dismissed)
-      .sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, LEARN_WORK_LIMIT));
-    skipProfile.mutedAuthors = Object.fromEntries(Object.entries(skipProfile.mutedAuthors)
-      .slice(0, LEARN_MUTE_LIMIT));
-    try {
-      localStorage.setItem(key, JSON.stringify({
-        userId: getMyUserId(),
-        ...skipProfile
-      }));
-    } catch (e) {
-      console.warn('[PTS] スキップ履歴保存失敗', e);
-    }
-  }
-
-  function learnSkip(s, elapsed = LEARN_SKIP_MS) {
-    const id = String(s?.id || '');
-
-    if (!/^\d+$/.test(id) || s.bookmarked || s.likedThisSession) return;
-    const weight = elapsed < LEARN_INSTANT_MS ? LEARN_INSTANT_WEIGHT : LEARN_SKIP_WEIGHT;
-    const p = sessionLearning();
-    for (const tag of normTags(s.tags)) addSessionValue(p.fatigueTags, tag, 1);
-    if (s.userId) addSessionValue(p.fatigueAuthors, String(s.userId), 1);
-    if (skippedThisSession.has(id)) return;
-    skippedThisSession.add(id);
-
-    for (const tag of normTags(s.tags)) {
-      skipProfile.tags[tag] = Math.min(
-        LEARN_NEGATIVE_CAP,
-        (Number(skipProfile.tags[tag]) || 0) + weight
-      );
-    }
-
-    if (s.userId) {
-      const author = String(s.userId);
-      skipProfile.authors[author] = Math.min(
-        LEARN_NEGATIVE_CAP,
-        (Number(skipProfile.authors[author]) || 0) + weight
-      );
-    }
-
-    const old = skipProfile.works[id];
-
-    skipProfile.works[id] = {
-      count: Math.min(20, (Number(old?.count) || 0) + 1),
-      time: Date.now()
-    };
-
-    saveSkipProfile();
-  }
-
-  function skipStrong(id) {
-    return (
-      Number(skipProfile.works[String(id)]?.count) || 0
-    ) >= 2;
-  }
-
-  function bindSkipNavigation() {
-    if (skipNavigationBound || !feedEl) return;
-    skipNavigationBound = true;
-
-    const userIntent = () => {
-      navIntent = {
-        reason: 'user',
-        until: performance.now() + 2500
-      };
-    };
-
+  let navIntent = {reason:'other',until:0};
+  let navigationBound = false;
+  function bindUserNavigationIntent() {
+    if (navigationBound || !feedEl) return;
+    navigationBound = true;
+    const note = () => {navIntent={reason:'user',until:performance.now()+2500};};
     feedEl.addEventListener('touchstart', e => {
-      if (e.touches.length === 1) userIntent();
-    }, { passive: true, capture: true });
-
+      if (e.touches.length===1) note();
+    }, {passive:true,capture:true});
     feedEl.addEventListener('pointerdown', e => {
-      if (e.isPrimary) userIntent();
-    }, { passive: true, capture: true });
-
-    feedEl.addEventListener('wheel', userIntent, {
-      passive: true
-    });
+      if (e.isPrimary) note();
+    }, {passive:true,capture:true});
+    feedEl.addEventListener('wheel', note, {passive:true});
   }
-
-  loadSkipProfile();
 
   function getMyUserId() {
     // ページ読み込み時に確認したログインユーザーのみ。
@@ -2218,29 +1992,14 @@
 
     if (tags.includes('R-18')) score += 3;
 
-    const negTags = tags.reduce(
-      (sum, t) =>
-        sum + (Number(skipProfile.tags[t]) || 0) * 0.5,
-      0
-    );
-
-    const negAuthor =
-      (Number(skipProfile.authors[authorId]) || 0) * 2;
-
-    const penalty = Math.min(
-      8,
-      score * 0.30,
-      negTags + negAuthor
-    );
-
-    const total = Number.isFinite(score) ? Math.max(0, score - penalty) : 0;
+    const total = Number.isFinite(score) ? Math.max(0, score) : 0;
     if (breakdown && typeof breakdown === 'object') Object.assign(breakdown, {
       total, tagRaw, tagCapped: Math.min(30, tagRaw),
       authorRaw, authorCapped: Math.min(27, authorRaw),
       ugoira: Number(it.illustType) === 2 &&
         historyProfile.ugoira + profile.ugoira > 0 ? 4 : 0,
       r18: tags.includes('R-18') ? 3 : 0,
-      negativePenalty: -penalty, other: 0,
+      other: 0,
       tagSaturated: tagRaw > 30, authorSaturated: authorRaw > 27,
       scoreRuleVersion: '3.13.16'
     });
@@ -2326,7 +2085,7 @@
     for (const raw of rawItems || []) {
       if (!raw) continue;
       const it = normalizeCandidate(raw);
-      if (!it.id || isFeedbackExcluded(it) || excludeIds.has(it.id) || seen.has(it.id)) continue;
+      if (!it.id || excludeIds.has(it.id) || seen.has(it.id)) continue;
       if (it.bookmarked) { knownBookmarkedIds.add(it.id); continue; }
       seen.add(it.id);
       unique.push(it);
@@ -2339,17 +2098,13 @@
         .sort((a, b) => (b.score - a.score) || (a.index - b.index))
         .map((x) => x.it);
     }
-    // ミュート中は作者不明の候補を確認してから採用する。
-    const hasMutedAuthors = Object.keys(skipProfile.mutedAuthors).length > 0;
-    const checked = hasMutedAuthors ? await mapLimited(unique, 4, async it =>
-      it.userId ? it : await enrichCandidate(it)) : unique;
-    const prelim = ranked(checked.filter(it => it && !isFeedbackExcluded(it)));
+    const prelim = ranked(unique.filter(Boolean));
     const enrichTop = Math.max(0, Math.floor(options.enrichTop != null ? options.enrichTop : 24));
     const head = prelim.slice(0, enrichTop);
     const tail = prelim.slice(enrichTop);
     const enriched = await mapLimited(head, Math.min(4, Math.max(1, enrichTop)), enrichCandidate);
     const headOk = enriched.filter((it) => {
-      if (!it || isFeedbackExcluded(it)) return false;
+      if (!it) return false;
       if (it.bookmarked) { knownBookmarkedIds.add(it.id); return false; }
       return true;
     });
@@ -2493,7 +2248,6 @@
   // 最終順位を1件ずつ決め、作者の連続だけを緩く抑える
   function customArrangeBatch(items) {
     const ranked = customDiversify(items).filter(it =>
-      !skipStrong(it.id) &&
       !isSeen(it.id) &&
       !knownBookmarkedIds.has(String(it.id))
     );
@@ -2534,7 +2288,7 @@
       ) &&
       !topAuthors.has(String(it.userId || '')) &&
       tasteScore(it) <= median &&
-      !skipStrong(it.id);
+      true;
 
     const explorationRate = customExplorationRate();
     const explorers = rest.filter(eligible)
@@ -3014,7 +2768,6 @@
 
   // スライド群を指定位置の直後に差し込む（ブックマーク時のおすすめ差し込み用）
   function insertSlidesAfter(posIdx, newSlides) {
-    newSlides = newSlides.filter(it => !isFeedbackExcluded(it));
     if (newSlides.length === 0) return;
     newSlides.forEach((s) => renderSlide(s, 99));
     slides.splice(posIdx + 1, 0, ...newSlides);
@@ -3151,7 +2904,7 @@
   }
 
   function learnViewing(v) {
-    if (!v?.readySeen || isFeedbackExcluded(v.slide)) return;
+    if (!v?.readySeen) return;
     const s = v.slide;
     if (!s.tags?.length && !s.userId) return;
     const metrics = viewingMetrics(v);
@@ -3179,10 +2932,8 @@
     learnViewing(v);
     if (!v.readySeen || !manual) return;
     const s = v.slide;
-    const skip = v.elapsed < LEARN_SKIP_MS && !s.bookmarked && !s.likedThisSession;
-    if (skip) learnSkip(s, v.elapsed);
     const events = sessionLearning().events;
-    events.push({skip, engaged: !!(s.likedThisSession || s.bookmarked ||
+    events.push({engaged: !!(s.likedThisSession || s.bookmarked ||
       sessionWork(s.id).opened || viewingMetrics(v).ratio >= LEARN_ENGAGE_RATIO)});
     if (events.length > LEARN_EVENT_LIMIT) events.shift();
   }
@@ -3819,8 +3570,6 @@
       dock.appendChild(close);
     }
 
-    addButton('pts-not-interested', '興味なし', () => { void dismissCurrentWork(); });
-    addButton('pts-mute-author', '作者をミュート', () => { void dismissCurrentWork(true); });
     addButton('pts-follow-author', '作者をフォロー',
       () => { void followCurrentAuthor(); });
     addButton('pts-return-grid', '検索結果へ戻る',
@@ -4354,8 +4103,8 @@
     const excluded = new Set((excludeIds || []).map(String));
     const raw = [...ctx.records.values()].filter(it =>
       !excluded.has(String(it.id)) && !isSeen(it.id) &&
-      !skipStrong(it.id) && !knownBookmarkedIds.has(String(it.id)) &&
-      !it.bookmarked && !isFeedbackExcluded(it)
+      !knownBookmarkedIds.has(String(it.id)) &&
+      !it.bookmarked
     );
     const prepared = await prepareCandidates(raw, {
       excludeIds: [...excluded, ...seenTimes.keys()],
@@ -4363,7 +4112,7 @@
     });
     if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) return null;
     return prepared.filter(it => ctx.searchHitIds.has(String(it.id)) &&
-      !isSeen(it.id) && !skipStrong(it.id) &&
+      !isSeen(it.id) &&
       !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
     ).map(it => ({
       ...it, isSearchApiHit: true, queryKey: ctx.queryKey
@@ -4671,7 +4420,7 @@
       if (!ctx || !searchContextValid(ctx) ||
           !ctx.searchHitIds.has(id) || !ctx.records.has(id) ||
           it.isSearchApiHit !== true || it.queryKey !== ctx.queryKey ||
-          !/^\d+$/.test(id) || isFeedbackExcluded(it) || g.ids.has(id) ||
+          !/^\d+$/.test(id) || g.ids.has(id) ||
           isSeen(id) || knownBookmarkedIds.has(id) ||
           it.bookmarked) continue;
 
@@ -5249,7 +4998,7 @@
       if (!valid() || !ranked) return; // 候補準備後の世代検証
       const selected = ranked.filter(it => {
         const id = String(it.id);
-        if (ids.has(id) || isSeen(id) || skipStrong(id) ||
+        if (ids.has(id) || isSeen(id) ||
           knownBookmarkedIds.has(id) || it.bookmarked) return false;
         ids.add(id);
         return true;
@@ -5881,7 +5630,7 @@
         const id = String(it.id);
         if (existing.has(id) || isSeen(id) ||
           knownBookmarkedIds.has(id) ||
-          it.bookmarked || skipStrong(id)) return false;
+          it.bookmarked) return false;
         existing.add(id);
         return true;
       });
@@ -7241,12 +6990,12 @@
     const soft = (v, cap) => v <= cap
       ? v : cap + cap * (1 - Math.exp(-(v-cap)/cap));
     const common = taste.ugoira + taste.r18 +
-      taste.negativePenalty + taste.other;
+      taste.other;
     return {
       raw: Math.max(0, taste.tagRaw + taste.authorRaw + common),
       soft: Math.max(0,
         soft(taste.tagRaw, tagCap) + soft(taste.authorRaw, authorCap) + common),
-      rule: 'diagnostic-only; raw uncapped; soft=cap+cap*(1-exp(-(raw-cap)/cap)); legacy penalty fixed'
+      rule: 'diagnostic-only; raw uncapped; soft=cap+cap*(1-exp(-(raw-cap)/cap)); negative feedback removed'
     };
   }
 
@@ -7278,7 +7027,7 @@
       bothAtOrOverCap: both,
       anyComponentSaturationCount: tag + author - both,
       anyComponentSaturationRate: n ? (tag + author - both) / n : 0,
-      note: 'Observed maximum is not a theoretical cap; totals can differ after penalties'
+      note: 'Observed maximum is not a theoretical cap; totals reflect positive signals'
     };
   }
 
@@ -7449,7 +7198,7 @@
           const taste = {};
           tasteScore(it, taste);
           const sum = taste.tagCapped + taste.authorCapped + taste.ugoira + taste.r18 +
-            taste.negativePenalty + taste.other;
+            taste.other;
           if (Math.abs(sum - taste.total) > 1e-9 || !Number.isFinite(sum))
             result.errors.push({page, apiOrder, code: 'taste-sum-mismatch'});
           result.candidates.push({api: {id: String(it.id), apiPage: page,
@@ -7462,8 +7211,8 @@
           match: searchDiagnosticMatch(it, search.word), legacy: {matchTier: legacySearchWordTier(it, search.word)},
           taste, tasteVariants: searchDiagnosticTasteVariants(taste), relevance: null,
           feedEligibility: {alreadyDisplayed: displayed.has(it.id), seen: isSeen(it.id),
-            stronglySkipped: skipStrong(it.id), knownBookmarked: knownBookmarkedIds.has(it.id),
-            apiBookmarked: it.bookmarked, feedbackExcluded: isFeedbackExcluded(it)},
+            knownBookmarked: knownBookmarkedIds.has(it.id),
+            apiBookmarked: it.bookmarked},
           humanEvaluation: {relevance: null, taste: null, centralityReason: null, notes: null}});
           if (!ids.has(it.id)) ids.set(it.id, apiOrder);
         }
@@ -7686,10 +7435,9 @@
     installDiagnosticUI();
     installBookmarkFeedback();
     installExperienceUI();
-    bindSkipNavigation();
+    bindUserNavigationIntent();
 
 
-    skippedThisSession.clear();
     viewedThisSession.clear();
     navIntent = { reason: 'other', until: 0 };
 

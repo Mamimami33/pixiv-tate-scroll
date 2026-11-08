@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.21
+// @version      3.13.22
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -98,6 +98,7 @@
 
   // 解決処理はPromiseを共有する（同じ作品に二重で走らせない。ChatGPTレビュー反映）
   function resolveSlide(s) {
+    if (s.contentBlocked) return Promise.resolve();
     if (s.resolved) return Promise.resolve();
     if (s.resolvePromise) return s.resolvePromise;
     s.resolving = true;
@@ -144,14 +145,27 @@
     try {
       const body = await get(`/ajax/illust/${s.id}`, signal);
 
-      if (signal?.aborted) return;
+      if (signal?.aborted || s.contentFilterEpoch !== contentFilterEpoch || !slides.includes(s)) return;
+      if (!contentMatches(body)) {
+        s.rawType = contentEnum(body.illustType);
+        s.xRestrict = contentEnum(body.xRestrict);
+        s.contentBlocked = true;
+        cleanupSlide(s);
+        s.sectionEl?.replaceChildren();
+        if (s.sectionEl) s.sectionEl.textContent = contentEmptyMessage();
+        s.isCurrent = false;
+        if (activeView?.slide === s) activeView = null;
+        return;
+      }
 
       s.createDate = body.createDate || s.createDate || null;
       s.seriesNextId = seriesNextId(body.seriesNavData);
       s.series = parseArtworkSeries(body);
       s.seriesInfoChecked = true;
       if(s.isCurrent)syncSeriesBar();
-      s.rawType = Number(body.illustType);
+      if (!contentMatches(body) || s.contentFilterEpoch !== contentFilterEpoch || signal?.aborted) return;
+      s.rawType = contentEnum(body.illustType);
+      s.xRestrict = contentEnum(body.xRestrict);
       s.tags = normTags(body.tags);
       s.userId = body.userId == null
         ? null : String(body.userId);
@@ -322,7 +336,7 @@
   }
 
   function upgradeSlide(s, force) {
-    if (!s.resolved || !s.pairs) return;
+    if (!contentMatches(s) || !s.resolved || !s.pairs) return;
 
     const holder = s.sectionEl?.querySelector('.pts-holder');
     if (!holder) return;
@@ -1126,7 +1140,9 @@
   }
 
   function addItems(items) {
+    items = items.filter(s => contentMatches(s) && s.contentFilterEpoch === contentFilterEpoch);
     if (items.length === 0) { updateCounter(); return; }
+    feedEl.querySelector('.pts-content-empty')?.remove();
     items.forEach((s) => {
       slides.push(s);
       renderSlide(s, slides.length - 1);
@@ -1638,7 +1654,8 @@
         id: String(id),
         userId: w.userId == null ? '' : String(w.userId),
         tags: normTags(w.tags),
-        illustType: Number(w.illustType),
+        illustType: contentEnum(w.illustType),
+        xRestrict: contentEnum(w.xRestrict),
         pageCount: Number(w.pageCount) || 1,
         createDate: typeof w.createDate === 'string'
           ? w.createDate : null
@@ -2012,6 +2029,186 @@
   initProfileFromBookmarks();
   let feedGeneration = 0;
 
+  /* ---------- v3.13.22: 表示モードとは独立したコンテンツ条件 ---------- */
+  let viewMode = 'feed'; // 将来の本棚モード用。検索/推薦(mode)とも独立。
+  let contentFilter = { type: 'all', age: 'all' };
+  let contentFilterEpoch = 0;
+  let contentFilterConfirmed = false;
+  let contentFilterDialog = null;
+  const contentMetadata = new Map();
+  const CONTENT_DETAIL_LIMIT = 24;
+
+  function contentEnum(value) {
+    if (typeof value !== 'number' && typeof value !== 'string') return null;
+    if (!/^[012]$/.test(String(value))) return null;
+    return Number(value);
+  }
+  function contentType(it) {
+    return contentEnum(it?.illustType ?? it?.rawType);
+  }
+  function contentKnown(it) {
+    return contentType(it) !== null && contentEnum(it?.xRestrict) !== null;
+  }
+  function contentMatches(it, filter = contentFilter) {
+    const type = contentType(it), age = contentEnum(it?.xRestrict);
+    // 「すべて」でも未知の種別/区分は表示しない。
+    return type !== null && age !== null &&
+      (filter.type === 'all' || (filter.type === 'manga' ? type === 1 : type === 0 || type === 2)) &&
+      (filter.age === 'all' || age === (filter.age === 'safe' ? 0 : 1));
+  }
+  function contentCouldMatch(it, filter) {
+    const type = contentType(it), age = contentEnum(it?.xRestrict);
+    return (type === null || filter.type === 'all' ||
+      (filter.type === 'manga' ? type === 1 : type === 0 || type === 2)) &&
+      (age === null || filter.age === 'all' || age === (filter.age === 'safe' ? 0 : 1));
+  }
+  async function filterContentCandidates(items, isCurrent = () => true) {
+    const epoch = contentFilterEpoch, filter = {...contentFilter};
+    const valid = () => epoch === contentFilterEpoch && isCurrent();
+    let requests = 0;
+    const result = await mapLimited(items, 4, async item => {
+      if (!valid() || !contentCouldMatch(item, filter)) return null;
+      let it = item;
+      if (!contentKnown(it)) {
+        const id = candidateId(it);
+        if (!/^[1-9]\d*$/.test(id)) return null;
+        let pending = contentMetadata.get(id);
+        if (!pending) {
+          if (requests++ >= CONTENT_DETAIL_LIMIT) return null;
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          pending = fetchJson('/ajax/illust/' + encodeURIComponent(id), controller.signal)
+            .then(body => ({illustType: contentEnum(body.illustType),
+              xRestrict: contentEnum(body.xRestrict)})).catch(() => null)
+            .finally(() => clearTimeout(timeout));
+          contentMetadata.set(id, pending);
+          if (contentMetadata.size > 500) contentMetadata.delete(contentMetadata.keys().next().value);
+        }
+        const metadata = await pending;
+        if (!valid() || !metadata) return null;
+        it = {...it, ...metadata};
+      }
+      return valid() && contentMatches(it, filter) ? it : null;
+    });
+    return valid() ? result.filter(Boolean) : [];
+  }
+  function contentFilterKey() {
+    return 'PTS_CONTENT_FILTER_V1:' + (getMyUserId() || 'guest');
+  }
+  function readContentFilter() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(contentFilterKey()) || 'null');
+      contentFilter = {
+        type: ['all','manga','illust'].includes(saved?.type) ? saved.type : 'all',
+        age: ['all','safe','r18'].includes(saved?.age) ? saved.age : 'all'
+      };
+    } catch { contentFilter = {type:'all', age:'all'}; }
+  }
+  function contentFilterLabel() {
+    return ({all:'すべて',manga:'マンガ',illust:'イラスト・うごイラ'})[contentFilter.type] +
+      '・' + ({all:'すべて',safe:'全年齢',r18:'R-18'})[contentFilter.age];
+  }
+  function contentEmptyMessage() {
+    return '現在の条件で表示できる作品がありません。取得範囲や作品情報、pixiv側の閲覧設定などにより結果が得られない場合があります。条件を変更するか、続きを取得してください。';
+  }
+  function showContentEmpty() {
+    if (!feedEl || slides.length || contentFilterDialog?.open) return;
+    let box = feedEl.querySelector('.pts-content-empty');
+    if (!box) {
+      box = document.createElement('div'); box.className = 'pts-content-empty';
+      box.style.cssText = 'padding:100px 24px 160px;color:white;max-width:520px;margin:auto;line-height:1.8';
+      const message = document.createElement('p'); message.textContent = contentEmptyMessage();
+      const change = document.createElement('button'); change.textContent = '条件を変更';
+      change.onclick = () => showContentFilterDialog(false);
+      const more = document.createElement('button'); more.textContent = '続きを取得';
+      more.onclick = async () => {
+        more.disabled = true;
+        try {
+          if (mode === 'search') await searchLoadMore();
+          else { customExhausted = false; customEmptyBatches = 0; await customLoadMore(); }
+        }
+        finally { more.disabled = false; }
+      };
+      box.append(message, change, more); feedEl.appendChild(box);
+    }
+  }
+  function contentSourceMode(filter = contentFilter, fallback = 'all') {
+    // URL側がsafeなら、ビューア選択でその制限を広げない。
+    return fallback === 'safe' ? 'safe' : filter.age === 'all' ? fallback : filter.age;
+  }
+  function contentSourceType(filter = contentFilter) {
+    return filter.type === 'manga' ? 'manga' : filter.type === 'illust' ? 'illust_and_ugoira' : 'all';
+  }
+  function contentDiscoveryUrl(filter = contentFilter) {
+    return '/ajax/discovery/artworks?' + new URLSearchParams({
+      mode: contentSourceMode(filter), type: contentSourceType(filter), limit: '60'
+    });
+  }
+  function showContentFilterDialog(startup) {
+    if (contentFilterDialog?.open) return;
+    const dialog = document.createElement('dialog'); contentFilterDialog = dialog;
+    dialog.id = 'pts-content-filter';
+    dialog.style.cssText = 'position:fixed;top:auto;bottom:12px;width:min(92vw,480px);box-sizing:border-box;max-height:88dvh;overflow:auto;border:0;border-radius:18px;padding:20px;background:#20232b;color:white;z-index:100010';
+    const title = document.createElement('h2'); title.textContent = startup ? '表示する作品を選択' : '表示条件を変更';
+    const form = document.createElement('form'); form.method = 'dialog';
+    for (const [name,label,options] of [
+      ['type','種別',[['all','すべて'],['manga','マンガのみ'],['illust','イラスト・うごイラ']]],
+      ['age','年齢',[['all','すべて'],['safe','全年齢のみ'],['r18','R-18のみ']]]
+    ]) {
+      const field = document.createElement('fieldset'), legend = document.createElement('legend');
+      legend.textContent = label; field.appendChild(legend);
+      for (const [value,text] of options) {
+        const row = document.createElement('label'); row.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer';
+        const input = document.createElement('input'); input.type='radio'; input.name=name; input.value=value;
+        input.checked=contentFilter[name]===value; row.append(input,document.createTextNode(text)); field.appendChild(row);
+      }
+      form.appendChild(field);
+    }
+    const note = document.createElement('p'); note.textContent = 'pixiv側の閲覧設定を尊重します。R-18Gは「R-18のみ」には含みません。';
+    const reset = document.createElement('button'); reset.type='button'; reset.textContent='すべてに戻す';
+    reset.onclick=()=>{for(const name of ['type','age'])form.elements[name].value='all';};
+    const cancel = document.createElement('button'); cancel.type='button'; cancel.textContent='キャンセル';
+    const start = document.createElement('button'); start.type='submit'; start.textContent=startup?'この条件で開始':'確定して先頭から開始';
+    for(const b of [reset,cancel,start])b.style.cssText='min-height:48px;margin:6px 4px;padding:8px 12px';
+    const dismiss = () => {
+      dialog.close(); dialog.remove(); contentFilterDialog=null;
+      if(activeView)activeView.last=performance.now();
+      if(seriesUI.reading)seriesUI.reading.last=performance.now();
+    };
+    const cancelSelection = () => { dismiss(); if(startup)routeAutoStartSuppressed=true; };
+    cancel.onclick=cancelSelection;
+    dialog.addEventListener('cancel',e=>{e.preventDefault();cancelSelection();});
+    form.addEventListener('submit',e=>{
+      e.preventDefault();
+      const next={type:form.elements.type.value,age:form.elements.age.value};
+      const changed=JSON.stringify(next)!==JSON.stringify(contentFilter);
+      contentFilter=next; contentFilterConfirmed=true;
+      try{localStorage.setItem(contentFilterKey(),JSON.stringify(next));}catch{}
+      dismiss();
+      if(startup){openViewer();return;}
+      if(!changed)return;
+      // 再生成は閲覧終了/スキップ学習を呼ばず、全非同期経路を失効させる。
+      activeView=null; navIntent={reason:'other',until:0};
+      contentFilterEpoch++; feedGeneration++;
+      cancelSearchDiagnostic('filter changed'); searchRankPools.clear(); seriesCache.clear();
+      const gridWord=searchGrid.open?searchGrid.config?.word:null;
+      closeSearchGrid(false); gridReturnState=null;
+      seriesCloseLayer(); seriesHideList(); sessionTrail.length=0;
+      overlay.querySelector('.pts-history-panel')?.setAttribute('hidden','');
+      syncContentFilterButton();
+      if(mode==='search')void startSearchFeed(); else void startCustomFeed();
+      if(gridWord)openSearchGrid(gridWord);
+    });
+    form.append(note,reset,cancel,start); dialog.append(title,form); document.body.appendChild(dialog); dialog.showModal();
+    start.focus();
+  }
+  function syncContentFilterButton() {
+    const button=overlay?.querySelector('.pts-content-filter');
+    if(button)button.textContent=contentFilterLabel();
+  }
+
+  readContentFilter();
+
   function candidateId(it) {
     const id = it && (it.id != null ? it.id : it.illustId);
     return id == null ? '' : String(id);
@@ -2023,7 +2220,8 @@
       id: candidateId(it),
       tags: normTags(it.tags),
       userId: it.userId == null ? null : String(it.userId),
-      illustType: Number(it.illustType),
+      illustType: contentType(it),
+      xRestrict: contentEnum(it.xRestrict),
       bookmarked: !!(it.bookmarkData || it.bookmarked || it.isBookmarked),
       bookmarkStateKnown:
         Object.prototype.hasOwnProperty.call(it, 'bookmarkData') ||
@@ -2056,7 +2254,8 @@
         ...it,
         tags: normTags(body.tags),
         userId: body.userId == null ? it.userId : String(body.userId),
-        illustType: Number(body.illustType),
+        illustType: contentEnum(body.illustType),
+        xRestrict: contentEnum(body.xRestrict),
         bookmarked: !!body.bookmarkData,
         bookmarkData: body.bookmarkData,
       };
@@ -2089,7 +2288,8 @@
         .sort((a, b) => (b.score - a.score) || (a.index - b.index))
         .map((x) => x.it);
     }
-    const prelim = ranked(unique.filter(Boolean));
+    const eligible = await filterContentCandidates(unique, options.isCurrent);
+    const prelim = ranked(eligible);
     const enrichTop = Math.max(0, Math.floor(options.enrichTop != null ? options.enrichTop : 24));
     const head = prelim.slice(0, enrichTop);
     const tail = prelim.slice(enrichTop);
@@ -2100,11 +2300,11 @@
       return true;
     });
     // 補完後も同じランキング関数で並べ直す（票の加点が途中で消えない）
-    return ranked([...headOk, ...tail]);
+    return ranked([...headOk, ...tail].filter(it => contentMatches(it)));
   }
 
   function candidatesToSlides(items) {
-    return items.map(it => {
+    return items.filter(it => contentMatches(it)).map(it => {
       const s = newSlide(
         it.id,
         it.url || '',
@@ -2120,6 +2320,8 @@
         s.rawType = Number(it.illustType);
       }
 
+      s.xRestrict = contentEnum(it.xRestrict);
+      s.contentFilterEpoch = contentFilterEpoch;
       s.bookmarked = false;
       s.customSources = Array.isArray(it._customSources)
         ? it._customSources.slice()
@@ -2144,6 +2346,7 @@
   let customSeenIds = new Set();
   let customExhausted = false;
   let customBatchNumber = 0;
+  let customEmptyBatches = 0;
 
   // 既存フィードの表示済み作品も記録する（同一ページ内では再表示しない）
 
@@ -2162,12 +2365,13 @@
       result.push(value);
     };
     // 初回のみ作品ページの作品をシードにする
-    if (customBatchNumber === 0) add(customPageArtworkId());
+    // 作品ページのシードは customFetchBatch で詳細を確認してから追加する。
     // 履歴から3件。次バッチでは3件ずつ先へ進める
     const works = bookmarkHistory.works || [];
     let added = 0;
     while (customSeedOffset < works.length && added < 3) {
       const work = works[customSeedOffset++];
+      if (!contentMatches(work)) continue;
       const before = result.length;
       add(work && work.id);
       if (result.length > before) added++;
@@ -2208,7 +2412,7 @@
             _customSources: [], _customOrder: order++ };
           merged.set(id, it);
         } else {
-          for (const key of ['tags','userId','illustType','pageCount','url','title','userName']) {
+          for (const key of ['tags','userId','illustType','xRestrict','pageCount','url','title','userName']) {
             const old = it[key], newer = raw[key];
             if ((old == null || old === '' || (Array.isArray(old) && !old.length)) &&
                 newer != null) it[key] = newer;
@@ -2432,6 +2636,8 @@
         const author = String(it.userId || '');
 
         let score = customBaseScore(it);
+        if (contentType(it) === contentType(source)) score += 12;
+        if (contentEnum(it.xRestrict) === contentEnum(source?.xRestrict)) score += 12;
 
         if (author && author === a) score -= 12;
         if (author && author === b) score -= 5;
@@ -2497,9 +2703,18 @@
 
   // 単一バッチの取得（初回：シード最大4＋discovery＋補完枠／追加：nextIds＋新シード＋discovery）
   async function customFetchBatch() {
+    const generation = feedGeneration, epoch = contentFilterEpoch;
+    const valid = () => generation === feedGeneration && epoch === contentFilterEpoch;
+    const filter = {...contentFilter};
     const first = customBatchNumber === 0;
     const jobs = [];
     const seeds = customPickSeeds();
+    const pageId = first ? customPageArtworkId() : null;
+    if (pageId) {
+      const pageSeed = await filterContentCandidates([{id:pageId}], valid);
+      if (!valid()) return [];
+      if (pageSeed.length) seeds.unshift(pageId);
+    }
 
     if (!first && customNextIds.length) {
       const ids = customNextIds.slice(0, 60);
@@ -2524,7 +2739,7 @@
     jobs.push({
       type: 'discovery',
       run: () => fetchJson(
-        '/ajax/discovery/artworks?mode=all&limit=60'
+        contentDiscoveryUrl(filter)
       )
     });
 
@@ -2537,9 +2752,10 @@
       .slice(0, 12)
       .map(([k]) => k);
 
-    if (!tags.length) tags.push('R-18');
+    if (!tags.length) tags.push(filter.age === 'safe' ? 'オリジナル' : filter.type === 'manga' ? '漫画' : 'R-18');
 
-    const tag = tags[customTagOffset++ % tags.length];
+    const tagOffset = customTagOffset++;
+    const tag = tags[tagOffset % tags.length];
 
     jobs.push({
       type: 'tag',
@@ -2547,7 +2763,8 @@
         '/ajax/search/artworks/' + encodeURIComponent(tag) +
         '?' + new URLSearchParams({
           word: tag, order: 'popular_d',
-          mode: 'all', s_mode: 's_tag', p: '1'
+          mode: contentSourceMode(filter), type: contentSourceType(filter),
+          s_mode: 's_tag', p: String(Math.min(1000, Math.floor(tagOffset / tags.length) + 1))
         })
       )
     });
@@ -2557,7 +2774,7 @@
       jobs.push({
         type: 'follow', page,
         run: () => fetchJson(
-          `/ajax/follow_latest/illust?mode=all&p=${page}`
+          `/ajax/follow_latest/illust?mode=${contentSourceMode(filter)}&p=${page}`
         )
       });
     }
@@ -2567,7 +2784,8 @@
       .sort((a, b) => b[1] - a[1])
       .slice(0, 12);
 
-    if (authors.length) {
+    // この既存作者APIはイラスト用。マンガ選択では推薦/検索プールを優先する。
+    if (authors.length && filter.type !== 'manga') {
       const authorId =
         authors[customAuthorOffset++ % authors.length][0];
 
@@ -2589,6 +2807,7 @@
       }
     });
 
+    if (!valid()) return [];
     const results = [], nextIds = [];
     let successful = 0;
 
@@ -2645,11 +2864,11 @@
       {
         excludeIds: [...customSeenIds, ...seenTimes.keys()],
         enrichTop: 0,
-        rank: customBaseScore
+        rank: customBaseScore, isCurrent: valid
       }
     );
 
-    return customArrangeBatch(prepared);
+    return valid() ? customArrangeBatch(prepared) : [];
   }
 
   function customResetState() {
@@ -2659,6 +2878,7 @@
     customQueuedIds = new Set();
     customExhausted = false;
     customBatchNumber = 0;
+    customEmptyBatches = 0;
     customTagOffset = 0;
     customFollowPage = 1;
     customFollowFinished = false;
@@ -2686,7 +2906,12 @@
     updateCounter();
 
     try {
-      const items = await customFetchBatch();
+      let items = [];
+      for (let attempt = 0; attempt < 3 && !items.length; attempt++) {
+        items = await customFetchBatch();
+        if (generation !== feedGeneration) return;
+        if (!items.length) customBatchNumber++;
+      }
 
       if (
         generation !== feedGeneration ||
@@ -2695,7 +2920,7 @@
       ) return;
 
       if (!items.length) {
-        throw new Error('表示できる候補がありません');
+        customExhausted = true; showContentEmpty(); return;
       }
 
       addItems(candidatesToSlides(items));
@@ -2726,6 +2951,7 @@
     } finally {
       if (generation === feedGeneration) {
         customBusy = false;
+        showContentEmpty();
       }
     }
   }
@@ -2747,18 +2973,21 @@
         for (const it of selected) customSeenIds.add(String(it.id));
       }
       customBatchNumber++;
+      customEmptyBatches = selected.length ? 0 : customEmptyBatches + 1;
+      if (customEmptyBatches >= 3) customExhausted = true;
       if (!selected.length && customSeedOffset >= (bookmarkHistory.works || []).length &&
           !customNextIds.length && customFollowFinished) customExhausted = true;
     } catch (e) {
       console.warn('[PTS custom] 続き取得失敗', e);
     } finally {
-      if (generation === feedGeneration) customBusy = false;
+      if (generation === feedGeneration) { customBusy = false; showContentEmpty(); }
     }
   }
 
 
   // スライド群を指定位置の直後に差し込む（ブックマーク時のおすすめ差し込み用）
   function insertSlidesAfter(posIdx, newSlides) {
+    newSlides = newSlides.filter(s => contentMatches(s) && s.contentFilterEpoch === contentFilterEpoch);
     if (newSlides.length === 0) return;
     newSlides.forEach((s) => renderSlide(s, 99));
     slides.splice(posIdx + 1, 0, ...newSlides);
@@ -2855,7 +3084,7 @@
   });
 
   function visibleReady(s) {
-    if (!s || !s.resolved) return false;
+    if (!s || !contentMatches(s) || !s.resolved) return false;
     if (s.kind === 'ugoira') return !!(s.frameUrls && s.frameUrls.length);
     const img = s.mainImg;
     return !!(img && img.complete && img.naturalWidth > 0);
@@ -2912,6 +3141,12 @@
           cache.pages.clear();cache.rows.clear();
         }
         cache.total=total;
+        const epoch=contentFilterEpoch;
+        const rows=thumbs.map((t,i)=>({...t,id:t?.id??t?.illustId??
+          (thumbs.length===list.length?list[i]?.workId:null)}));
+        const eligible=await filterContentCandidates(rows);
+        if(epoch!==contentFilterEpoch)return false;
+        const allowedIds=new Set(eligible.map(candidateId));
         const thumbMap=new Map(thumbs.map(t=>[String(t?.id??t?.illustId??''),t]));
         list.forEach((item,offset)=>{
           const id=String(item?.workId??''),order=Number(item?.order);
@@ -2920,8 +3155,9 @@
           const aligned=thumbs.length===list.length &&
             String(thumbs[offset]?.id??thumbs[offset]?.illustId??'')==='';
           const thumb=thumbMap.get(id)||(aligned?thumbs[offset]:null);
-          cache.rows.set(index,{id,index,order,title:thumb?.title||'',
-            thumbnail:thumb?.url||'',pageCount:Number(thumb?.pageCount)||null});
+          cache.rows.set(index,{id,index,order,allowed:allowedIds.has(id),
+            title:allowedIds.has(id)?thumb?.title||'':'表示条件に合わないか情報を確認できません',
+            thumbnail:allowedIds.has(id)?thumb?.url||'':'',pageCount:Number(thumb?.pageCount)||null});
         });
         cache.pages.add(page);cache.error='';cache.updated=Date.now();
         return true;
@@ -2971,6 +3207,7 @@
         button.append(img,label);
         const current=seriesUI.episode?.id||slides[currentIndex()]?.id;
         if(String(current)===item.id)button.classList.add('pts-series-selected');
+        button.disabled=!item.allowed;
         button.addEventListener('click',()=>void seriesOpenEpisode(item));
       }
       frag.appendChild(button);
@@ -3100,7 +3337,7 @@
     if(!r)return;
     const now=performance.now();
     const dt=Math.min(250,Math.max(0,now-r.last));r.last=now;
-    if(!seriesUI.layerOpen||seriesUI.sheetOpen||document.hidden||
+    if(contentFilterDialog?.open||!seriesUI.layerOpen||seriesUI.sheetOpen||document.hidden||
        seriesUI.episode?.id!==r.id||!r.imageReady)return;
     r.elapsed+=dt;
     if(!r.recorded&&r.elapsed>=LEARN_READY_MS){
@@ -3196,6 +3433,7 @@
     try{
       const body=await fetchJson('/ajax/illust/'+encodeURIComponent(item.id));
       if(token!==seriesUI.layerToken||!seriesUI.layerOpen)return;
+      if(!contentMatches(body))throw new Error('現在の表示条件に合わないか、種別・年齢情報を確認できません');
       const info=parseArtworkSeries(body);
       if(!info||info.id!==source.id||String(body.id??item.id)!==item.id)
         throw new Error('指定したシリーズの漫画を確認できません');
@@ -3212,7 +3450,7 @@
       const e={id:item.id,index:item.index,order:item.order,
         title:body.title||item.title||'',series:info,pairs,
         tags:normTags(body.tags),userId:body.userId==null?null:String(body.userId),
-        rawType:1,bookmarked:!!body.bookmarkData||
+        rawType:1,xRestrict:contentEnum(body.xRestrict),bookmarked:!!body.bookmarkData||
           knownBookmarkedIds.has(String(item.id)),tasteLearned:false,
         bookmarkBtn:seriesUI.layer.querySelector('.pts-series-save')};
       seriesUI.episode=e;seriesUI.pageIndex=0;
@@ -3323,6 +3561,7 @@
         void seriesShowPage(seriesUI.pageIndex+(dx<0?1:-1));
     },{passive:true});
     document.addEventListener('keydown',ev=>{
+      if(contentFilterDialog?.open)return;
       if(!seriesUI.layerOpen&&!seriesUI.sheetOpen)return;
       if(ev.key==='Escape'){
         if(seriesUI.sheetOpen)seriesHideList();else seriesCloseLayer();
@@ -3355,6 +3594,7 @@
   function syncDock() {
     if (!overlay) return;
     syncSeriesBar();
+    syncContentFilterButton();
     const returnButton = overlay.querySelector('.pts-return-grid');
     if (returnButton) returnButton.hidden = !gridReturnState ||
       searchGrid.open || overlay.style.display === 'none';
@@ -3446,7 +3686,7 @@
     v.last = now;
     const s = v.slide;
     const wasCounting = v.counting;
-    v.counting = !!(overlay && overlay.style.display !== 'none' && !searchGrid.open &&
+    v.counting = !!(!contentFilterDialog?.open && overlay && overlay.style.display !== 'none' && !searchGrid.open &&
       !document.hidden && !seriesUI.layerOpen && !seriesUI.sheetOpen && slides[currentIndex()] === s && s.isCurrent && visibleReady(s));
     if (!v.counting) return;
     v.readySeen = true;
@@ -3468,7 +3708,7 @@
     learnViewing(v);
   }
   function onUgoiraLoop(s) {
-    if (!searchGrid.open && activeView?.slide === s && !document.hidden) {
+    if (!contentFilterDialog?.open && !searchGrid.open && activeView?.slide === s && !document.hidden) {
       activeView.loops++;
     }
   }
@@ -3562,6 +3802,7 @@
 
   // キーボードによる移動はビューア表示中のみ。入力操作・修飾キーを優先。
   function handleViewerKeyboard(e) {
+    if (contentFilterDialog?.open) return;
     if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.altKey ||
         e.metaKey || !overlay || overlay.style.display==='none' ||
         searchGrid.open || seriesUI.sheetOpen || seriesUI.layerOpen) return;
@@ -3634,7 +3875,7 @@
     list.replaceChildren();
     for (const item of [...sessionTrail].reverse()) {
       const btn = document.createElement('button');
-      const available = slides.some(s => String(s.id) === item.id);
+      const available = slides.some(s => String(s.id) === item.id && contentMatches(s));
       btn.textContent = `${available ? '▶' : '—'} ${item.title || item.id} (${item.id})`;
       btn.disabled = !available;
       btn.addEventListener('click', () => {
@@ -4054,6 +4295,7 @@
       dock.appendChild(close);
     }
 
+    dock.prepend(addButton('pts-content-filter', contentFilterLabel(), () => showContentFilterDialog(false)));
     addButton('pts-follow-author', '作者をフォロー',
       () => { void followCurrentAuthor(); });
     addButton('pts-return-grid', '検索結果へ戻る',
@@ -4112,6 +4354,7 @@
     document.addEventListener('keydown', handleViewerKeyboard, true);
 
     document.addEventListener('keydown', e => {
+      if (contentFilterDialog?.open) return;
       if (
         e.key !== 'Escape' ||
         overlay.style.display === 'none'
@@ -4294,14 +4537,9 @@
 
   // 検索API候補専用。illustTypeが欠落したときはrawTypeを使い、
   // どちらも不明ならnullのままとする（ugoira加点なし）。
-  // custom用normalizeCandidateの既存挙動は変えない。
+  // 通常候補と同じ厳密な種別正規化を使う。
   function searchIllustType(candidate) {
-    for (const raw of [candidate?.illustType, candidate?.rawType]) {
-      if (raw == null || raw === '') continue;
-      const type = Number(raw);
-      if (Number.isFinite(type)) return type;
-    }
-    return null;
+    return contentType(candidate);
   }
 
   function normalizeSearchCandidate(candidate) {
@@ -4327,13 +4565,14 @@
     return {
       word: String(config.word || ''),
       order: String(config.order || 'popular_d'),
-      mode: String(config.searchMode || 'all'),
+      mode: contentSourceMode(config.contentFilter || contentFilter, String(config.searchMode || 'all')),
+      type: contentSourceType(config.contentFilter || contentFilter),
       s_mode: String(config.matchMode || 's_tag')
     };
   }
 
   function searchQueryKey(config) {
-    return JSON.stringify(searchApiConditions(config));
+    return JSON.stringify([searchApiConditions(config), config.contentFilter || contentFilter]);
   }
 
   function getSearchRankContext(config, startPage = 1) {
@@ -4350,7 +4589,8 @@
           word: String(config.word || ''),
           order: String(config.order || 'popular_d'),
           searchMode: String(config.searchMode || 'all'),
-          matchMode: String(config.matchMode || 's_tag')
+          matchMode: String(config.matchMode || 's_tag'),
+          contentFilter: {...contentFilter}
         }),
         queryType: queryTokens.length > 1 ? 'multi-token' : 'single-token',
         relatedTags: new Set(), searchOrderById: new Map(),
@@ -4588,7 +4828,7 @@
     );
     const prepared = await prepareCandidates(raw, {
       excludeIds: [...excluded, ...seenTimes.keys()],
-      enrichTop: 0, rank: tasteScore
+      enrichTop: 0, rank: tasteScore, isCurrent
     });
     if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) return null;
     return prepared.filter(it => ctx.searchHitIds.has(String(it.id)) &&
@@ -4611,6 +4851,11 @@
   }
 
   async function fetchBookmarkRelatedCandidates(id) {
+    const epoch = contentFilterEpoch;
+    const anchor = slides.find(s => String(s.id) === String(id));
+    const filter = {...contentFilter};
+    if (filter.type === 'all' && contentType(anchor) !== null) filter.type = contentType(anchor) === 1 ? 'manga' : 'illust';
+    if (filter.age === 'all' && contentEnum(anchor?.xRestrict) !== null) filter.age = Number(anchor.xRestrict) > 0 ? 'r18' : 'safe';
     // recommend の既存取得に discovery を1回だけ追加する。
     const related = (async () => {
       const body = await fetchJson(
@@ -4633,12 +4878,13 @@
     })();
     const results = await Promise.allSettled([
       related,
-      fetchJson('/ajax/discovery/artworks?mode=all&limit=60')
+      fetchJson(contentDiscoveryUrl(filter))
         .then(customCandidateArray)
     ]);
     if (results.every(result => result.status === 'rejected')) {
       throw results[0].reason;
     }
+    if (epoch !== contentFilterEpoch) return [];
     return results.flatMap(result =>
       result.status === 'fulfilled' ? result.value : []
     );
@@ -4895,6 +5141,7 @@
     const accepted = [];
 
     for (const it of items) {
+      if (!contentMatches(it)) continue;
       const id = String(it.id);
       const ctx = g.rankContext;
       if (!ctx || !searchContextValid(ctx) ||
@@ -5103,7 +5350,7 @@
         g.retry.hidden = false;
       } else if (ctx.finished) {
         g.status.textContent = g.items.length ? g.items.length + '件' :
-          '該当がありません';
+          contentEmptyMessage();
       } else {
         g.status.textContent = g.items.length + '件表示中';
         if (g.scroll.scrollHeight <= g.scroll.clientHeight + 4) {
@@ -5129,7 +5376,7 @@
   }
 
   function openGridArtwork(it) {
-    if (!searchGrid.open || !feedEl) return;
+    if (!searchGrid.open || !feedEl || !contentMatches(it)) return;
 
     const id = String(it?.id || '');
     if (!/^\d+$/.test(id)) return;
@@ -5497,7 +5744,7 @@
         const counter = overlay?.querySelector('.pts-counter');
         if (counter) counter.textContent = loaded.error
           ? '検索取得失敗: ' + (loaded.error.message || loaded.error)
-          : '表示可能な検索結果がありません';
+          : contentEmptyMessage();
       }
     } catch (e) {
       if (valid()) {
@@ -5505,7 +5752,7 @@
         console.warn('[PTS search]', e);
       }
     } finally {
-      if (generation === feedGeneration) searchBusy = false;
+      if (generation === feedGeneration) { searchBusy = false; showContentEmpty(); }
     }
   }
 
@@ -5710,7 +5957,7 @@
   }
 
   function gotoSlide(i, reason = 'other') {
-    if (!feedEl || i < 0 || i >= slides.length) return;
+    if (!feedEl || i < 0 || i >= slides.length || !contentMatches(slides[i])) return;
 
     navIntent = {
       reason,
@@ -6039,7 +6286,7 @@
         `/ajax/illust/${encodeURIComponent(id)}`
       );
 
-      if (!next ||
+      if (!next || !contentMatches(next) ||
           next.bookmarkData ||
           !next.urls ||
           generation !== feedGeneration ||
@@ -6058,7 +6305,9 @@
       item.tags = normTags(next.tags);
       item.userId = next.userId == null
         ? null : String(next.userId);
-      item.rawType = Number(next.illustType);
+      item.rawType = contentEnum(next.illustType);
+      item.xRestrict = contentEnum(next.xRestrict);
+      item.contentFilterEpoch = contentFilterEpoch;
       item.seriesParentId = String(s.id);
 
       const current = slides[currentIndex()];
@@ -7644,7 +7893,7 @@
     const context = searchDiagnosticContext();
     const generation = ++searchDiagnosticGeneration;
     const search = context?.search || null;
-    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.21',
+    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.22',
       capturedAt: new Date().toISOString(), diagnosticId: 'search-' + Date.now() + '-' + generation,
       search, requestedPages: Array.from({length: SEARCH_DIAG_PAGES}, (_, i) => i + 1),
       completedPages: [], apiTotal: null, relatedTags: [],
@@ -7910,6 +8159,7 @@
 
   function openViewer() {
     if (overlay && overlay.style.display !== 'none') return;
+    if (!contentFilterConfirmed) { showContentFilterDialog(true); return; }
 
     buildOverlay();
     installDiagnosticUI();
@@ -7942,6 +8192,7 @@
   }
 
   function closeViewer() {
+    if (contentFilterDialog) { contentFilterDialog.close(); contentFilterDialog.remove(); contentFilterDialog=null; }
     if (!overlay) return;
     tickViewing();
     finishViewing(activeView, false);

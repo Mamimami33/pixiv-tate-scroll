@@ -1336,20 +1336,7 @@
       const legacy = localStorage.getItem(base);
       if (legacy === null) return null;
 
-      let mayMigrate = legacyProfileOwnerMatches();
-
-      // スキップ履歴には所有者IDを直接保存している。
-      if (base === 'PTS_SKIP_V1') {
-        try {
-          const data = JSON.parse(legacy);
-          mayMigrate =
-            String(data?.userId || '') === ACTIVE_PIXIV_USER_ID;
-        } catch (e) {
-          mayMigrate = false;
-        }
-      }
-
-      if (!mayMigrate) return null;
+      if (!legacyProfileOwnerMatches()) return null;
 
       // コピーのみ。旧キーは変更しない。
       try {
@@ -2927,7 +2914,9 @@
           const id=String(item?.workId??''),order=Number(item?.order);
           const index=total-1-((page-1)*12+offset);
           if(index<0||!/^[1-9]\d*$/.test(id)||!Number.isFinite(order))return;
-          const thumb=thumbMap.get(id)||null;
+          const aligned=thumbs.length===list.length &&
+            String(thumbs[offset]?.id??thumbs[offset]?.illustId??'')==='';
+          const thumb=thumbMap.get(id)||(aligned?thumbs[offset]:null);
           cache.rows.set(index,{id,index,order,title:thumb?.title||'',
             thumbnail:thumb?.url||'',pageCount:Number(thumb?.pageCount)||null});
         });
@@ -3022,6 +3011,8 @@
     const row=await seriesFindOrder(cache,info.order);
     if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
     if(row)seriesUI.list.scrollTop=Math.max(0,row.index*70-seriesUI.list.clientHeight/2);
+    else if(cache.total!=null && cache.rows.size)
+      seriesUI.status.textContent='現在話の位置を特定できません。スクロールして探してください。';
     seriesRenderList();
   }
   function seriesHideList(){
@@ -3144,6 +3135,7 @@
     const e=seriesUI.episode;
     if(!e||index<0||index>=e.pairs.length||!seriesUI.layerOpen)return;
     seriesUI.pageIndex=index;
+    if(seriesUI.reading)seriesUI.reading.imageReady=false;
     const imageRoot=seriesUI.layer.querySelector('.pts-series-image');
     const token=++seriesUI.layerToken;
     const url=e.pairs[index]?.o||e.pairs[index]?.r;
@@ -3182,6 +3174,7 @@
     const token=++seriesUI.layerToken;
     seriesStopReading();seriesHideList();
     seriesUI.episode=null;
+    seriesUI.layer.querySelector('.pts-series-image').replaceChildren();
     seriesUpdateEpisodeUI();
     try{
       const body=await fetchJson('/ajax/illust/'+encodeURIComponent(item.id));
@@ -3251,19 +3244,23 @@
     const e=seriesUI.episode;
     if(!e||!seriesUI.layerOpen||seriesUI.sheetOpen)return;
     const button=seriesUI.layer.querySelector('.pts-series-save');
-    if(button.disabled)return;
+    if(e.bookmarkPromise)return;
+    if(byLike&&!e.likedThisSession){
+      e.likedThisSession=true;
+      learnFromWork(e.tags,e.userId,e.rawType,LEARN_LIKE_WEIGHT);
+      e.tasteLearned=true;
+    }
+    if(e.bookmarked)return; // いいねの学習のみ（重複ブックマークPOSTはしない）
     button.disabled=true;
     try{
-      if(byLike){
-        learnFromWork(e.tags,e.userId,e.rawType,LEARN_LIKE_WEIGHT);
-        e.tasteLearned=true;
-      }
       await ensureBookmarked(e);
-      seriesUpdateEpisodeUI();
+      if(seriesUI.episode===e)seriesUpdateEpisodeUI();
     }catch(err){
-      seriesUI.layer.querySelector('.pts-series-error').textContent=
-        '保存失敗: '+String(err?.message||err);
-      button.disabled=false;
+      if(seriesUI.episode===e){
+        seriesUI.layer.querySelector('.pts-series-error').textContent=
+          '保存失敗: '+String(err?.message||err);
+        button.disabled=false;
+      }
     }
   }
   function installSeriesLayer(){

@@ -2864,7 +2864,7 @@
   const seriesCache=new Map();
   const seriesUI={bar:null,sheet:null,list:null,rows:null,status:null,retry:null,
     label:null,activeId:null,sheetOpen:false,layerOpen:false,
-    episode:null,layer:null,reading:null,clock:null,requestToken:0};
+    episode:null,layer:null,reading:null,clock:null,requestToken:0,layerToken:0};
   let seriesActiveRequests=0;
   const seriesRequestQueue=[];
   function parseArtworkSeries(body){

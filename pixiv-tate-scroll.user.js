@@ -3108,9 +3108,10 @@
     }
     if(r.elapsed<LEARN_READY_MS)return;
     const e=seriesUI.episode;
-    const expected=Math.min(LEARN_MULTI_MAX_MS,Math.max(1,e.pairs.length)*LEARN_PAGE_MS);
-    const target=Math.min(LEARN_VIEW_BUDGET,
-      LEARN_DWELL_WEIGHT*Math.min(LEARN_RATIO_CAP,r.elapsed/expected));
+    const target=Math.min(LEARN_VIEW_BUDGET,viewingMetrics({
+      slide:{kind:e.pairs.length>1?'multi':'single',pairs:e.pairs},
+      elapsed:r.elapsed,maxPage:r.maxPage||0,played:0,loops:0
+    }).score);
     const delta=Math.max(0,target-r.score);
     if(delta>0){
       r.score=target;
@@ -3146,7 +3147,10 @@
     const e=seriesUI.episode;
     if(!e||index<0||index>=e.pairs.length||!seriesUI.layerOpen)return;
     seriesUI.pageIndex=index;
-    if(seriesUI.reading)seriesUI.reading.imageReady=false;
+    if(seriesUI.reading){
+      seriesUI.reading.imageReady=false;
+      seriesUI.reading.maxPage=Math.max(seriesUI.reading.maxPage||0,index);
+    }
     const imageRoot=seriesUI.layer.querySelector('.pts-series-image');
     const token=++seriesUI.layerToken;
     const url=e.pairs[index]?.o||e.pairs[index]?.r;
@@ -3211,7 +3215,7 @@
         bookmarkBtn:seriesUI.layer.querySelector('.pts-series-save')};
       seriesUI.episode=e;seriesUI.pageIndex=0;
       seriesUI.reading={id:e.id,last:performance.now(),
-        elapsed:0,recorded:false,score:0,imageReady:false};
+        elapsed:0,recorded:false,score:0,maxPage:0,imageReady:false};
       seriesUI.clock=setInterval(seriesTickReading,250);
       seriesUpdateEpisodeUI();
       await seriesShowPage(0);

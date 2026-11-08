@@ -17,7 +17,7 @@ const injected=script.replace(/\}\)\(\);\s*$/,`window.__shelfTest={
  ['d',{id:'d',rank:5,state:'ready',series:{id:'A'}}]]);
  const keys=bookshelfGroups().map(g=>g.key);bookshelf.entries=saved;return keys;},
  open:key=>bookshelfOpen(bookshelfGroups().find(g=>g.key===key)),
- ranks:()=>bookshelf.context?searchRankCandidates(bookshelf.context,[...bookshelf.context.records.values()].filter(w=>contentMatches(w))).map(w=>w.id):[],
+ ranks:()=>bookshelf.context?searchRankCandidates(bookshelf.context,[...bookshelf.context.records.values()].filter(w=>contentMatches(w)),{onlyMatching:true}).map(w=>w.id):[],
  };})();`);
 (async()=>{
  const browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH||'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
@@ -37,6 +37,10 @@ const injected=script.replace(/\}\)\(\);\s*$/,`window.__shelfTest={
   if(u.pathname.startsWith('/img/'))return route.fulfill({contentType:'image/png',body:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQ1sAAAAASUVORK5CYII=','base64')});
   if(u.pathname==='/ranking.php'){
    const contents=[102,201,301,401,402,...(coldPopular?[601,602]:[])].map(id=>{const w=works.get(String(id));return {illust_id:w.id,illust_type:1,title:w.title,url:w.url,illust_series:w.seriesNavData?{illustSeriesId:w.seriesNavData.seriesId,illustSeriesTitle:w.seriesNavData.title}:null};});
+   // 実ランキング形式の混入物：相対urlのエントリと、型の壊れたエントリ。
+   // どちらも読み込み全体を落とさず、個別に除外されること。
+   contents.push({illust_id:'701',illust_type:1,title:'Relative link',url:'/artworks/301',illust_series:null});
+   contents.push({illust_id:'702',illust_type:1,title:null,url:42,illust_series:false});
    return route.fulfill({contentType:'application/json',body:JSON.stringify({contents:u.searchParams.get('p')==='1'?contents:[]})});
   }
   if(/\/bookmarks(?:\/artworks)?$/.test(u.pathname)){

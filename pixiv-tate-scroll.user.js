@@ -98,6 +98,34 @@
     return json.body;
   }
 
+  // ランキング応答専用。/ajax/ 系でない ranking.php だけは、応答を
+  // res.json() でなく本文テキストから読む（WebKit では res.json() が
+  // 「The string did not match the expected pattern」で落ちることがあるため）。
+  async function fetchRankingJson(url, signal) {
+    const options = { method: 'GET', credentials: 'same-origin', signal };
+    const res = await fetch(url, options);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      throw new Error('ランキング応答をJSONとして読めません');
+    }
+    if (!json || typeof json !== 'object') {
+      throw new Error('JSON形式が不正');
+    }
+    if (json.error) {
+      throw new Error(json.message || 'api error');
+    }
+    if (!Array.isArray(json.contents)) {
+      throw new Error('ランキング応答にcontents配列がありません');
+    }
+    return json;
+  }
+
   // 解決処理はPromiseを共有する（同じ作品に二重で走らせない。ChatGPTレビュー反映）
   function resolveSlide(s) {
     if (s.contentBlocked) return Promise.resolve();
@@ -2239,7 +2267,7 @@
     if(/^[a-z][a-z0-9+.-]*:/i.test(text))return text;
     return 'https://www.pixiv.net'+(text.startsWith('/')?text:'/'+text);
   }
-  async function bookshelfRequest(url) {
+  async function bookshelfRequest(url, options = {}) {
     if (bookshelf.activeRequests >= 3) await new Promise(resolve => bookshelf.queue.push(resolve));
     else bookshelf.activeRequests++;
     const token=bookshelf.token;
@@ -2256,7 +2284,9 @@
         bookshelf.lastRequestAt=Date.now();
         const controller=new AbortController();
         const timer=setTimeout(()=>controller.abort(),8000);
-        try { return await fetchJson(target, controller.signal); }
+        try { return await (options.plainTextJson
+          ? fetchRankingJson(target, controller.signal)
+          : fetchJson(target, controller.signal)); }
         catch(error){
           lastError=error;
           const rateLimited=/HTTP 429/.test(String(error?.message||error));
@@ -2408,7 +2438,7 @@
         if(entry.state==='error')button.onclick=()=>void bookshelfHydrate(entry);
       }else{
         const metadata=entry.cover;
-        const url=entry.series?metadata?.url:searchGridThumbnail(entry.work);
+        const url=entry.series?metadata?.url:bookshelfTileThumbnail(entry);
         if(url){const img=document.createElement('img');img.loading='lazy';img.alt='';img.src=url;cover.appendChild(img);}
         else cover.textContent=entry.series?'シリーズ表紙未確認':'表紙なし';
         title.textContent=entry.series?(metadata?.title||entry.series.title):entry.work.title||'単発マンガ';
@@ -2461,12 +2491,46 @@
   }
   function bookshelfAdd(rawItems) {
     for(const raw of rawItems){
-      const id=candidateId(raw);
+      // 1件の壊れた候補で読み込み全体を落とさない。
+      let id;
+      try{ id=candidateId(raw); }catch{ continue; }
       if(!/^[1-9]\d*$/.test(id)||bookshelf.entries.has(id))continue;
-      if(!contentCouldMatch(raw,contentFilter))continue;
+      let couldMatch=false;
+      try{ couldMatch=contentCouldMatch(raw,contentFilter); }catch{ continue; }
+      if(!couldMatch)continue;
       if(bookshelf.entries.size>=BOOKSHELF_LIMIT)break;
       bookshelf.entries.set(id,{id,raw,rank:bookshelf.entries.size,state:'pending',work:null,series:null,cover:null});
     }
+  }
+  // 人気の失敗は段階（取得／解析／変換）が分かる形で表示する。
+  function bookshelfStageError(stage, error) {
+    const wrapped=new Error('人気['+stage+'] '+String(error?.message||error));
+    wrapped.cause=error;
+    return wrapped;
+  }
+  // ランキングの1件を本棚の候補形式へ。url は相対パス（/artworks/...）の
+  // ことがあり、DOM の URL 解決へ渡すと WebKit で落ちるため文字列のまま扱い、
+  // タイル画像には使わない（詳細取得後の pximg URL を使う）。
+  function rankingShelfEntry(raw) {
+    if(!raw||typeof raw!=='object')return null;
+    try{
+      const series=raw.illust_series;
+      return {...raw,
+        id:raw.illust_id??raw.id,
+        illustType:contentEnum(raw.illust_type??raw.illustType),
+        xRestrict:contentEnum(raw.xRestrict),
+        title:String(raw.title||''),
+        url:typeof raw.url==='string'?raw.url:'',
+        illust_series:series&&typeof series==='object'?series:null};
+    }catch{ return null; }
+  }
+  // 単発タイルの画像。詳細の pximg URL を優先し、無ければ候補に残った
+  // pximg URL だけを使う（ランキングの相対 url はここへ流さない）。
+  function bookshelfTileThumbnail(entry) {
+    const direct=searchGridThumbnail(entry.work);
+    if(direct)return direct;
+    const rawUrl=entry.raw?.url;
+    return typeof rawUrl==='string'&&/^https:\/\/i\.pximg\.net\//.test(rawUrl)?rawUrl:'';
   }
   async function bookshelfLoadBookmarks(valid) {
     if(!getMyUserId())throw new Error('ログイン情報を確認できません。人気または検索をご利用ください。');
@@ -2490,31 +2554,57 @@
   async function bookshelfLoadPopular(valid) {
     if(bookshelf.page>10){bookshelf.finished=true;return;}
     const page=bookshelf.page;
-    // ranking.phpはajax bodyラッパーを持たない。
-    const data=await bookshelfRequest('/ranking.php?mode=daily&content=manga&p='+page+'&format=json');
+    // ranking.phpはajax bodyラッパーを持たない。本文テキスト経由で読む。
+    let data;
+    try{
+      data=await bookshelfRequest('/ranking.php?mode=daily&content=manga&p='+page+'&format=json',
+        {plainTextJson:true});
+    }catch(error){
+      throw bookshelfStageError('取得',error);
+    }
     if(!valid())return;
-    if(!Array.isArray(data.contents))throw new Error('マンガランキングの応答形式を確認できません');
-    bookshelfAdd(data.contents.map(raw=>({...raw,id:raw.illust_id??raw.id,
-      illustType:contentEnum(raw.illust_type??raw.illustType),
-      xRestrict:contentEnum(raw.xRestrict),title:raw.title||'',url:raw.url||''})));
+    if(!Array.isArray(data?.contents))throw bookshelfStageError('解析',new Error('応答形式を確認できません'));
+    let mapped;
+    try{
+      mapped=data.contents.map(raw=>rankingShelfEntry(raw)).filter(Boolean);
+    }catch(error){
+      throw bookshelfStageError('変換',error);
+    }
+    bookshelfAdd(mapped);
     bookshelf.page++;bookshelf.finished=!data.contents.length||bookshelf.page>10;
   }
   async function bookshelfLoadSearch(valid) {
     const config=bookshelf.config;
     if(!config?.word)return;
     const ctx=bookshelf.context||getSearchRankContext(config,1);bookshelf.context=ctx;
-    const loaded=await loadSearchApiBatch(ctx,config,valid);
-    if(!valid()||loaded.stale)return;
-    const ranked=await buildSearchRankedBatch(ctx,[],[],valid);
-    if(!valid()||!ranked)return;
-    const selected=ranked.slice(0,BOOKSHELF_LIMIT);
-    const ids=new Set(selected.map(work=>String(work.id)));
-    for(const id of bookshelf.entries.keys())if(!ids.has(id))bookshelf.entries.delete(id);
-    bookshelfAdd(selected);
+    // フィード／グリッドと同じ共有プールとモデルA比較器を使う。
+    // 候補はプールの記録から直接評価する。prepareSearchRankCandidates は
+    // 閲覧済み（seen）・保存済みを除外し、prepareCandidates 経由で
+    // knownBookmarkedIds へ登録まで行う（＝本棚操作が学習側の状態を汚す）。
+    // 本棚は表示専用で学習に使わないため、その経路は使わない。
+    // 一致の証拠がある候補（tier>0）だけを並べる（searchBookmarkCandidates
+    // と同じ onlyMatching）。並びは tier 辞書式→好みスコアのまま。
+    // 新規候補が無い間は「続きを取得」相当に次バッチを読み進める。
+    let ranked=null,fresh=[];
+    for(let round=0;round<3;round++){
+      const previous=[...bookshelf.entries.values()]
+        .sort((a,b)=>a.rank-b.rank).slice(-2)
+        .map(entry=>entry.work).filter(Boolean);
+      ranked=searchRankCandidates(ctx,[...ctx.records.values()],
+        {previous,onlyMatching:true});
+      if(!valid())return;
+      fresh=ranked.filter(work=>!bookshelf.entries.has(String(work.id)));
+      if(fresh.length||ctx.finished)break;
+      const loaded=await loadSearchApiBatch(ctx,config,valid);
+      if(!valid()||loaded.stale)return;
+      if(loaded.error){if(!bookshelf.entries.size)throw loaded.error;break;}
+      if(!loaded.fetched)break;
+    }
+    if(!ranked)return;
+    bookshelfAdd(fresh.slice(0,BOOKSHELF_LIMIT));
     // 全取得済み候補を同じ検索比較器で順位付け。話数は一切加点しない。
     ranked.forEach((work,rank)=>{const entry=bookshelf.entries.get(String(work.id));if(entry)entry.rank=rank;});
-    bookshelf.finished=ctx.finished;
-    if(loaded.error)throw loaded.error;
+    bookshelf.finished=ctx.finished&&!fresh.length;
   }
   async function bookshelfLoadMore() {
     if(!bookshelf.active||bookshelf.busy||bookshelf.finished||bookshelf.entries.size>=BOOKSHELF_LIMIT)return;
@@ -2542,7 +2632,11 @@
       bookshelf.form.querySelector('input').value=query;
       if(!query){bookshelfRender();bookshelf.status.textContent='検索語を入力してください。';return;}
       const from=getSearchPageConfig();
-      bookshelf.config={word:query,order:from?.order||'popular_d',searchMode:from?.searchMode||'all',matchMode:from?.matchMode||'s_tag'};
+      // 検索プールのキーは表示条件（contentFilter）を含む。本棚検索は
+      // 現在の表示条件（本棚はマンガ表示中だけ開く）を config に固定し、
+      // フィード／グリッドと同じプールを指すようにする。固定しないと
+      // コンテキスト生成時点の古い条件で別プールになり、候補が空になる。
+      bookshelf.config={word:query,order:from?.order||'popular_d',searchMode:from?.searchMode||'all',matchMode:from?.matchMode||'s_tag',contentFilter:{...contentFilter}};
     }
     bookshelfRender();await bookshelfLoadMore();
   }

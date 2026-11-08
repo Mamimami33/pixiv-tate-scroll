@@ -3082,6 +3082,262 @@
     document.head.appendChild(st);
   }
 
+
+  // 専用閲覧レイヤー。slides・feedEl・検索順位には一切挿入しない。
+  function seriesStopReading(){
+    if(seriesUI.clock){clearInterval(seriesUI.clock);seriesUI.clock=null;}
+    if(seriesUI.reading){
+      saveProfile();
+      seriesUI.reading=null;
+    }
+  }
+  function seriesTickReading(){
+    const r=seriesUI.reading;
+    if(!r)return;
+    const now=performance.now();
+    const dt=Math.min(250,Math.max(0,now-r.last));r.last=now;
+    if(!seriesUI.layerOpen||seriesUI.sheetOpen||document.hidden||
+       seriesUI.episode?.id!==r.id||!r.imageReady)return;
+    r.elapsed+=dt;
+    if(!r.recorded&&r.elapsed>=LEARN_READY_MS){
+      r.recorded=true;
+      markSeen(r.id);
+      sessionWork(r.id).viewed=true;
+    }
+    if(r.elapsed<LEARN_READY_MS)return;
+    const e=seriesUI.episode;
+    const expected=Math.min(LEARN_MULTI_MAX_MS,Math.max(1,e.pairs.length)*LEARN_PAGE_MS);
+    const target=Math.min(LEARN_VIEW_BUDGET,
+      LEARN_DWELL_WEIGHT*Math.min(LEARN_RATIO_CAP,r.elapsed/expected));
+    const delta=Math.max(0,target-r.score);
+    if(delta>0){
+      r.score=target;
+      learnFromWork(e.tags,e.userId,e.rawType,delta,true,false);
+      if(!viewSaveTimer)viewSaveTimer=setTimeout(()=>{
+        viewSaveTimer=null;saveProfile();
+      },LEARN_SAVE_INTERVAL_MS);
+    }
+  }
+  function seriesUpdateEpisodeUI(){
+    const e=seriesUI.episode,root=seriesUI.layer;
+    if(!root)return;
+    const title=root.querySelector('.pts-series-episode-title');
+    const page=root.querySelector('.pts-series-page-info');
+    const prev=root.querySelector('.pts-series-prev-page');
+    const next=root.querySelector('.pts-series-next-page');
+    const before=root.querySelector('.pts-series-prev-episode');
+    const after=root.querySelector('.pts-series-next-episode');
+    const save=root.querySelector('.pts-series-save');
+    title.textContent=e?(e.title||'漫画'):'読み込み中…';
+    page.textContent=e?(seriesUI.pageIndex+1)+' / '+e.pairs.length:'…';
+    prev.disabled=!e||seriesUI.pageIndex===0;
+    next.disabled=!e||seriesUI.pageIndex>=e.pairs.length-1;
+    if(e){
+      const cache=seriesCacheFor(e.series.id);
+      before.disabled=e.index<=0;
+      after.disabled=cache.total!=null&&e.index>=cache.total-1;
+      save.textContent=e.bookmarked?'✓ 保存済み':'♡ ブックマーク';
+      save.disabled=!!e.bookmarked;
+    }else{before.disabled=true;after.disabled=true;save.disabled=true;}
+  }
+  async function seriesShowPage(index){
+    const e=seriesUI.episode;
+    if(!e||index<0||index>=e.pairs.length||!seriesUI.layerOpen)return;
+    seriesUI.pageIndex=index;
+    const imageRoot=seriesUI.layer.querySelector('.pts-series-image');
+    const token=++seriesUI.layerToken;
+    const url=e.pairs[index]?.o||e.pairs[index]?.r;
+    if(!url)return;
+    const img=new Image();
+    img.decoding='async';img.alt=e.title||'';
+    img.className='pts-series-artwork';
+    img.src=url;
+    try{
+      if(img.decode)await img.decode();
+      else await new Promise((resolve,reject)=>{
+        img.onload=resolve;img.onerror=()=>reject(new Error('画像読み込み失敗'));
+        if(img.complete&&img.naturalWidth)resolve();
+      });
+    }catch(err){
+      if(token===seriesUI.layerToken)
+        seriesUI.layer.querySelector('.pts-series-error').textContent=
+          String(err?.message||err);
+      return;
+    }
+    if(token!==seriesUI.layerToken||!seriesUI.layerOpen||
+       seriesUI.episode!==e)return;
+    imageRoot.replaceChildren(img);
+    seriesUI.layer.querySelector('.pts-series-error').textContent='';
+    if(seriesUI.reading)seriesUI.reading.imageReady=true;
+    seriesUpdateEpisodeUI();
+  }
+  async function seriesOpenEpisode(item){
+    if(!item||!seriesUI.layer)return;
+    const source=seriesUI.episode?.series||slides[currentIndex()]?.series;
+    if(!source||!seriesUI.sheetOpen)return;
+    seriesUI.layerOpen=true;
+    seriesUI.layer.hidden=false;
+    const loading=seriesUI.layer.querySelector('.pts-series-error');
+    loading.textContent='作品を読み込み中…';
+    const token=++seriesUI.layerToken;
+    seriesStopReading();seriesHideList();
+    seriesUI.episode=null;
+    seriesUpdateEpisodeUI();
+    try{
+      const body=await fetchJson('/ajax/illust/'+encodeURIComponent(item.id));
+      if(token!==seriesUI.layerToken||!seriesUI.layerOpen)return;
+      const info=parseArtworkSeries(body);
+      if(!info||info.id!==source.id||String(body.id??item.id)!==item.id)
+        throw new Error('指定したシリーズの漫画を確認できません');
+      const count=Math.max(1,Number(body.pageCount)||1);
+      let pairs=[];
+      if(count>1){
+        const pages=await fetchJson('/ajax/illust/'+encodeURIComponent(item.id)+'/pages');
+        if(token!==seriesUI.layerToken||!seriesUI.layerOpen)return;
+        if(!Array.isArray(pages)||pages.length<1)
+          throw new Error('漫画のページ一覧を取得できません');
+        pairs=pages.map(p=>pickPair(p.urls)).filter(p=>p.r||p.o);
+      }else pairs=[pickPair(body.urls)];
+      if(!pairs.length)throw new Error('画像URLがありません');
+      const e={id:item.id,index:item.index,order:item.order,
+        title:body.title||item.title||'',series:info,pairs,
+        tags:normTags(body.tags),userId:body.userId==null?null:String(body.userId),
+        rawType:1,bookmarked:!!body.bookmarkData||
+          knownBookmarkedIds.has(String(item.id)),tasteLearned:false,
+        bookmarkBtn:seriesUI.layer.querySelector('.pts-series-save')};
+      seriesUI.episode=e;seriesUI.pageIndex=0;
+      seriesUI.reading={id:e.id,last:performance.now(),
+        elapsed:0,recorded:false,score:0,imageReady:false};
+      seriesUI.clock=setInterval(seriesTickReading,250);
+      seriesUpdateEpisodeUI();
+      await seriesShowPage(0);
+    }catch(err){
+      if(token===seriesUI.layerToken)loading.textContent=
+        '作品を開けません: '+String(err?.message||err);
+    }
+  }
+  async function seriesStepEpisode(step){
+    const e=seriesUI.episode;
+    if(!e||!seriesUI.layerOpen||seriesUI.sheetOpen)return;
+    const cache=seriesCacheFor(e.series.id);
+    const index=e.index+step;
+    if(index<0||(cache.total!=null&&index>=cache.total))return;
+    let row=cache.rows.get(index);
+    if(!row){
+      const ok=await seriesFetchPage(cache,seriesPageForIndex(cache,index));
+      if(!ok)return;
+      row=cache.rows.get(index);
+    }
+    if(!row||seriesUI.episode!==e)return;
+    // 専用レイヤーからの話移動でも同じ処理を使用する。
+    seriesUI.sheetOpen=true;
+    await seriesOpenEpisode(row);
+  }
+  function seriesCloseLayer(){
+    if(!seriesUI.layerOpen)return;
+    seriesUI.layerOpen=false;
+    seriesUI.layerToken++;
+    seriesStopReading();
+    seriesHideList();
+    seriesUI.episode=null;
+    if(seriesUI.layer){
+      seriesUI.layer.hidden=true;
+      seriesUI.layer.querySelector('.pts-series-image').replaceChildren();
+    }
+    if(activeView)activeView.last=performance.now();
+    syncDock();
+  }
+  async function seriesBookmarkEpisode(byLike){
+    const e=seriesUI.episode;
+    if(!e||!seriesUI.layerOpen||seriesUI.sheetOpen)return;
+    const button=seriesUI.layer.querySelector('.pts-series-save');
+    if(button.disabled)return;
+    button.disabled=true;
+    try{
+      if(byLike){
+        learnFromWork(e.tags,e.userId,e.rawType,LEARN_LIKE_WEIGHT);
+        e.tasteLearned=true;
+      }
+      await ensureBookmarked(e);
+      seriesUpdateEpisodeUI();
+    }catch(err){
+      seriesUI.layer.querySelector('.pts-series-error').textContent=
+        '保存失敗: '+String(err?.message||err);
+      button.disabled=false;
+    }
+  }
+  function installSeriesLayer(){
+    if(!overlay||seriesUI.layer)return;
+    const root=document.createElement('section');
+    root.className='pts-series-layer';root.hidden=true;
+    root.innerHTML=
+      '<header><span class="pts-series-episode-title"></span></header>'+
+      '<div class="pts-series-image"></div>'+
+      '<div class="pts-series-error" role="status"></div>'+
+      '<div class="pts-series-controls">'+
+      '<button type="button" class="pts-series-to-list">一覧へ</button>'+
+      '<button type="button" class="pts-series-to-feed">フィードへ</button>'+
+      '<button type="button" class="pts-series-prev-episode">前話</button>'+
+      '<button type="button" class="pts-series-next-episode">次話</button>'+
+      '<button type="button" class="pts-series-prev-page">前ページ</button>'+
+      '<span class="pts-series-page-info">…</span>'+
+      '<button type="button" class="pts-series-next-page">次ページ</button>'+
+      '<button type="button" class="pts-series-save">♡ ブックマーク</button>'+
+      '<button type="button" class="pts-series-like">いいね</button>'+
+      '</div>';
+    overlay.appendChild(root);seriesUI.layer=root;
+    const sel=c=>root.querySelector('.'+c);
+    sel('pts-series-to-list').onclick=()=>void seriesShowList();
+    sel('pts-series-to-feed').onclick=seriesCloseLayer;
+    sel('pts-series-prev-episode').onclick=()=>void seriesStepEpisode(-1);
+    sel('pts-series-next-episode').onclick=()=>void seriesStepEpisode(1);
+    sel('pts-series-prev-page').onclick=()=>void seriesShowPage(seriesUI.pageIndex-1);
+    sel('pts-series-next-page').onclick=()=>void seriesShowPage(seriesUI.pageIndex+1);
+    sel('pts-series-save').onclick=()=>void seriesBookmarkEpisode(false);
+    sel('pts-series-like').onclick=()=>void seriesBookmarkEpisode(true);
+    let start=null;
+    root.addEventListener('touchstart',ev=>{
+      if(ev.touches.length!==1||ev.target.closest('button'))return;
+      start={x:ev.touches[0].clientX,y:ev.touches[0].clientY};
+    },{passive:true});
+    root.addEventListener('touchend',ev=>{
+      if(!start||ev.changedTouches.length!==1)return;
+      const dx=ev.changedTouches[0].clientX-start.x,
+        dy=ev.changedTouches[0].clientY-start.y;
+      start=null;
+      if(Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.3)
+        void seriesShowPage(seriesUI.pageIndex+(dx<0?1:-1));
+    },{passive:true});
+    document.addEventListener('keydown',ev=>{
+      if(!seriesUI.layerOpen&&!seriesUI.sheetOpen)return;
+      if(ev.key==='Escape'){
+        if(seriesUI.sheetOpen)seriesHideList();else seriesCloseLayer();
+        ev.preventDefault();ev.stopImmediatePropagation();
+        return;
+      }
+      if(seriesUI.sheetOpen||!seriesUI.layerOpen||
+        ev.target?.closest?.('input,textarea,[contenteditable]'))return;
+      if(ev.key==='ArrowLeft'||ev.key==='ArrowRight'){
+        void seriesShowPage(seriesUI.pageIndex+(ev.key==='ArrowRight'?1:-1));
+        ev.preventDefault();ev.stopImmediatePropagation();
+      }
+    },true);
+    const style=document.createElement('style');
+    style.textContent=[
+      '#pts-overlay .pts-series-layer[hidden]{display:none!important}',
+      '#pts-overlay .pts-series-layer{position:absolute;inset:0;z-index:74;background:#050508;color:#fff;display:flex;flex-direction:column;overflow:hidden}',
+      '#pts-overlay .pts-series-layer header{flex:0 0 auto;padding:calc(12px + env(safe-area-inset-top)) 14px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '#pts-overlay .pts-series-image{flex:1;min-height:0;display:flex;justify-content:center;align-items:center;overflow:hidden}',
+      '#pts-overlay .pts-series-image img{display:block;max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain}',
+      '#pts-overlay .pts-series-error{font-size:12px;color:#ffb8b8;text-align:center;min-height:18px}',
+      '#pts-overlay .pts-series-controls{flex:0 0 auto;display:flex;overflow-x:auto;gap:8px;align-items:center;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:#17171b}',
+      '#pts-overlay .pts-series-controls button{white-space:nowrap;min-height:44px;color:white;background:#383840;border:1px solid #ffffff40;border-radius:9px;padding:8px 12px}',
+      '#pts-overlay .pts-series-controls button:disabled{opacity:.4}',
+      '#pts-overlay .pts-series-page-info{white-space:nowrap;font-size:12px}'
+    ].join('\n');
+    document.head.appendChild(style);
+  }
+
   function syncDock() {
     if (!overlay) return;
     syncSeriesBar();
@@ -3177,7 +3433,7 @@
     const s = v.slide;
     const wasCounting = v.counting;
     v.counting = !!(overlay && overlay.style.display !== 'none' && !searchGrid.open &&
-      !document.hidden && slides[currentIndex()] === s && s.isCurrent && visibleReady(s));
+      !document.hidden && !seriesUI.layerOpen && !seriesUI.sheetOpen && slides[currentIndex()] === s && s.isCurrent && visibleReady(s));
     if (!v.counting) return;
     v.readySeen = true;
     const visibleTime = wasCounting ? dt : 0;
@@ -3294,7 +3550,7 @@
   function handleViewerKeyboard(e) {
     if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.altKey ||
         e.metaKey || !overlay || overlay.style.display==='none' ||
-        searchGrid.open) return;
+        searchGrid.open || seriesUI.sheetOpen || seriesUI.layerOpen) return;
     const focused=document.activeElement;
     const target=e.target?.nodeType===1 ? e.target : focused;
     const editable='input,textarea,select,[contenteditable]:not([contenteditable="false"]),' +
@@ -7649,6 +7905,7 @@
     installBookmarkFeedback();
     installExperienceUI();
     installSeriesUI();
+    installSeriesLayer();
     bindUserNavigationIntent();
 
 
@@ -7682,6 +7939,8 @@
     saveProfile();
     gridReturnState = null;
     closeSearchGrid(false);
+    seriesCloseLayer();
+    seriesHideList();
     closeDiagnosticPanel();
     clearTimeout(bookmarkToastTimer);
     const toast = overlay.querySelector('.pts-bookmark-toast');

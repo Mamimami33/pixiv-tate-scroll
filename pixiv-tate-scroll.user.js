@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.20
+// @version      3.13.21
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -520,7 +520,6 @@
     if (state === 'none' || state === 'playing') {
       el.hidden = true;
       el.textContent = '';
-      if (state === 'playing') ambientSchedule(60);
       return;
     }
     el.hidden = false;
@@ -851,15 +850,6 @@
 
   // 画像の読み込みを強制的にやり直す（壊れて終わっているときだけ。読み込み途中では呼ばない）
   function forceReloadImage(s) {
-    const now = Date.now();
-    reloadTimes = reloadTimes.filter(t => now - t < 60000);
-    reloadTimes.push(now);
-
-    if (reloadTimes.length >= 3) {
-      effectsReduced = true;
-      overlay?.classList.add('pts-low-effects');
-    }
-
     const img = s.mainImg;
     const pair = s.pairs?.[s.pageIdx || 0] || s.pairs?.[0];
 
@@ -3046,286 +3036,10 @@
   let sessionBackTarget = '';
   let activeView = null;
   let activeTick = null;
-  let reloadTimes = [];
-  let effectsReduced = false;
   let closeConfirmTimer = null;
   let experienceInstalled = false;
   let touchStart = null;
   let lastTap = null;
-
-  /* ---------- v3.13.4: ambient glow ---------- */
-  const ambient = {
-    enabled: true, installed: false, stage: null, layers: [],
-    active: -1, key: '', color: null, timer: null,
-    sequence: 0, cache: new Map()
-  };
-
-  function ambientReset() {
-    ambient.sequence++;
-    clearTimeout(ambient.timer);
-    ambient.timer = null;
-    ambient.active = -1;
-    ambient.key = '';
-    ambient.color = null;
-    for (const layer of ambient.layers) layer.style.opacity = '0';
-  }
-
-  function ambientSchedule(delay = 120) {
-    if (!ambient.installed || !ambient.enabled) return;
-    const seq = ++ambient.sequence;
-    clearTimeout(ambient.timer);
-    ambient.timer = setTimeout(() => {
-      ambient.timer = null;
-      void ambientUpdate(seq);
-    }, delay);
-  }
-
-  function ambientTarget() {
-    if (!overlay || !feedEl || overlay.style.display === 'none' ||
-        document.hidden) return null;
-    const idx = currentIndex();
-    const s = slides[idx];
-    if (!s) return null;
-    let page = 0, img = s.mainImg;
-    if (s.kind === 'multi') {
-      const pager = s.sectionEl.querySelector('.pts-pager');
-      if (!pager?.clientWidth) return null;
-      const pos = pager.scrollLeft / pager.clientWidth;
-      if (Math.abs(pos - Math.round(pos)) > 0.045) return null;
-      page = Math.round(pos);
-      img = pager.querySelectorAll('.pts-page img')[page];
-    }
-    if (!img?.complete || !img.naturalWidth || !img.naturalHeight) return null;
-    if (s.kind === 'ugoira' && !s.frameUrls?.[0]) return null;
-    const ir = img.getBoundingClientRect();
-    const root = overlay.getBoundingClientRect();
-    const scale = Math.min(ir.width / img.naturalWidth,
-      ir.height / img.naturalHeight);
-    if (!(scale > 0)) return null;
-    const w = img.naturalWidth * scale, h = img.naturalHeight * scale;
-    const x = ir.left - root.left + (ir.width - w) / 2;
-    const y = ir.top - root.top + (ir.height - h) / 2;
-    return {
-      s, img, key: `${s.id}:${s.kind === 'ugoira' ? 'ugoira' : page}`,
-      source: s.kind === 'ugoira' ? s.frameUrls[0] : null,
-      rect: { x, y, w, h }, width: root.width, height: root.height
-    };
-  }
-
-  function ambientColor(target) {
-    if (ambient.cache.has(target.key)) return ambient.cache.get(target.key);
-    const result = (async () => {
-      // 統合時修正: 表示中の img は CORS 属性なしで読み込まれており、
-      // そのまま描くと canvas が汚染され色が読めない。pximg は
-      // Access-Control-Allow-Origin: * を返すので、
-      // crossOrigin='anonymous' を付けて対象URLから読み直す。
-      // 静止画は target.img の実URL、うごイラは target.source を使う。
-      const url = target.source || target.img.currentSrc || target.img.src;
-      if (!url) return null;
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.decoding = 'async';
-      const loaded = await new Promise(resolve => {
-        img.onload = () => resolve(true);
-        img.onerror = () => resolve(false);
-        img.src = url;
-      });
-      if (!loaded || !img.naturalWidth || !img.naturalHeight) return null;
-      // 1作品／ページにつき24×24へ縮小・読み取りを1回だけ。
-      await new Promise(resolve => setTimeout(resolve, 0));
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = canvas.height = 24;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (!ctx) return null;
-        ctx.drawImage(img, 0, 0, 24, 24);
-        const pixels = ctx.getImageData(0, 0, 24, 24).data;
-        const sum = [0, 0, 0];
-        let count = 0;
-        for (let i = 0; i < pixels.length; i += 4) {
-          if (pixels[i + 3] < 64) continue;
-          for (let k = 0; k < 3; k++) sum[k] += pixels[i + k];
-          count++;
-        }
-        return count ? sum.map(v => Math.round(Math.min(175, v / count * 0.7))) : null;
-      } catch (e) {
-        // CORSでcanvasが汚染された場合を含め、常に黒へフォールバック。
-        return null;
-      }
-    })();
-    ambient.cache.set(target.key, result);
-    return result;
-  }
-
-  function ambientPlace(layer, target, rgb) {
-    const W = target.width, H = target.height;
-    const x1 = Math.max(0, Math.min(W, target.rect.x));
-    const x2 = Math.max(x1, Math.min(W, target.rect.x + target.rect.w));
-    const y1 = Math.max(0, Math.min(H, target.rect.y));
-    const y2 = Math.max(y1, Math.min(H, target.rect.y + target.rect.h));
-    const strips = [
-      [0, 0, W, y1, 'to top'],
-      [0, y2, W, H - y2, 'to bottom'],
-      [0, y1, x1, y2 - y1, 'to left'],
-      [x2, y1, W - x2, y2 - y1, 'to right']
-    ];
-    for (let i = 0; i < 4; i++) {
-      const [x, y, w, h, dir] = strips[i];
-      const el = layer.children[i];
-      el.style.cssText = `position:absolute;left:${x}px;top:${y}px;` +
-        `width:${Math.max(0, w)}px;height:${Math.max(0, h)}px;` +
-        `background:linear-gradient(${dir},rgba(${rgb.join(',')},.32),transparent 95%);`;
-    }
-  }
-
-  function ambientShow(target, color) {
-    if (!color) {
-      for (const layer of ambient.layers) layer.style.opacity = '0';
-      ambient.active = -1;
-      ambient.key = '';
-      ambient.color = null;
-      return;
-    }
-    if (ambient.key === target.key && ambient.active !== -1) {
-      ambientPlace(ambient.layers[ambient.active], target, color);
-      return;
-    }
-    const old = ambient.active;
-    const next = old === 0 ? 1 : 0;
-    const layer = ambient.layers[next];
-    layer.style.transition = 'none';
-    layer.style.opacity = '0';
-    ambientPlace(layer, target, color);
-    if (old !== -1) {
-      ambientPlace(ambient.layers[old], target, ambient.color);
-    }
-    void layer.offsetWidth; // 新レイヤーのopacity:0を確定させる
-    layer.style.transition = '';
-    layer.style.opacity = '1';
-    if (old !== -1) ambient.layers[old].style.opacity = '0';
-    ambient.active = next;
-    ambient.key = target.key;
-    ambient.color = color;
-  }
-
-  async function ambientUpdate(seq) {
-    if (seq !== ambient.sequence || !ambient.enabled) return;
-    const target = ambientTarget();
-    if (!target) return; // スクロール中／読み込み前は今の色を維持
-    const color = await ambientColor(target);
-    if (seq !== ambient.sequence || !ambient.enabled) return;
-    const current = ambientTarget();
-    if (!current || current.key !== target.key || current.s !== target.s) return;
-    ambientShow(current, color);
-  }
-
-  function installAmbientUI() {
-    if (ambient.installed || !overlay || !feedEl) return;
-    ambient.installed = true;
-
-    const stage = document.createElement('div');
-    stage.className = 'pts-ambient-stage';
-    stage.setAttribute('aria-hidden', 'true');
-
-    for (let n = 0; n < 2; n++) {
-      const layer = document.createElement('div');
-      layer.className = 'pts-ambient-layer';
-
-      for (let k = 0; k < 4; k++) {
-        layer.appendChild(document.createElement('div'));
-      }
-
-      stage.appendChild(layer);
-      ambient.layers.push(layer);
-    }
-
-    overlay.insertBefore(stage, feedEl);
-    ambient.stage = stage;
-
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'pts-ambient-toggle';
-
-    button.addEventListener('click', () => {
-      ambient.enabled = !ambient.enabled;
-
-      ambientReset();
-      stage.hidden = !ambient.enabled;
-
-      syncDock();
-
-      if (ambient.enabled) {
-        ambientSchedule(0);
-      }
-    });
-
-    // その他パネルではなく、横スクロールドックに追加。
-    overlay.querySelector('.pts-dock')?.appendChild(button);
-    stage.hidden = !ambient.enabled;
-    syncDock();
-
-    const style = document.createElement('style');
-
-    style.textContent = `
-      #pts-overlay .pts-ambient-stage{
-        position:absolute;inset:0;z-index:0;
-        pointer-events:none;overflow:hidden;background:#000
-      }
-      #pts-overlay .pts-ambient-stage[hidden]{
-        display:none!important
-      }
-      #pts-overlay .pts-ambient-layer{
-        position:absolute;inset:0;opacity:0;
-        pointer-events:none;transition:opacity .48s ease
-      }
-      #pts-overlay .pts-feed{
-        position:relative;z-index:1;background:transparent
-      }
-      #pts-overlay .pts-slide{background:transparent}
-      @media(prefers-reduced-motion:reduce){
-        #pts-overlay .pts-ambient-layer{
-          transition-duration:.12s
-        }
-      }
-  `;
-
-    document.head.appendChild(style);
-
-    feedEl.addEventListener('load', e => {
-      const s = slides[currentIndex()];
-
-      if (
-        e.target?.tagName !== 'IMG' ||
-        !s?.sectionEl?.contains(e.target)
-      ) return;
-
-      if (
-        s.kind === 'ugoira' &&
-        ambient.cache.has(`${s.id}:ugoira`)
-      ) return;
-
-      ambientSchedule(75);
-    }, true);
-
-    feedEl.addEventListener('scroll', e => {
-      const node = e.target;
-
-      if (
-        node?.classList?.contains('pts-pager') &&
-        slides[currentIndex()]?.sectionEl?.contains(node)
-      ) {
-        ambientSchedule(160);
-      }
-    }, true);
-
-    window.addEventListener('resize', () => {
-      ambientSchedule(80);
-    }, { passive: true });
-
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) ambientSchedule(60);
-    });
-  }
 
   function loadSeenTimes() {
     if (!getMyUserId()) return;
@@ -3409,13 +3123,6 @@
     if (returnButton) returnButton.hidden = !gridReturnState ||
       searchGrid.open || overlay.style.display === 'none';
     syncFollowButton();
-    const button = overlay.querySelector(
-      '.pts-ambient-toggle'
-    );
-    if (button) {
-      button.textContent =
-        `アンビエント:${ambient.enabled ? 'ON' : 'OFF'}`;
-    }
   }
   function noteSessionVisit(s) {
     if (!s || !s.id) return;
@@ -3497,7 +3204,6 @@
       rewatch: !!(manual && sessionWork(s.id).viewed)
     };
     syncDock();
-    ambientSchedule(140);
   }
   function tickViewing() {
     if (!activeView) return;
@@ -3886,9 +3592,6 @@
         animation:ptsIn .16s ease-out
       }
       @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
-      #pts-overlay.pts-low-effects .pts-current .pts-holder{
-        animation:none!important
-      }
       #pts-overlay .pts-like-heart{
         position:absolute;z-index:18;pointer-events:none;
         font-size:clamp(70px,20vw,120px);
@@ -7983,10 +7686,8 @@
     installDiagnosticUI();
     installBookmarkFeedback();
     installExperienceUI();
-    installAmbientUI();
     bindSkipNavigation();
 
-    ambientReset();
 
     skippedThisSession.clear();
     viewedThisSession.clear();
@@ -8029,7 +7730,6 @@
     lastTap = null;
     touchStart = null;
     clearTimeout(closeConfirmTimer);
-    ambientReset();
     overlay.querySelector('.pts-history-panel')
       ?.setAttribute('hidden', '');
     feedGeneration++;

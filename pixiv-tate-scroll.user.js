@@ -17,6 +17,8 @@
   window.__ptsLoaded = true;
 
   let overlay = null;
+  // ユーザーが閉じた後は、ページ再読み込みまで自動起動しない。
+  let routeAutoStartSuppressed = false;
   let feedEl = null;
   let slides = [];
   let mode = 'custom'; // 'custom' | 'search'
@@ -3651,6 +3653,7 @@
     if (!btn) return;
     if (btn.dataset.confirm === '1') {
       clearTimeout(closeConfirmTimer);
+      routeAutoStartSuppressed = true;
       btn.dataset.confirm = '0'; closeViewer(); return;
     }
     btn.dataset.confirm = '1'; btn.textContent = '本当に閉じる？';
@@ -4055,12 +4058,6 @@
       () => { void followCurrentAuthor(); });
     addButton('pts-return-grid', '検索結果へ戻る',
       returnToSearchGrid).hidden = true;
-    addButton('pts-open-original', 'pixivで開く', () => {
-      const s = slides[currentIndex()];
-      if (!s || searchGrid.open) return;
-      window.open(s.page, '_blank', 'noopener');
-      void learnOpenWork(s);
-    });
 
     const bar = overlay.querySelector('.pts-bar');
     const form = document.createElement('form');
@@ -8147,11 +8144,13 @@
       location.pathname + location.search;
 
     const openForRoute = route => {
+      if (routeAutoStartSuppressed) return;
       requestAnimationFrame(() => {
         const current =
           location.pathname + location.search;
 
         if (current !== route) return;
+        if (routeAutoStartSuppressed) return;
         if (!shouldAutoOpenPixivView()) return;
 
         if (
@@ -8168,7 +8167,6 @@
         location.pathname + location.search;
 
       // 同一URLなら何もしない。
-      // 閉じたあとも自動再起動しない。
       if (current === lastRoute) return;
 
       lastRoute = current;
@@ -8182,6 +8180,7 @@
       }
 
       // 設定・投稿画面などでは起動しない。
+      if (routeAutoStartSuppressed) return;
       if (!shouldAutoOpenPixivView()) return;
 
       openForRoute(current);
@@ -8225,6 +8224,6 @@
   document.body.appendChild(btn);
 
   // 閲覧ページでは自動起動。
-  // SPA遷移も監視するが、同じURLでは再起動しない。
+  // SPA遷移も監視するが、ユーザーが閉じた後は手動起動のみ。
   installRouteAutoStart();
 })();

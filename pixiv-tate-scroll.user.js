@@ -146,7 +146,9 @@
 
       s.createDate = body.createDate || s.createDate || null;
       s.seriesNextId = seriesNextId(body.seriesNavData);
+      s.series = parseArtworkSeries(body);
       s.seriesInfoChecked = true;
+      if(s.isCurrent)syncSeriesBar();
       s.rawType = Number(body.illustType);
       s.tags = normTags(body.tags);
       s.userId = body.userId == null
@@ -2870,8 +2872,219 @@
     return !!(img && img.complete && img.naturalWidth > 0);
   }
 
+
+  const SERIES_PAGE_SIZE=12, SERIES_ROW_H=70, SERIES_TTL=1800000;
+  const seriesCache=new Map();
+  const seriesUI={bar:null,sheet:null,list:null,rows:null,status:null,retry:null,
+    label:null,activeId:null,sheetOpen:false,layerOpen:false,
+    episode:null,layer:null,reading:null,clock:null,requestToken:0};
+  let seriesActiveRequests=0;
+  const seriesRequestQueue=[];
+  function parseArtworkSeries(body){
+    const nav=body?.seriesNavData;
+    if(Number(body?.illustType)!==1||!nav||nav.seriesType!=='manga')return null;
+    const id=String(nav.seriesId??''),order=Number(nav.order);
+    if(!/^[1-9]\d*$/.test(id)||!Number.isFinite(order)||order<=0)return null;
+    return {id,order,title:String(nav.title||'')};
+  }
+  function seriesCacheFor(id){
+    const now=Date.now();
+    for(const [key,v] of seriesCache)if(now-v.updated>SERIES_TTL)seriesCache.delete(key);
+    id=String(id);
+    let cache=seriesCache.get(id);
+    if(!cache)cache={id,total:null,pages:new Set(),rows:new Map(),
+      pending:new Map(),error:'',updated:now};
+    else seriesCache.delete(id);
+    cache.updated=now;
+    seriesCache.set(id,cache);
+    while(seriesCache.size>3)seriesCache.delete(seriesCache.keys().next().value);
+    return cache;
+  }
+  function seriesPageForIndex(cache,index){
+    return cache.total==null?1:Math.floor((cache.total-1-index)/12)+1;
+  }
+  async function seriesFetchPage(cache,page){
+    page=Number(page);
+    if(!Number.isSafeInteger(page)||page<1||
+      (cache.total!=null&&page>Math.ceil(cache.total/12)))return false;
+    if(cache.pages.has(page))return true;
+    if(cache.pending.has(page))return cache.pending.get(page);
+    const task=(async()=>{
+      if(seriesActiveRequests>=2)await new Promise(r=>seriesRequestQueue.push(r));
+      seriesActiveRequests++;
+      try{
+        const body=await fetchJson('/ajax/series/'+encodeURIComponent(cache.id)+'?p='+page);
+        const total=Number(body?.page?.total),list=body?.page?.series,
+          thumbs=body?.thumbnails?.illust;
+        if(!Number.isSafeInteger(total)||total<1||!Array.isArray(list)||
+          !Array.isArray(thumbs))throw Error('シリーズAPIの応答形式が不正です');
+        if(cache.total!=null&&cache.total!==total){
+          cache.pages.clear();cache.rows.clear();
+        }
+        cache.total=total;
+        const thumbMap=new Map(thumbs.map(t=>[String(t?.id??t?.illustId??''),t]));
+        list.forEach((item,offset)=>{
+          const id=String(item?.workId??''),order=Number(item?.order);
+          const index=total-1-((page-1)*12+offset);
+          if(index<0||!/^[1-9]\d*$/.test(id)||!Number.isFinite(order))return;
+          const thumb=thumbMap.get(id)||null;
+          cache.rows.set(index,{id,index,order,title:thumb?.title||'',
+            thumbnail:thumb?.url||'',pageCount:Number(thumb?.pageCount)||null});
+        });
+        cache.pages.add(page);cache.error='';cache.updated=Date.now();
+        return true;
+      }catch(e){cache.error=String(e?.message||e);return false;}
+      finally{
+        seriesActiveRequests--;
+        seriesRequestQueue.shift()?.();
+        cache.pending.delete(page);
+        if(seriesUI.sheetOpen&&seriesUI.activeId===cache.id)seriesRenderList();
+        syncSeriesBar();
+      }
+    })();
+    cache.pending.set(page,task);
+    return task;
+  }
+  async function seriesFindOrder(cache,order){
+    if(!cache.pages.has(1))await seriesFetchPage(cache,1);
+    if(!cache.total)return null;
+    const lookup=()=>[...cache.rows.values()].find(r=>r.order===order);
+    const known=lookup();if(known)return known;
+    const guess=Math.max(1,Math.min(Math.ceil(cache.total/12),
+      Math.ceil((cache.total-order+1)/12)));
+    await seriesFetchPage(cache,guess);
+    return lookup()||null;
+  }
+  function seriesRenderList(){
+    if(!seriesUI.sheetOpen||!seriesUI.activeId||!seriesUI.list)return;
+    const cache=seriesCacheFor(seriesUI.activeId);
+    seriesUI.status.textContent=cache.error?'取得失敗: '+cache.error:
+      cache.total==null?'取得中…':
+        '取得済み '+cache.rows.size+' / 全'+cache.total+'作品';
+    seriesUI.retry.hidden=!cache.error;
+    if(cache.total==null){seriesUI.rows.replaceChildren();return;}
+    const top=seriesUI.list.scrollTop,first=Math.max(0,Math.floor(top/70)-8),
+      count=Math.min(56,Math.ceil(seriesUI.list.clientHeight/70)+16),
+      end=Math.min(cache.total,first+count),frag=document.createDocumentFragment();
+    for(let i=first;i<end;i++){
+      const item=cache.rows.get(i),button=document.createElement('button');
+      button.type='button';button.className='pts-series-row';
+      button.style.top=i*70+'px';
+      if(!item){button.disabled=true;button.textContent='読み込み中…';}
+      else{
+        const img=document.createElement('img');img.alt='';img.loading='lazy';
+        if(item.thumbnail)img.src=item.thumbnail;
+        const label=document.createElement('span');
+        label.textContent='第'+item.order+'話 '+(item.title||'タイトル未取得');
+        button.append(img,label);
+        const current=seriesUI.episode?.id||slides[currentIndex()]?.id;
+        if(String(current)===item.id)button.classList.add('pts-series-selected');
+        button.addEventListener('click',()=>void seriesOpenEpisode(item));
+      }
+      frag.appendChild(button);
+    }
+    seriesUI.rows.replaceChildren(frag);
+    seriesUI.rows.style.height=cache.total*70+'px';
+    if(cache.error)return;
+    const index=Math.max(0,Math.min(cache.total-1,Math.floor(
+      (top+seriesUI.list.clientHeight/2)/70)));
+    const page=seriesPageForIndex(cache,index);
+    if(!cache.pages.has(page)&&!cache.pending.has(page)){
+      void seriesFetchPage(cache,page).then(ok=>{
+        if(!ok||!seriesUI.sheetOpen||seriesUI.activeId!==cache.id)return;
+        const adjacent=index>cache.total/2?page+1:page-1;
+        if(adjacent>=1&&adjacent<=Math.ceil(cache.total/12)&&
+           !cache.pages.has(adjacent))void seriesFetchPage(cache,adjacent);
+      });
+    }
+  }
+  function syncSeriesBar(){
+    if(!seriesUI.bar||!overlay)return;
+    const info=slides[currentIndex()]?.series;
+    const shown=!!info&&!seriesUI.layerOpen&&!searchGrid.open&&
+      overlay.style.display!=='none';
+    seriesUI.bar.hidden=!shown;
+    if(!shown)return;
+    const total=seriesCache.get(info.id)?.total;
+    seriesUI.bar.textContent=(info.title||'漫画シリーズ')+' · '+
+      (total==null?'第'+info.order+'話':info.order+' / '+total);
+  }
+  async function seriesShowList(){
+    const info=seriesUI.episode?.series||slides[currentIndex()]?.series;
+    if(!info||!seriesUI.sheet)return;
+    seriesUI.activeId=info.id;seriesUI.sheetOpen=true;
+    seriesUI.sheet.hidden=false;
+    seriesUI.label.textContent=info.title||'漫画シリーズ';
+    const token=++seriesUI.requestToken,cache=seriesCacheFor(info.id);
+    seriesRenderList();
+    if(!cache.pages.has(1))await seriesFetchPage(cache,1);
+    if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
+    const row=await seriesFindOrder(cache,info.order);
+    if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
+    if(row)seriesUI.list.scrollTop=Math.max(0,row.index*70-seriesUI.list.clientHeight/2);
+    seriesRenderList();
+  }
+  function seriesHideList(){
+    seriesUI.sheetOpen=false;seriesUI.requestToken++;
+    if(seriesUI.sheet)seriesUI.sheet.hidden=true;
+    if(activeView)activeView.last=performance.now();
+    syncSeriesBar();
+  }
+  function installSeriesUI(){
+    if(!overlay||seriesUI.bar)return;
+    const bar=document.createElement('button');
+    bar.type='button';bar.className='pts-series-bar';bar.hidden=true;
+    bar.addEventListener('click',()=>void seriesShowList());
+    overlay.appendChild(bar);seriesUI.bar=bar;
+    const panel=document.createElement('section');
+    panel.className='pts-series-sheet';panel.hidden=true;
+    panel.innerHTML='<header><strong class="pts-series-name"></strong>'+
+      '<button type="button" class="pts-series-close">閉じる</button></header>'+
+      '<div class="pts-series-scroll"><div class="pts-series-rows"></div></div>'+
+      '<footer><span class="pts-series-status"></span>'+
+      '<button class="pts-series-retry" type="button" hidden>再試行</button></footer>';
+    overlay.appendChild(panel);seriesUI.sheet=panel;
+    seriesUI.label=panel.querySelector('.pts-series-name');
+    seriesUI.list=panel.querySelector('.pts-series-scroll');
+    seriesUI.rows=panel.querySelector('.pts-series-rows');
+    seriesUI.status=panel.querySelector('.pts-series-status');
+    seriesUI.retry=panel.querySelector('.pts-series-retry');
+    panel.querySelector('.pts-series-close').addEventListener('click',seriesHideList);
+    seriesUI.retry.addEventListener('click',()=>{
+      const c=seriesCacheFor(seriesUI.activeId);
+      c.error='';
+      const i=Math.floor(seriesUI.list.scrollTop/70);
+      void seriesFetchPage(c,c.total==null?1:seriesPageForIndex(c,i));
+    });
+    let pending=false;
+    seriesUI.list.addEventListener('scroll',()=>{
+      if(pending)return;
+      pending=true;requestAnimationFrame(()=>{pending=false;seriesRenderList();});
+    },{passive:true});
+    const st=document.createElement('style');
+    st.textContent=[
+      '#pts-overlay .pts-series-bar[hidden],#pts-overlay .pts-series-sheet[hidden],#pts-overlay .pts-series-retry[hidden]{display:none!important}',
+      '#pts-overlay .pts-series-bar{position:absolute;z-index:29;bottom:calc(67px + env(safe-area-inset-bottom));left:12px;right:12px;width:calc(100% - 24px);min-height:40px;padding:7px 14px;border:1px solid #ffffff40;border-radius:10px;background:#17171be8;color:#fff;text-align:left;font:13px system-ui;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '#pts-overlay .pts-series-sheet{position:absolute;z-index:75;bottom:0;left:0;right:0;height:73dvh;max-height:75vh;display:flex;flex-direction:column;background:#17171c;color:white;border-radius:18px 18px 0 0;border-top:1px solid #ffffff50;box-shadow:0 -18px 40px #000b}',
+      '#pts-overlay .pts-series-sheet header,#pts-overlay .pts-series-sheet footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;flex-shrink:0}',
+      '#pts-overlay .pts-series-sheet header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '#pts-overlay .pts-series-sheet button{color:white}',
+      '#pts-overlay .pts-series-close,#pts-overlay .pts-series-retry{border:1px solid #ffffff40;border-radius:9px;background:#383840;padding:9px 13px}',
+      '#pts-overlay .pts-series-scroll{flex:1;overflow-y:auto;position:relative;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}',
+      '#pts-overlay .pts-series-rows{position:relative}',
+      '#pts-overlay .pts-series-row{position:absolute;left:0;right:0;height:70px;display:flex;align-items:center;gap:13px;width:100%;background:#202027;color:white;border:0;border-bottom:1px solid #ffffff18;text-align:left;padding:5px 14px;box-sizing:border-box;font:13px system-ui}',
+      '#pts-overlay .pts-series-row[disabled]{opacity:.65}',
+      '#pts-overlay .pts-series-row img{width:56px;height:56px;object-fit:cover;background:#333;border-radius:5px;flex:none}',
+      '#pts-overlay .pts-series-row span{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
+      '#pts-overlay .pts-series-selected{background:#34445d}',
+      '#pts-overlay .pts-series-status{font-size:12px;color:#ccc}'
+    ].join('\n');
+    document.head.appendChild(st);
+  }
+
   function syncDock() {
     if (!overlay) return;
+    syncSeriesBar();
     const returnButton = overlay.querySelector('.pts-return-grid');
     if (returnButton) returnButton.hidden = !gridReturnState ||
       searchGrid.open || overlay.style.display === 'none';
@@ -7435,6 +7648,7 @@
     installDiagnosticUI();
     installBookmarkFeedback();
     installExperienceUI();
+    installSeriesUI();
     bindUserNavigationIntent();
 
 

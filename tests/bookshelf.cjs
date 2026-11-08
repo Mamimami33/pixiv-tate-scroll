@@ -87,11 +87,17 @@ const injected=script.replace(/\}\)\(\);\s*$/,`window.__shelfTest={
  await page.locator('.pts-close').click();
  assert.equal((await page.evaluate(()=>__shelfTest.state())).reading,null);
  assert.equal(await page.locator('.pts-bookshelf-scroll').evaluate(el=>el.scrollTop),top);
- // Explicit series origin works with zero slides; list-only close also restores shelf.
- await page.evaluate(()=>__shelfTest.open('series:1'));await page.waitForSelector('.pts-series-sheet:not([hidden])');
+ // Opening a series tile starts reading at episode 1 directly (user request);
+ // the episode list stays reachable, and list-only close also restores shelf.
+ await page.evaluate(()=>__shelfTest.open('series:1'));
+ await page.waitForFunction(()=>__shelfTest.state().episode==='101'&&__shelfTest.seriesUI.reading?.imageReady);
+ assert.equal(await page.locator('.pts-series-sheet:not([hidden])').count(),0,'tile open goes straight to episode 1');
+ await page.getByRole('button',{name:'本棚へ',exact:true}).click();
+ assert.equal((await page.evaluate(()=>__shelfTest.state())).reading,null);
+ assert.equal(await page.locator('.pts-bookshelf-scroll').evaluate(el=>el.scrollTop),top);
+ await page.evaluate(()=>__shelfTest.showList({id:'1',order:1,title:'Series 1'}));await page.waitForSelector('.pts-series-sheet:not([hidden])');
  await page.locator('.pts-series-close').click();assert.equal((await page.evaluate(()=>__shelfTest.state())).reading,null);
  await page.evaluate(()=>__shelfTest.open('series:1'));
- await page.evaluate(()=>__shelfTest.openEpisode({id:'101',index:0,order:1},{id:'1',order:1,title:'Series 1'}));
  await page.waitForFunction(()=>__shelfTest.state().episode==='101'&&__shelfTest.seriesUI.reading?.imageReady);
  await page.keyboard.press('ArrowLeft');await page.waitForFunction(()=>__shelfTest.state().page===1);
  await page.keyboard.press('ArrowRight');await page.waitForFunction(()=>__shelfTest.state().page===0);
@@ -125,7 +131,6 @@ const injected=script.replace(/\}\)\(\);\s*$/,`window.__shelfTest={
  assert(!state.entries.some(e=>e.id==='101'),'nonmatching first episode is cover/reading only');
  const beforeIds=state.entries.map(e=>e.id);
  await page.evaluate(()=>__shelfTest.open('series:1'));
- await page.evaluate(()=>__shelfTest.openEpisode({id:'101',index:0,order:1},{id:'1',order:1,title:'Series 1'}));
  await page.waitForFunction(()=>__shelfTest.state().episode==='101');
  await page.evaluate(()=>__shelfTest.closeSeries());
  assert.deepEqual((await page.evaluate(()=>__shelfTest.state())).entries.map(e=>e.id),beforeIds,'reading never expands search candidates');

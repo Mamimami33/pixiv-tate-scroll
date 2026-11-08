@@ -89,7 +89,7 @@
       throw new Error(json.message || 'api error');
     }
 
-    if (String(url).startsWith('/ranking.php?') && Array.isArray(json.contents)) return json;
+    if (/(?:^|\/)ranking\.php\?/.test(String(url)) && Array.isArray(json.contents)) return json;
 
     if (json.body == null) {
       throw new Error('API bodyがありません');
@@ -2221,7 +2221,8 @@
     active:false, source:'bookmarks', reading:null, returnTop:0, token:0,
     entries:new Map(), offset:0, rest:'show', page:1, finished:false, busy:false,
     config:null, context:null, observer:null, error:'', activeRequests:0, queue:[],
-    details:new Map(), covers:new Map(), autoTurnBusy:false, lastTurn:0
+    details:new Map(), covers:new Map(), autoTurnBusy:false, lastTurn:0,
+    lastRequestAt:0
   };
   // 人気と好みベース推薦は別プロバイダ。初版では人気だけを有効にする。
   const bookshelfProviders = {
@@ -2229,14 +2230,42 @@
     popular:{label:'おすすめ・人気', load:bookshelfLoadPopular},
     search:{label:'検索', load:bookshelfLoadSearch}
   };
+  // 本棚の要求は必ずこの口を通す。相対パスのままだとSafariの
+  // ユーザースクリプト文脈で相対URL解決に失敗し、fetchが
+  // 「The string did not match the expected pattern」で落ちることがあるため、
+  // 他所の直接fetch（https://www.pixiv.net/ 形式）と同じく絶対URLへ寄せる。
+  function bookshelfAbsoluteUrl(url) {
+    const text=String(url);
+    if(/^[a-z][a-z0-9+.-]*:/i.test(text))return text;
+    return 'https://www.pixiv.net'+(text.startsWith('/')?text:'/'+text);
+  }
   async function bookshelfRequest(url) {
     if (bookshelf.activeRequests >= 3) await new Promise(resolve => bookshelf.queue.push(resolve));
     else bookshelf.activeRequests++;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    try { return await fetchJson(url, controller.signal); }
+    const token=bookshelf.token;
+    try {
+      const target=bookshelfAbsoluteUrl(url);
+      // 要求開始の最小間隔（350ms）と429時の再試行（最大2回）で、
+      // 可視範囲の詳細・表紙取得が短時間に集中してpixiv側の上限へ
+      // 当たるのを防ぐ。再試行は本棚が開いたまま同じ選択中だけ続ける。
+      let lastError=null;
+      for(let attempt=0;;attempt++){
+        if(attempt>0&&(!bookshelf.active||bookshelf.token!==token))throw lastError;
+        const wait=bookshelf.lastRequestAt+350-Date.now();
+        if(wait>0)await new Promise(resolve=>setTimeout(resolve,wait));
+        bookshelf.lastRequestAt=Date.now();
+        const controller=new AbortController();
+        const timer=setTimeout(()=>controller.abort(),8000);
+        try { return await fetchJson(target, controller.signal); }
+        catch(error){
+          lastError=error;
+          const rateLimited=/HTTP 429/.test(String(error?.message||error));
+          if(!rateLimited||attempt>=2)throw error;
+          await new Promise(resolve=>setTimeout(resolve,attempt===0?1500:3000));
+        } finally { clearTimeout(timer); }
+      }
+    }
     finally {
-      clearTimeout(timer);
       const next=bookshelf.queue.shift();
       if(next)next();else bookshelf.activeRequests--;
     }
@@ -2537,7 +2566,18 @@
     bookshelf.returnTop=bookshelf.scroll.scrollTop;
     if(entry.series){
       bookshelf.reading='series';
-      await seriesShowList(entry.series);
+      const firstId=String(entry.cover?.firstId??''),total=entry.cover?.total;
+      if(/^[1-9]\d*$/.test(firstId)&&Number.isSafeInteger(total)&&total>=1){
+        // 本棚から開いたら第1話から読む（間宮さんの要望）。
+        // 表紙メタデータで解決済みの第1話を直接開き、話一覧は
+        // リーダー内の「一覧へ」から従来どおり開ける。
+        // 行インデックスは最古話が0（seriesFetchPageの割当てと一致）。
+        seriesUI.source=entry.series;seriesUI.activeId=entry.series.id;
+        seriesUI.sheetOpen=true;
+        await seriesOpenEpisode({id:firstId,index:0,order:1,title:''},entry.series);
+      }else{
+        await seriesShowList(entry.series);
+      }
     }else{
       bookshelf.reading='single';bookshelf.root.hidden=true;
       feedGeneration++;activeView=null;navIntent={reason:'other',until:0};

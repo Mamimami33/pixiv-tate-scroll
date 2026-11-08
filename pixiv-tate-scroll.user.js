@@ -2864,7 +2864,8 @@
   const seriesCache=new Map();
   const seriesUI={bar:null,sheet:null,list:null,rows:null,status:null,retry:null,
     label:null,activeId:null,sheetOpen:false,layerOpen:false,
-    episode:null,layer:null,reading:null,clock:null,requestToken:0,layerToken:0};
+    episode:null,layer:null,backdrop:null,reading:null,clock:null,
+    initializing:false,requestToken:0,layerToken:0};
   let seriesActiveRequests=0;
   const seriesRequestQueue=[];
   function parseArtworkSeries(body){
@@ -2974,7 +2975,7 @@
     }
     seriesUI.rows.replaceChildren(frag);
     seriesUI.rows.style.height=cache.total*70+'px';
-    if(cache.error)return;
+    if(cache.error||seriesUI.initializing)return;
     const index=Math.max(0,Math.min(cache.total-1,Math.floor(
       (top+seriesUI.list.clientHeight/2)/70)));
     const page=seriesPageForIndex(cache,index);
@@ -3002,7 +3003,9 @@
     const info=seriesUI.episode?.series||slides[currentIndex()]?.series;
     if(!info||!seriesUI.sheet)return;
     seriesUI.activeId=info.id;seriesUI.sheetOpen=true;
+    seriesUI.initializing=true;
     seriesUI.sheet.hidden=false;
+    if(seriesUI.backdrop)seriesUI.backdrop.hidden=false;
     seriesUI.label.textContent=info.title||'漫画シリーズ';
     const token=++seriesUI.requestToken,cache=seriesCacheFor(info.id);
     seriesRenderList();
@@ -3010,14 +3013,17 @@
     if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
     const row=await seriesFindOrder(cache,info.order);
     if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
+    seriesUI.initializing=false;
     if(row)seriesUI.list.scrollTop=Math.max(0,row.index*70-seriesUI.list.clientHeight/2);
-    else if(cache.total!=null && cache.rows.size)
-      seriesUI.status.textContent='現在話の位置を特定できません。スクロールして探してください。';
     seriesRenderList();
+    if(!row&&cache.total!=null)
+      seriesUI.status.textContent='現在話を特定できません。スクロールして探してください。';
   }
   function seriesHideList(){
-    seriesUI.sheetOpen=false;seriesUI.requestToken++;
+    seriesUI.sheetOpen=false;seriesUI.initializing=false;
+    seriesUI.requestToken++;
     if(seriesUI.sheet)seriesUI.sheet.hidden=true;
+    if(seriesUI.backdrop)seriesUI.backdrop.hidden=true;
     if(activeView)activeView.last=performance.now();
     syncSeriesBar();
   }
@@ -3027,6 +3033,10 @@
     bar.type='button';bar.className='pts-series-bar';bar.hidden=true;
     bar.addEventListener('click',()=>void seriesShowList());
     overlay.appendChild(bar);seriesUI.bar=bar;
+    const backdrop=document.createElement('div');
+    backdrop.className='pts-series-backdrop';backdrop.hidden=true;
+    backdrop.addEventListener('click',seriesHideList);
+    overlay.appendChild(backdrop);seriesUI.backdrop=backdrop;
     const panel=document.createElement('section');
     panel.className='pts-series-sheet';panel.hidden=true;
     panel.innerHTML='<header><strong class="pts-series-name"></strong>'+
@@ -3054,9 +3064,10 @@
     },{passive:true});
     const st=document.createElement('style');
     st.textContent=[
-      '#pts-overlay .pts-series-bar[hidden],#pts-overlay .pts-series-sheet[hidden],#pts-overlay .pts-series-retry[hidden]{display:none!important}',
+      '#pts-overlay .pts-series-bar[hidden],#pts-overlay .pts-series-sheet[hidden],#pts-overlay .pts-series-retry[hidden],#pts-overlay .pts-series-backdrop[hidden]{display:none!important}',
+      '#pts-overlay .pts-series-backdrop{position:absolute;inset:0;z-index:75;background:#0009}',
       '#pts-overlay .pts-series-bar{position:absolute;z-index:29;bottom:calc(67px + env(safe-area-inset-bottom));left:12px;right:12px;width:calc(100% - 24px);min-height:40px;padding:7px 14px;border:1px solid #ffffff40;border-radius:10px;background:#17171be8;color:#fff;text-align:left;font:13px system-ui;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-      '#pts-overlay .pts-series-sheet{position:absolute;z-index:75;bottom:0;left:0;right:0;height:73dvh;max-height:75vh;display:flex;flex-direction:column;background:#17171c;color:white;border-radius:18px 18px 0 0;border-top:1px solid #ffffff50;box-shadow:0 -18px 40px #000b}',
+      '#pts-overlay .pts-series-sheet{position:absolute;z-index:76;bottom:0;left:0;right:0;height:73dvh;max-height:75vh;display:flex;flex-direction:column;background:#17171c;color:white;border-radius:18px 18px 0 0;border-top:1px solid #ffffff50;box-shadow:0 -18px 40px #000b}',
       '#pts-overlay .pts-series-sheet header,#pts-overlay .pts-series-sheet footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;flex-shrink:0}',
       '#pts-overlay .pts-series-sheet header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '#pts-overlay .pts-series-sheet button{color:white}',
@@ -7630,7 +7641,7 @@
     const context = searchDiagnosticContext();
     const generation = ++searchDiagnosticGeneration;
     const search = context?.search || null;
-    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.18',
+    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.21',
       capturedAt: new Date().toISOString(), diagnosticId: 'search-' + Date.now() + '-' + generation,
       search, requestedPages: Array.from({length: SEARCH_DIAG_PAGES}, (_, i) => i + 1),
       completedPages: [], apiTotal: null, relatedTags: [],

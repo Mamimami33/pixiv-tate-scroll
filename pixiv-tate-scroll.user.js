@@ -101,12 +101,53 @@
   // ランキング応答専用。/ajax/ 系でない ranking.php だけは、応答を
   // res.json() でなく本文テキストから読む（WebKit では res.json() が
   // 「The string did not match the expected pattern」で落ちることがあるため）。
-  // モバイル経路ではボットチェック等の割り込みページ（HTML）が200で
-  // 差し込まれることがある（実測：PCの同一アカウントでは正常なJSON）。
-  // そのため解析失敗時は最終URLと本文の先頭をエラーに含めて切り分け可能にし、
-  // HTMLが返った場合だけ3秒待って1回だけ再試行する。
+  // ranking.php は User-Agent で出し分ける（実測で確定）：デスクトップUAでは
+  // format=json のJSONが返るが、モバイルUAでは同じURL・同じ200でも
+  // Next.js のHTMLページが返り、Accept ヘッダでは切り替わらない。
+  // その場合はモバイル版アプリ自身が使う /touch/ajax/ranking/illust へ
+  // 切り替える。こちらはUAを問わずJSON（作品IDと順位のみ、18件/ページ）を
+  // 返すことを実測し、ID並びが ranking.php の contents と一致することも
+  // 確認済み。タイトル・画像・シリーズは本棚側が作品詳細の解決で補う
+  // （従来経路でも全件を解決している）。
+  // touch 側も失敗した場合は、最終URLと本文の先頭をエラーに含めて
+  // 切り分け可能にし、HTMLが返った場合だけ3秒待って1回だけ再試行する。
   async function fetchRankingJson(url, signal) {
     const options = { method: 'GET', credentials: 'same-origin', signal };
+    const touchRankingUrl = (sourceUrl) => {
+      let mode = 'daily', type = 'all', page = '1';
+      try {
+        const q = new URL(sourceUrl).searchParams;
+        mode = q.get('mode') || mode;
+        type = q.get('content') || type;
+        page = q.get('p') || page;
+      } catch { /* パラメータが取れなければ既定値で試す */ }
+      return 'https://www.pixiv.net/touch/ajax/ranking/illust?mode=' +
+        encodeURIComponent(mode) + '&type=' + encodeURIComponent(type) +
+        '&page=' + encodeURIComponent(page) + '&lang=ja';
+    };
+    // 成功時は {contents} 形式へ組み立てて返し、形が想定と違えば null。
+    // 429 だけは呼び出し側の間隔・再試行に乗せるため HTTP 429 として投げる。
+    const fetchTouchRanking = async () => {
+      const res = await fetch(touchRankingUrl(url),
+        { method: 'GET', credentials: 'same-origin', signal, headers: { Accept: 'application/json' } });
+      if (!res.ok) {
+        if (res.status === 429) throw new Error('HTTP 429');
+        return null;
+      }
+      let json;
+      try { json = JSON.parse(await res.text()); } catch { return null; }
+      const ranking = json && !json.error && json.body && Array.isArray(json.body.ranking)
+        ? json.body.ranking : null;
+      if (!ranking) return null;
+      const contents = [];
+      for (const row of ranking) {
+        const id = Number(row && row.illustId);
+        if (!Number.isSafeInteger(id) || id <= 0) continue;
+        contents.push({ illust_id: id, rank: row.rank, title: '', url: '', illust_series: null });
+      }
+      if (ranking.length && !contents.length) return null;
+      return { contents };
+    };
     // 診断情報：最終URLは末尾側（パスとクエリ）を優先して最長90字、
     // 本文の先頭は空白を1字に潰して80字まで。
     const diagUrl = (res) => {
@@ -140,9 +181,15 @@
       try {
         json = JSON.parse(text);
       } catch (e) {
+        const isHtml = String(text || '').trimStart().startsWith('<');
+        if (isHtml) {
+          // UA出し分けのHTMLなら touch 側ランキングで取り直す。
+          const viaTouch = await fetchTouchRanking();
+          if (viaTouch) return viaTouch;
+        }
         const err = new Error(`ランキング応答をJSONとして読めません url=${diagUrl(res)} head=${diagHead(text)}`);
-        // 割り込みページ（HTML）のときだけ、呼び出し側で再試行できるよう印を付ける。
-        err.rankingHtmlInterstitial = String(text || '').trimStart().startsWith('<');
+        // HTMLが返った場合だけ、呼び出し側で再試行できるよう印を付ける。
+        err.rankingHtmlInterstitial = isHtml;
         throw err;
       }
       if (!json || typeof json !== 'object') {
@@ -2591,7 +2638,10 @@
     }
   }
   async function bookshelfLoadPopular(valid) {
-    if(bookshelf.page>10){bookshelf.finished=true;return;}
+    // モバイルUAでは touch 側ランキング（18件/ページ）へ切り替わるため、
+    // ランキング総数（500件）に届くようページ上限は28とする。
+    // デスクトップ経路（50件/ページ）では空ページで通常どおり打ち止めになる。
+    if(bookshelf.page>28){bookshelf.finished=true;return;}
     const page=bookshelf.page;
     // ranking.phpはajax bodyラッパーを持たない。本文テキスト経由で読む。
     let data;
@@ -2610,7 +2660,7 @@
       throw bookshelfStageError('変換',error);
     }
     bookshelfAdd(mapped);
-    bookshelf.page++;bookshelf.finished=!data.contents.length||bookshelf.page>10;
+    bookshelf.page++;bookshelf.finished=!data.contents.length||bookshelf.page>28;
   }
   async function bookshelfLoadSearch(valid) {
     const config=bookshelf.config;

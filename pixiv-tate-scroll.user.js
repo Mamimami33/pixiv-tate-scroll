@@ -101,29 +101,68 @@
   // ランキング応答専用。/ajax/ 系でない ranking.php だけは、応答を
   // res.json() でなく本文テキストから読む（WebKit では res.json() が
   // 「The string did not match the expected pattern」で落ちることがあるため）。
+  // モバイル経路ではボットチェック等の割り込みページ（HTML）が200で
+  // 差し込まれることがある（実測：PCの同一アカウントでは正常なJSON）。
+  // そのため解析失敗時は最終URLと本文の先頭をエラーに含めて切り分け可能にし、
+  // HTMLが返った場合だけ3秒待って1回だけ再試行する。
   async function fetchRankingJson(url, signal) {
     const options = { method: 'GET', credentials: 'same-origin', signal };
-    const res = await fetch(url, options);
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-    const text = await res.text();
-    let json;
+    // 診断情報：最終URLは末尾側（パスとクエリ）を優先して最長90字、
+    // 本文の先頭は空白を1字に潰して80字まで。
+    const diagUrl = (res) => {
+      const u = String((res && res.url) || url || '');
+      return u.length > 90 ? '…' + u.slice(-89) : u;
+    };
+    const diagHead = (text) => String(text || '').replace(/\s+/g, ' ').slice(0, 80);
+    const abortError = () => (signal && signal.reason) || new DOMException('Aborted', 'AbortError');
+    const waitAbortable = (ms) => new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(abortError());
+      };
+      const timer = setTimeout(() => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    });
+    const attemptOnce = async () => {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const text = await res.text();
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch (e) {
+        const err = new Error(`ランキング応答をJSONとして読めません url=${diagUrl(res)} head=${diagHead(text)}`);
+        // 割り込みページ（HTML）のときだけ、呼び出し側で再試行できるよう印を付ける。
+        err.rankingHtmlInterstitial = String(text || '').trimStart().startsWith('<');
+        throw err;
+      }
+      if (!json || typeof json !== 'object') {
+        throw new Error('JSON形式が不正');
+      }
+      if (json.error) {
+        throw new Error(json.message || 'api error');
+      }
+      if (!Array.isArray(json.contents)) {
+        throw new Error(`ランキング応答にcontents配列がありません head=${diagHead(text)}`);
+      }
+      return json;
+    };
     try {
-      json = JSON.parse(text);
+      return await attemptOnce();
     } catch (e) {
-      throw new Error('ランキング応答をJSONとして読めません');
+      if (!e || !e.rankingHtmlInterstitial) throw e;
+      await waitAbortable(3000);
+      return await attemptOnce();
     }
-    if (!json || typeof json !== 'object') {
-      throw new Error('JSON形式が不正');
-    }
-    if (json.error) {
-      throw new Error(json.message || 'api error');
-    }
-    if (!Array.isArray(json.contents)) {
-      throw new Error('ランキング応答にcontents配列がありません');
-    }
-    return json;
   }
 
   // 解決処理はPromiseを共有する（同じ作品に二重で走らせない。ChatGPTレビュー反映）

@@ -11,7 +11,9 @@ function functionText(s,name) {
  return s.slice(start,next);
 }
 for(const name of ['compareSearchRank','orderSearchRankRows','searchTiePenalty','searchRankRow','tasteScore']) assert.equal(functionText(source,name),functionText(base,name),name+' unchanged');
-const instrumented=source.replace(/\}\)\(\);\s*$/,`window.__test = {
+// Bookshelf routing is covered by bookshelf.cjs; retain feed-path filter regression coverage here.
+const feedSource=source.replace("if (contentFilter.type === 'manga') {", "if (false) {");
+const instrumented=feedSource.replace(/\}\)\(\);\s*$/,`window.__test = {
  state:()=>({filter:{...contentFilter},epoch:contentFilterEpoch,viewMode,slides:slides.map(s=>({id:s.id,type:s.rawType,age:s.xRestrict})),grid:searchGrid.items.map(s=>({id:s.id,type:s.illustType,age:s.xRestrict})),busy:customBusy||searchBusy}),
  matches:contentMatches, prepare:filterContentCandidates, normalize:normalizeCandidate,
  set:f=>{contentFilter=f;contentFilterEpoch++;}, invalidate:()=>{contentFilterEpoch++;},

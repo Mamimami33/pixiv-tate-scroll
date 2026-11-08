@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.22
+// @version      3.13.23
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -88,6 +88,8 @@
     if (json.error) {
       throw new Error(json.message || 'api error');
     }
+
+    if (String(url).startsWith('/ranking.php?') && Array.isArray(json.contents)) return json;
 
     if (json.body == null) {
       throw new Error('API bodyがありません');
@@ -932,6 +934,7 @@
 
       const pager = document.createElement('div');
       pager.className = 'pts-pager';
+      if(viewMode==='bookshelf'&&contentType(s)===1){pager.dir='rtl';s.mangaRTL=true;}
 
       s.pairs.forEach((pair, i) => {
         const pg = document.createElement('div');
@@ -955,7 +958,7 @@
           Math.min(
             s.pairs.length - 1,
             Math.round(
-              pager.scrollLeft /
+              Math.abs(pager.scrollLeft) /
               Math.max(1, pager.clientWidth)
             )
           )
@@ -2030,7 +2033,7 @@
   let feedGeneration = 0;
 
   /* ---------- v3.13.22: 表示モードとは独立したコンテンツ条件 ---------- */
-  let viewMode = 'feed'; // 将来の本棚モード用。検索/推薦(mode)とも独立。
+  let viewMode = 'feed'; // 'feed' | 'bookshelf'。検索/推薦(mode)とも独立。
   let contentFilter = { type: 'all', age: 'all' };
   let contentFilterEpoch = 0;
   let contentFilterConfirmed = false;
@@ -2112,7 +2115,7 @@
     return '現在の条件で表示できる作品がありません。取得範囲や作品情報、pixiv側の閲覧設定などにより結果が得られない場合があります。条件を変更するか、続きを取得してください。';
   }
   function showContentEmpty() {
-    if (!feedEl || slides.length || contentFilterDialog?.open) return;
+    if (viewMode === 'bookshelf' || !feedEl || slides.length || contentFilterDialog?.open) return;
     let box = feedEl.querySelector('.pts-content-empty');
     if (!box) {
       box = document.createElement('div'); box.className = 'pts-content-empty';
@@ -2192,11 +2195,13 @@
       contentFilterEpoch++; feedGeneration++;
       cancelSearchDiagnostic('filter changed'); searchRankPools.clear(); seriesCache.clear();
       const gridWord=searchGrid.open?searchGrid.config?.word:null;
+      const shelfSource=bookshelf.active?bookshelf.source:null;
+      const shelfWord=bookshelf.config?.word;
       closeSearchGrid(false); gridReturnState=null;
-      seriesCloseLayer(); seriesHideList(); sessionTrail.length=0;
+      bookshelfStop(); seriesCloseLayer(); seriesHideList(); sessionTrail.length=0;
       overlay.querySelector('.pts-history-panel')?.setAttribute('hidden','');
       syncContentFilterButton();
-      if(mode==='search')void startSearchFeed(); else void startCustomFeed();
+      startSelectedView(shelfSource,shelfWord);
       if(gridWord)openSearchGrid(gridWord);
     });
     form.append(note,reset,cancel,start); dialog.append(title,form); document.body.appendChild(dialog); dialog.showModal();
@@ -2208,6 +2213,360 @@
   }
 
   readContentFilter();
+
+  /* ---------- v3.13.23: 段階的に集約するマンガ本棚 ---------- */
+  const BOOKSHELF_LIMIT = 500;
+  const bookshelf = {
+    root:null, scroll:null, tiles:null, status:null, more:null, form:null,
+    active:false, source:'bookmarks', reading:null, returnTop:0, token:0,
+    entries:new Map(), offset:0, rest:'show', page:1, finished:false, busy:false,
+    config:null, context:null, observer:null, error:'', activeRequests:0, queue:[],
+    details:new Map(), covers:new Map(), autoTurnBusy:false, lastTurn:0
+  };
+  // 人気と好みベース推薦は別プロバイダ。初版では人気だけを有効にする。
+  const bookshelfProviders = {
+    bookmarks:{label:'ブックマーク', load:bookshelfLoadBookmarks},
+    popular:{label:'おすすめ・人気', load:bookshelfLoadPopular},
+    search:{label:'検索', load:bookshelfLoadSearch}
+  };
+  async function bookshelfRequest(url) {
+    if (bookshelf.activeRequests >= 3) await new Promise(resolve => bookshelf.queue.push(resolve));
+    else bookshelf.activeRequests++;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try { return await fetchJson(url, controller.signal); }
+    finally {
+      clearTimeout(timer);
+      const next=bookshelf.queue.shift();
+      if(next)next();else bookshelf.activeRequests--;
+    }
+  }
+  function bookshelfDetail(id) {
+    id=String(id);
+    if (!/^[1-9]\d*$/.test(id)) return Promise.reject(new Error('作品IDが不正です'));
+    if (!bookshelf.details.has(id)) {
+      const task=bookshelfRequest('/ajax/illust/'+encodeURIComponent(id))
+        .catch(error=>{bookshelf.details.delete(id);throw error;});
+      bookshelf.details.set(id,task);
+      if(bookshelf.details.size>150)bookshelf.details.delete(bookshelf.details.keys().next().value);
+    }
+    return bookshelf.details.get(id);
+  }
+  function bookshelfSeries(work, body) {
+    const parsed=parseArtworkSeries(body);
+    if(parsed)return parsed;
+    const raw=work.illust_series;
+    const id=String(body?.userIllusts?.[work.id]?.seriesId ??
+      raw?.illustSeriesId ?? raw?.seriesId ?? raw?.id ?? '');
+    if(!/^[1-9]\d*$/.test(id))return null;
+    return {id,order:1,title:String(raw?.illustSeriesTitle||raw?.title||'漫画シリーズ')};
+  }
+  async function bookshelfCover(info, valid) {
+    // キャッシュはフィルタ非依存のメタデータだけ。利用時に現在条件を再検証する。
+    let pending=bookshelf.covers.get(info.id);
+    if(!pending){
+      pending=(async()=>{
+        const first=await bookshelfRequest('/ajax/series/'+encodeURIComponent(info.id)+'?p=1');
+        const metadata=first.illustSeries?.find(s=>String(s.id??s.seriesId??info.id)===info.id);
+        const firstId=String(metadata?.firstIllustId??'');
+        const total=Number(first.page?.total??metadata?.contentCount??metadata?.illustCount);
+        if(!/^[1-9]\d*$/.test(firstId)||!Number.isSafeInteger(total)||total<1)
+          throw new Error('シリーズ表紙・総話数を確認できません');
+        const lastPage=Math.ceil(total/SERIES_PAGE_SIZE);
+        const last=lastPage===1?first:await bookshelfRequest('/ajax/series/'+encodeURIComponent(info.id)+'?p='+lastPage);
+        // 最終ページにシリーズ外の作品が混ざるため、必ずfirstIllustIdで照合する。
+        const thumbnail=last.thumbnails?.illust?.find(t=>candidateId(t)===firstId);
+        return {title:String(metadata.title||info.title||'漫画シリーズ'),total,firstId,thumbnail};
+      })().catch(error=>{bookshelf.covers.delete(info.id);throw error;});
+      bookshelf.covers.set(info.id,pending);
+      if(bookshelf.covers.size>30)bookshelf.covers.delete(bookshelf.covers.keys().next().value);
+    }
+    const metadata=await pending;
+    if(!valid())return null;
+    const thumbnail=metadata.thumbnail;
+    let url='';
+    if(thumbnail){
+      const verified=contentKnown(thumbnail)?thumbnail:await bookshelfDetail(metadata.firstId);
+      if(valid()&&contentMatches(verified))url=thumbnail.url||thumbnail.urls?.regular||'';
+    }
+    return valid()?{title:metadata.title,total:metadata.total,firstId:metadata.firstId,url}:null;
+  }
+  function bookshelfValid(token, epoch) {
+    return bookshelf.active && viewMode==='bookshelf' && bookshelf.token===token && contentFilterEpoch===epoch;
+  }
+  function bookshelfStop() {
+    bookshelf.active=false; bookshelf.token++; bookshelf.reading=null;
+    seriesUI.source=null;
+    bookshelf.observer?.disconnect();
+    if(bookshelf.root)bookshelf.root.hidden=true;
+  }
+  function installBookshelfUI() {
+    if(bookshelf.root)return;
+    const root=document.createElement('section');root.className='pts-bookshelf';root.hidden=true;
+    root.setAttribute('aria-label','マンガ本棚');
+    root.innerHTML='<h2>マンガ本棚</h2><nav class="pts-bookshelf-tabs" aria-label="本棚の取得元"></nav>'+
+      '<form class="pts-bookshelf-search"><input type="search" aria-label="本棚の検索語" placeholder="マンガを検索" required><button>検索</button></form>'+
+      '<div class="pts-bookshelf-scroll"><div class="pts-bookshelf-tiles"></div>'+
+      '<footer><p class="pts-bookshelf-status" role="status"></p><button class="pts-bookshelf-more" type="button">続きを取得</button></footer></div>';
+    overlay.appendChild(root);
+    bookshelf.root=root;bookshelf.scroll=root.querySelector('.pts-bookshelf-scroll');
+    bookshelf.tiles=root.querySelector('.pts-bookshelf-tiles');bookshelf.status=root.querySelector('.pts-bookshelf-status');
+    bookshelf.more=root.querySelector('.pts-bookshelf-more');bookshelf.form=root.querySelector('form');
+    for(const [key,provider] of Object.entries(bookshelfProviders)){
+      const button=document.createElement('button');button.type='button';button.dataset.source=key;
+      button.textContent=provider.label;button.onclick=()=>void bookshelfSelectSource(key);
+      root.querySelector('nav').appendChild(button);
+    }
+    bookshelf.form.onsubmit=event=>{event.preventDefault();void bookshelfSelectSource('search',bookshelf.form.querySelector('input').value);};
+    bookshelf.more.onclick=()=>void bookshelfLoadMore();
+    const style=document.createElement('style');style.textContent=`
+      #pts-overlay .pts-bookshelf[hidden]{display:none!important}
+      #pts-overlay .pts-bookshelf{position:absolute;inset:60px 0 68px;z-index:58;background:#11141b;color:white;display:flex;flex-direction:column}
+      #pts-overlay .pts-bookshelf h2{font:600 18px system-ui;margin:12px}
+      #pts-overlay .pts-bookshelf-tabs{display:flex;gap:6px;padding:0 10px}
+      #pts-overlay .pts-bookshelf button{min-height:44px;padding:8px 12px;border:1px solid #ffffff40;border-radius:9px;background:#303744;color:white;cursor:pointer}
+      #pts-overlay .pts-bookshelf-tabs button[aria-pressed="true"]{background:#006bbd;border-color:#8dcfff}
+      #pts-overlay .pts-bookshelf-search{display:flex;gap:8px;padding:10px}
+      #pts-overlay .pts-bookshelf-search[hidden]{display:none}
+      #pts-overlay .pts-bookshelf-search input{flex:1;min-width:0;min-height:44px;border-radius:8px;padding:0 10px;font-size:16px}
+      #pts-overlay .pts-bookshelf-scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:12px}
+      #pts-overlay .pts-bookshelf-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+      #pts-overlay .pts-bookshelf-tile{display:flex;flex-direction:column;gap:6px;min-width:0;text-align:left}
+      #pts-overlay .pts-bookshelf-cover{display:flex;align-items:center;justify-content:center;width:100%;aspect-ratio:2/3;background:#222a38;border-radius:5px;overflow:hidden;font-size:12px}
+      #pts-overlay .pts-bookshelf-cover img{width:100%;height:100%;object-fit:cover}
+      #pts-overlay .pts-bookshelf-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13px;overflow-wrap:anywhere}
+      #pts-overlay .pts-bookshelf-count{font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+      #pts-overlay .pts-bookshelf footer{padding:12px 0 20px;font-size:12px;line-height:1.7}
+      #pts-overlay .pts-bookshelf-tile:disabled{cursor:default}
+      @media(min-width:700px){#pts-overlay .pts-bookshelf-tiles{grid-template-columns:repeat(auto-fill,minmax(145px,1fr))}}
+    `;document.head.appendChild(style);
+    bookshelf.observer=new IntersectionObserver(entries=>{
+      for(const entry of entries)if(entry.isIntersecting){
+        const item=bookshelf.entries.get(entry.target.dataset.workId);
+        if(item)void bookshelfHydrate(item);
+        bookshelf.observer.unobserve(entry.target);
+      }
+    },{root:bookshelf.scroll,rootMargin:'180px'});
+  }
+  function bookshelfGroups() {
+    const groups=new Map();
+    for(const entry of bookshelf.entries.values()){
+      if(entry.state==='excluded')continue;
+      const key=entry.series?'series:'+entry.series.id:'work:'+entry.id;
+      let group=groups.get(key);
+      if(!group){group={key,rank:entry.rank,entry,items:[]};groups.set(key,group);}
+      if(entry.rank<group.rank){group.rank=entry.rank;group.entry=entry;}
+      group.items.push(entry);
+    }
+    // 順位は最上位候補の位置のみ。平均・話数・好みスコアを混ぜない。
+    return [...groups.values()].sort((a,b)=>a.rank-b.rank);
+  }
+  function bookshelfRender() {
+    if(!bookshelf.active||bookshelf.reading)return;
+    const top=bookshelf.scroll.scrollTop;
+    bookshelf.observer.disconnect();
+    const fragment=document.createDocumentFragment();
+    for(const group of bookshelfGroups()){
+      const entry=group.entry,button=document.createElement('button');
+      button.type='button';button.className='pts-bookshelf-tile';button.dataset.tileKey=group.key;
+      const cover=document.createElement('span');cover.className='pts-bookshelf-cover';
+      const title=document.createElement('span');title.className='pts-bookshelf-title';
+      const count=document.createElement('span');count.className='pts-bookshelf-count';
+      if(entry.state!=='ready'){
+        cover.textContent=entry.state==='error'?'再試行':'情報を確認中…';
+        title.textContent='作品情報を確認';
+        button.disabled=entry.state!=='error';button.dataset.workId=entry.id;
+        if(entry.state==='error')button.onclick=()=>void bookshelfHydrate(entry);
+      }else{
+        const metadata=entry.cover;
+        const url=entry.series?metadata?.url:searchGridThumbnail(entry.work);
+        if(url){const img=document.createElement('img');img.loading='lazy';img.alt='';img.src=url;cover.appendChild(img);}
+        else cover.textContent=entry.series?'シリーズ表紙未確認':'表紙なし';
+        title.textContent=entry.series?(metadata?.title||entry.series.title):entry.work.title||'単発マンガ';
+        const total=metadata?.total;
+        count.textContent=entry.series?
+          (bookshelf.source==='bookmarks'?'ブックマーク'+group.items.length+'話（取得済み分）／':'')+
+          '全'+(total??'未確認')+'話':(entry.work.pageCount||1)+'ページ・単発';
+        button.onclick=()=>void bookshelfOpen(group);
+      }
+      button.append(cover,title,count);fragment.appendChild(button);
+    }
+    bookshelf.tiles.replaceChildren(fragment);bookshelf.scroll.scrollTop=top;
+    bookshelf.tiles.querySelectorAll('[data-work-id]').forEach(tile=>{
+      if(bookshelf.entries.get(tile.dataset.workId)?.state==='pending')bookshelf.observer.observe(tile);
+    });
+    const groups=bookshelfGroups(), ready=groups.filter(g=>g.entry.state==='ready').length;
+    const pending=[...bookshelf.entries.values()].some(entry=>entry.state==='pending'||entry.state==='loading');
+    const counter=overlay.querySelector('.pts-counter');
+    if(counter)counter.textContent='本棚 '+ready+'件';
+    bookshelf.status.textContent=bookshelf.error||
+      (bookshelf.busy?'取得中…':ready+'タイル／候補'+bookshelf.entries.size+'件。')+
+      (bookshelf.source==='bookmarks'?' ブックマーク話数は表示条件内の取得済み分です。':'')+
+      (bookshelf.source==='popular'?' 人気（日間マンガ）順。おすすめは後続版で対応します。':'')+
+      (pending?' 可視範囲の作品情報を確認中です。':'')+
+      (!ready&&!bookshelf.busy&&!pending?' '+contentEmptyMessage():'')+
+      (bookshelf.entries.size>=BOOKSHELF_LIMIT?' この本棚の候補上限（500件）です。':'');
+    bookshelf.more.disabled=bookshelf.busy||bookshelf.finished||bookshelf.entries.size>=BOOKSHELF_LIMIT||
+      (bookshelf.source==='search'&&!bookshelf.config?.word);
+    bookshelf.more.textContent=bookshelf.finished?'取得済み範囲の末尾':'続きを取得';
+  }
+  async function bookshelfHydrate(entry) {
+    if(entry.state==='loading'||entry.state==='ready'||entry.state==='excluded')return;
+    const token=bookshelf.token,epoch=contentFilterEpoch;
+    const valid=()=>bookshelfValid(token,epoch)&&bookshelf.entries.get(entry.id)===entry;
+    entry.state='loading';
+    try{
+      const body=await bookshelfDetail(entry.id);
+      if(!valid())return;
+      const work=normalizeCandidate({...entry.raw,...body,id:entry.id,
+        url:body.urls?.regular||body.urls?.small||entry.raw.url||'',
+        bookmarked:bookshelf.source==='bookmarks'||!!body.bookmarkData});
+      if(!contentMatches(work)){entry.state='excluded';return;}
+      entry.work=work;entry.series=bookshelfSeries(work,body);entry.state='ready';
+      if(entry.series){
+        try{entry.cover=await bookshelfCover(entry.series,valid);}catch{entry.cover=null;}
+        if(!valid())return;
+      }
+    }catch(error){if(valid()){entry.state='error';entry.error=String(error.message||error);}}
+    finally{if(valid())bookshelfRender();}
+  }
+  function bookshelfAdd(rawItems) {
+    for(const raw of rawItems){
+      const id=candidateId(raw);
+      if(!/^[1-9]\d*$/.test(id)||bookshelf.entries.has(id))continue;
+      if(!contentCouldMatch(raw,contentFilter))continue;
+      if(bookshelf.entries.size>=BOOKSHELF_LIMIT)break;
+      bookshelf.entries.set(id,{id,raw,rank:bookshelf.entries.size,state:'pending',work:null,series:null,cover:null});
+    }
+  }
+  async function bookshelfLoadBookmarks(valid) {
+    if(!getMyUserId())throw new Error('ログイン情報を確認できません。人気または検索をご利用ください。');
+    let added=0;
+    for(let n=0;n<3&&added<12&&!bookshelf.finished;n++){
+      const rest=bookshelf.rest,offset=bookshelf.offset;
+      const result=await fetchBookmarkBodyWithFallback(getMyUserId(),offset,100,
+        url=>bookshelfRequest(url.replace('rest=show','rest='+rest)));
+      if(!valid())return;
+      const rows=result.body.works;
+      const before=bookshelf.entries.size;
+      bookshelfAdd(rows);added+=bookshelf.entries.size-before;
+      bookshelf.offset+=rows.length;
+      const total=Number(result.body.total);
+      if(rows.length<100||(Number.isFinite(total)&&bookshelf.offset>=total)){
+        if(rest==='show'){bookshelf.rest='hide';bookshelf.offset=0;}
+        else bookshelf.finished=true;
+      }
+    }
+  }
+  async function bookshelfLoadPopular(valid) {
+    if(bookshelf.page>10){bookshelf.finished=true;return;}
+    const page=bookshelf.page;
+    // ranking.phpはajax bodyラッパーを持たない。
+    const data=await bookshelfRequest('/ranking.php?mode=daily&content=manga&p='+page+'&format=json');
+    if(!valid())return;
+    if(!Array.isArray(data.contents))throw new Error('マンガランキングの応答形式を確認できません');
+    bookshelfAdd(data.contents.map(raw=>({...raw,id:raw.illust_id??raw.id,
+      illustType:contentEnum(raw.illust_type??raw.illustType),
+      xRestrict:contentEnum(raw.xRestrict),title:raw.title||'',url:raw.url||''})));
+    bookshelf.page++;bookshelf.finished=!data.contents.length||bookshelf.page>10;
+  }
+  async function bookshelfLoadSearch(valid) {
+    const config=bookshelf.config;
+    if(!config?.word)return;
+    const ctx=bookshelf.context||getSearchRankContext(config,1);bookshelf.context=ctx;
+    const loaded=await loadSearchApiBatch(ctx,config,valid);
+    if(!valid()||loaded.stale)return;
+    const ranked=await buildSearchRankedBatch(ctx,[],[],valid);
+    if(!valid()||!ranked)return;
+    const selected=ranked.slice(0,BOOKSHELF_LIMIT);
+    const ids=new Set(selected.map(work=>String(work.id)));
+    for(const id of bookshelf.entries.keys())if(!ids.has(id))bookshelf.entries.delete(id);
+    bookshelfAdd(selected);
+    // 全取得済み候補を同じ検索比較器で順位付け。話数は一切加点しない。
+    ranked.forEach((work,rank)=>{const entry=bookshelf.entries.get(String(work.id));if(entry)entry.rank=rank;});
+    bookshelf.finished=ctx.finished;
+    if(loaded.error)throw loaded.error;
+  }
+  async function bookshelfLoadMore() {
+    if(!bookshelf.active||bookshelf.busy||bookshelf.finished||bookshelf.entries.size>=BOOKSHELF_LIMIT)return;
+    const token=bookshelf.token,epoch=contentFilterEpoch,source=bookshelf.source;
+    const valid=()=>bookshelfValid(token,epoch)&&bookshelf.source===source;
+    bookshelf.busy=true;bookshelf.error='';bookshelfRender();
+    try{await bookshelfProviders[source].load(valid);}
+    catch(error){if(valid())bookshelf.error='取得失敗: '+String(error.message||error)+'。続きを取得で再試行できます。';}
+    finally{if(valid()){bookshelf.busy=false;bookshelfRender();}}
+  }
+  async function bookshelfSelectSource(source,word) {
+    if(!bookshelfProviders[source])return;
+    bookshelf.token++;bookshelf.observer?.disconnect();bookshelf.reading=null;
+    activeView=null;feedGeneration++;
+    slides.forEach(cleanupSlide);slides=[];if(feedEl)feedEl.replaceChildren();
+    bookshelf.root.hidden=false;
+    seriesCloseLayer();seriesHideList();
+    bookshelf.source=source;bookshelf.entries=new Map();bookshelf.offset=0;bookshelf.rest='show';
+    bookshelf.page=1;bookshelf.finished=false;bookshelf.busy=false;bookshelf.error='';bookshelf.context=null;
+    bookshelf.config=null;bookshelf.returnTop=0;bookshelf.scroll.scrollTop=0;
+    bookshelf.form.hidden=source!=='search';
+    bookshelf.root.querySelectorAll('[data-source]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.source===source)));
+    if(source==='search'){
+      const query=String(word??bookshelf.form.querySelector('input').value??'').trim();
+      bookshelf.form.querySelector('input').value=query;
+      if(!query){bookshelfRender();bookshelf.status.textContent='検索語を入力してください。';return;}
+      const from=getSearchPageConfig();
+      bookshelf.config={word:query,order:from?.order||'popular_d',searchMode:from?.searchMode||'all',matchMode:from?.matchMode||'s_tag'};
+    }
+    bookshelfRender();await bookshelfLoadMore();
+  }
+  function startSelectedView(preferredSource = null, preferredWord = null) {
+    bookshelfStop();
+    if (contentFilter.type === 'manga') {
+      viewMode='bookshelf';installBookshelfUI();bookshelf.active=true;bookshelf.root.hidden=false;
+      activeView=null;slides.forEach(cleanupSlide);slides=[];feedEl.replaceChildren();
+      const config=getSearchPageConfig();
+      void bookshelfSelectSource(preferredSource||(config?'search':getMyUserId()?'bookmarks':'popular'),preferredWord??config?.word);
+    } else {
+      viewMode='feed';
+      searchConfig=getSearchPageConfig();mode=searchConfig?'search':'custom';
+      if(mode==='search')void startSearchFeed();else{renderSearchTagCandidates();void startCustomFeed();}
+      if(preferredSource==='search'&&preferredWord&&!searchConfig)openSearchGrid(preferredWord);
+    }
+  }
+  async function bookshelfOpen(group) {
+    const entry=group.entry;
+    if(entry.state!=='ready'||!contentMatches(entry.work))return;
+    bookshelf.returnTop=bookshelf.scroll.scrollTop;
+    if(entry.series){
+      bookshelf.reading='series';
+      await seriesShowList(entry.series);
+    }else{
+      bookshelf.reading='single';bookshelf.root.hidden=true;
+      feedGeneration++;activeView=null;navIntent={reason:'other',until:0};
+      slides.forEach(cleanupSlide);slides=[];feedEl.replaceChildren();feedEl.scrollTop=0;mode='custom';
+      const item=candidatesToSlides([entry.work])[0];
+      if(!item)return;
+      item.bookmarked=entry.work.bookmarked||knownBookmarkedIds.has(item.id);
+      addItems([item]);markCurrentFromScroll();syncDock();
+    }
+  }
+  function bookshelfReturn() {
+    if(!bookshelf.active)return;
+    bookshelf.reading=null;bookshelf.autoTurnBusy=false;
+    activeView=null;navIntent={reason:'other',until:0};feedGeneration++;
+    seriesCloseLayer();seriesHideList();
+    slides.forEach(cleanupSlide);slides=[];feedEl.replaceChildren();
+    bookshelf.root.hidden=false;bookshelfRender();bookshelf.scroll.scrollTop=bookshelf.returnTop;
+    const close=overlay.querySelector('.pts-close');if(close){close.dataset.confirm='0';close.textContent='閉じる';}
+    syncDock();
+  }
+  async function bookshelfAdvanceSeries(delta) {
+    if(bookshelf.autoTurnBusy||!seriesUI.layerOpen||seriesUI.sheetOpen||!seriesUI.episode)return;
+    bookshelf.autoTurnBusy=true;
+    try{
+      const next=seriesUI.pageIndex+delta;
+      if(next>=seriesUI.episode.pairs.length)await seriesStepEpisode(1);
+      else if(next>=0)await seriesShowPage(next);
+    }finally{bookshelf.autoTurnBusy=false;bookshelf.lastTurn=performance.now();}
+  }
 
   function candidateId(it) {
     const id = it && (it.id != null ? it.id : it.illustId);
@@ -2957,7 +3316,7 @@
   }
 
   async function customLoadMore() {
-    if (mode !== 'custom' || customBusy || customExhausted ||
+    if (viewMode === 'bookshelf' || mode !== 'custom' || customBusy || customExhausted ||
         !overlay || overlay.style.display === 'none') return;
     customBusy = true;
     const generation = feedGeneration;
@@ -3096,7 +3455,7 @@
   const seriesUI={bar:null,sheet:null,list:null,rows:null,status:null,retry:null,
     label:null,activeId:null,sheetOpen:false,layerOpen:false,
     episode:null,layer:null,backdrop:null,reading:null,clock:null,
-    initializing:false,requestToken:0,layerToken:0};
+    initializing:false,requestToken:0,layerToken:0,source:null};
   let seriesActiveRequests=0;
   const seriesRequestQueue=[];
   function parseArtworkSeries(body){
@@ -3238,9 +3597,10 @@
     seriesUI.bar.textContent=(info.title||'漫画シリーズ')+' · '+
       (total==null?'第'+info.order+'話':info.order+' / '+total);
   }
-  async function seriesShowList(){
-    const info=seriesUI.episode?.series||slides[currentIndex()]?.series;
+  async function seriesShowList(info = null){
+    info=info||seriesUI.episode?.series||slides[currentIndex()]?.series||seriesUI.source;
     if(!info||!seriesUI.sheet)return;
+    seriesUI.source=info;
     seriesUI.activeId=info.id;seriesUI.sheetOpen=true;
     seriesUI.initializing=true;
     seriesUI.sheet.hidden=false;
@@ -3265,6 +3625,7 @@
     if(seriesUI.backdrop)seriesUI.backdrop.hidden=true;
     if(activeView)activeView.last=performance.now();
     syncSeriesBar();
+    if(bookshelf.active&&bookshelf.reading==='series'&&!seriesUI.layerOpen)bookshelfReturn();
   }
   function installSeriesUI(){
     if(!overlay||seriesUI.bar)return;
@@ -3373,7 +3734,12 @@
     title.textContent=e?(e.title||'漫画'):'読み込み中…';
     page.textContent=e?(seriesUI.pageIndex+1)+' / '+e.pairs.length:'…';
     prev.disabled=!e||seriesUI.pageIndex===0;
-    next.disabled=!e||seriesUI.pageIndex>=e.pairs.length-1;
+    const shelf=viewMode==='bookshelf';
+    root.querySelector('.pts-series-controls').style.direction=shelf?'rtl':'ltr';
+    root.querySelector('.pts-series-to-feed').textContent=shelf?'本棚へ':'フィードへ';
+    prev.textContent=shelf?'→ 前ページ':'前ページ';next.textContent=shelf?'次ページ ←':'次ページ';
+    next.disabled=!e||(!shelf&&seriesUI.pageIndex>=e.pairs.length-1)||
+      (shelf&&e&&seriesUI.pageIndex>=e.pairs.length-1&&seriesCacheFor(e.series.id).total!=null&&e.index>=seriesCacheFor(e.series.id).total-1);
     if(e){
       const cache=seriesCacheFor(e.series.id);
       before.disabled=e.index<=0;
@@ -3417,10 +3783,11 @@
     if(seriesUI.reading)seriesUI.reading.imageReady=true;
     seriesUpdateEpisodeUI();
   }
-  async function seriesOpenEpisode(item){
+  async function seriesOpenEpisode(item, source = null){
     if(!item||!seriesUI.layer)return;
-    const source=seriesUI.episode?.series||slides[currentIndex()]?.series;
+    source=source||seriesUI.episode?.series||slides[currentIndex()]?.series||seriesUI.source;
     if(!source||!seriesUI.sheetOpen)return;
+    seriesUI.source=source;
     seriesUI.layerOpen=true;
     seriesUI.layer.hidden=false;
     const loading=seriesUI.layer.querySelector('.pts-series-error');
@@ -3479,7 +3846,7 @@
     if(!row||seriesUI.episode!==e)return;
     // 専用レイヤーからの話移動でも同じ処理を使用する。
     seriesUI.sheetOpen=true;
-    await seriesOpenEpisode(row);
+    await seriesOpenEpisode(row,e.series);
   }
   function seriesCloseLayer(){
     if(!seriesUI.layerOpen)return;
@@ -3494,6 +3861,8 @@
     }
     if(activeView)activeView.last=performance.now();
     syncDock();
+    if(bookshelf.active&&bookshelf.reading==='series')bookshelfReturn();
+    seriesUI.source=null;
   }
   async function seriesBookmarkEpisode(byLike){
     const e=seriesUI.episode;
@@ -3543,8 +3912,8 @@
     sel('pts-series-to-feed').onclick=seriesCloseLayer;
     sel('pts-series-prev-episode').onclick=()=>void seriesStepEpisode(-1);
     sel('pts-series-next-episode').onclick=()=>void seriesStepEpisode(1);
-    sel('pts-series-prev-page').onclick=()=>void seriesShowPage(seriesUI.pageIndex-1);
-    sel('pts-series-next-page').onclick=()=>void seriesShowPage(seriesUI.pageIndex+1);
+    sel('pts-series-prev-page').onclick=()=>void (viewMode==='bookshelf'?bookshelfAdvanceSeries(-1):seriesShowPage(seriesUI.pageIndex-1));
+    sel('pts-series-next-page').onclick=()=>void (viewMode==='bookshelf'?bookshelfAdvanceSeries(1):seriesShowPage(seriesUI.pageIndex+1));
     sel('pts-series-save').onclick=()=>void seriesBookmarkEpisode(false);
     sel('pts-series-like').onclick=()=>void seriesBookmarkEpisode(true);
     let start=null;
@@ -3557,9 +3926,21 @@
       const dx=ev.changedTouches[0].clientX-start.x,
         dy=ev.changedTouches[0].clientY-start.y;
       start=null;
-      if(Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.3)
-        void seriesShowPage(seriesUI.pageIndex+(dx<0?1:-1));
+      if(Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.3){
+        if(viewMode==='bookshelf')void bookshelfAdvanceSeries(dx>0?1:-1);
+        else void seriesShowPage(seriesUI.pageIndex+(dx<0?1:-1));
+      }else if(viewMode==='bookshelf'&&dy < -55&&Math.abs(dy)>Math.abs(dx)*1.3){
+        void bookshelfAdvanceSeries(1);
+      }
     },{passive:true});
+    root.querySelector('.pts-series-image').addEventListener('wheel',ev=>{
+      if(viewMode!=='bookshelf'||contentFilterDialog?.open||seriesUI.sheetOpen)return;
+      const delta=Math.abs(ev.deltaX)>Math.abs(ev.deltaY)?-ev.deltaX:ev.deltaY;
+      if(Math.abs(delta)<16)return;
+      ev.preventDefault();
+      if(bookshelf.lastTurn&&performance.now()-bookshelf.lastTurn<500)return;
+      void bookshelfAdvanceSeries(delta>0?1:-1);
+    },{passive:false});
     document.addEventListener('keydown',ev=>{
       if(contentFilterDialog?.open)return;
       if(!seriesUI.layerOpen&&!seriesUI.sheetOpen)return;
@@ -3571,7 +3952,8 @@
       if(seriesUI.sheetOpen||!seriesUI.layerOpen||
         ev.target?.closest?.('input,textarea,[contenteditable]'))return;
       if(ev.key==='ArrowLeft'||ev.key==='ArrowRight'){
-        void seriesShowPage(seriesUI.pageIndex+(ev.key==='ArrowRight'?1:-1));
+        if(viewMode==='bookshelf')void bookshelfAdvanceSeries(ev.key==='ArrowLeft'?1:-1);
+        else void seriesShowPage(seriesUI.pageIndex+(ev.key==='ArrowRight'?1:-1));
         ev.preventDefault();ev.stopImmediatePropagation();
       }
     },true);
@@ -3802,7 +4184,7 @@
 
   // キーボードによる移動はビューア表示中のみ。入力操作・修飾キーを優先。
   function handleViewerKeyboard(e) {
-    if (contentFilterDialog?.open) return;
+    if (contentFilterDialog?.open || (viewMode==='bookshelf'&&!bookshelf.reading)) return;
     if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.altKey ||
         e.metaKey || !overlay || overlay.style.display==='none' ||
         searchGrid.open || seriesUI.sheetOpen || seriesUI.layerOpen) return;
@@ -3825,11 +4207,11 @@
       if (!pager) return;
       const width=Math.max(1,pager.clientWidth);
       const page=Math.max(0,Math.min(slide.pairs.length-1,
-        Math.round(pager.scrollLeft/width)));
-      const next=page+(e.key==='ArrowRight'?1:-1);
+        Math.round(Math.abs(pager.scrollLeft)/width)));
+      const next=page+((slide.mangaRTL?e.key==='ArrowLeft':e.key==='ArrowRight')?1:-1);
       if (next>=0&&next<slide.pairs.length) {
         loadHorizontalNeighbors(slide,next);
-        pager.scrollTo({left:next*width,behavior:'smooth'});
+        pager.scrollTo({left:next*width*(slide.mangaRTL?-1:1),behavior:'smooth'});
       }
       handled=true;
     }
@@ -3890,6 +4272,7 @@
   }
 
   function confirmCloseViewer() {
+    if (viewMode === 'bookshelf' && bookshelf.reading) { bookshelfReturn(); return; }
     const btn = overlay?.querySelector('.pts-close');
     if (!btn) return;
     if (btn.dataset.confirm === '1') {
@@ -4477,6 +4860,7 @@
   function openSearchGrid(value) {
     const word = String(value || '').trim();
     if (!word || !overlay || !searchGrid.root) return;
+    if (viewMode === 'bookshelf') { void bookshelfSelectSource('search', word); return; }
 
     gridReturnState = null;
     closeSearchGrid(false);
@@ -5701,7 +6085,7 @@
 
 
   async function searchLoadMore() {
-    if (mode !== 'search' || !searchConfig || searchBusy ||
+    if (viewMode === 'bookshelf' || mode !== 'search' || !searchConfig || searchBusy ||
       searchFinished || overlay?.style.display === 'none') return;
     if (Date.now() - searchLastFailure < 4000) return;
     searchBusy = true;
@@ -6257,7 +6641,7 @@
   // ブックマークした作品のおすすめを、その作品の直後に最大12件差し込む
   async function insertSeriesAfter(s) {
     // シリーズ続編は検索APIヒット資格がないため検索系では追加しない。
-    if (mode === 'search' || !s || s.seriesInsertStarted ||
+    if (viewMode === 'bookshelf' || mode === 'search' || !s || s.seriesInsertStarted ||
         !slides.includes(s)) return;
 
     s.seriesInsertStarted = true;
@@ -6330,7 +6714,7 @@
   }
 
   async function insertRecommendationsAfterBookmark(s) {
-    if (!s || s.recommendInsertStarted || !slides.includes(s)) return;
+    if (viewMode === 'bookshelf' || !s || s.recommendInsertStarted || !slides.includes(s)) return;
 
     s.recommendInsertStarted = true;
     const generation = feedGeneration;
@@ -6494,7 +6878,7 @@
         loadHorizontalNeighbors(s, idx);
 
         if (pager) {
-          pager.scrollLeft = idx * pager.clientWidth;
+          pager.scrollLeft = idx * pager.clientWidth * (s.mangaRTL?-1:1);
         }
 
         upgradeSlide(s);
@@ -7893,7 +8277,7 @@
     const context = searchDiagnosticContext();
     const generation = ++searchDiagnosticGeneration;
     const search = context?.search || null;
-    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.22',
+    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.23',
       capturedAt: new Date().toISOString(), diagnosticId: 'search-' + Date.now() + '-' + generation,
       search, requestedPages: Array.from({length: SEARCH_DIAG_PAGES}, (_, i) => i + 1),
       completedPages: [], apiTotal: null, relatedTags: [],
@@ -8183,15 +8567,11 @@
     overlay.style.display = 'block';
     keepAwake(true);
 
-    if (mode === 'search') {
-      void startSearchFeed();
-    } else {
-      renderSearchTagCandidates();
-      void startCustomFeed();
-    }
+    startSelectedView();
   }
 
   function closeViewer() {
+    bookshelfStop();
     if (contentFilterDialog) { contentFilterDialog.close(); contentFilterDialog.remove(); contentFilterDialog=null; }
     if (!overlay) return;
     tickViewing();

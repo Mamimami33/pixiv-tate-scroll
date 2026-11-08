@@ -4120,6 +4120,8 @@
         overlay.style.display === 'none'
       ) return;
 
+      // シリーズ一覧・専用閲覧レイヤー側のEscape操作を優先する。
+      if (seriesUI.sheetOpen || seriesUI.layerOpen) return;
       // 検索入力中のEscapeは検索欄側に任せる。
       if (e.target.closest?.('.pts-global-search')) return;
 

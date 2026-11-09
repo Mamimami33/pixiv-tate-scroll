@@ -52,3 +52,25 @@ CIの権限は`contents: read`だけ。AIモデル・APIキーはCIから実行�
 ## 次の段階
 
 隔離環境の標準化、テスト仕様の自動生成と人間による検証、ブランチの自動push＋PR作成、GitHub Actions結果の取得、必要時の独立レビュー、実機からのテスト結果入力を順に追加する。これらは今回の試作では実装済みと扱わない。
+
+## 第2段階：モデル実行前の診断・模擬結合試験（2026-11-10）
+
+以前の試作品では、作業worktreeを最新`origin/main`から作ると、未マージの`AGENTS.md`や自律ランナーのテストが存在しない問題があった。修正版は**コントローラー側**の指示書をプロンプトに渡し、ランナーの不変条件テストもコントローラー側から実行する。アプリ本体は最新`origin/main`を基準に扱う。
+
+`python tools/autodev.py --doctor` は外部AIを実行せず、Git・Node・公式Codex CLIとそのログイン状態、Git checkout、originの存在を真偽値で表示する。秘密情報やアカウント識別情報は表示しない。
+
+`tests/test_autodev_integration.py` は、使い捨てのローカルGitリポジトリと**偽のCodex実行ファイル**を使った模擬結合試験。初回のJavaScript構文エラー→失敗情報をAIプロンプトへ渡す→2回目の修正→全検査合格と、元のmainを変更しないことを実行プロセス経由で確認する。本物のモデルが同様に動くことやSafari互換性は証明しない。
+
+Windowsでの次の確認（PC所有者が実行）：
+
+```powershell
+git clone https://github.com/Mamimami33/pixiv-tate-scroll.git
+cd pixiv-tate-scroll
+git fetch origin
+git switch feat/autodev-foundation-20261110
+python tools/autodev.py --doctor
+```
+
+Codex CLIが未導入なら、公式案内に従い`npm install -g @openai/codex@latest`と`codex login`でChatGPTアカウント認証する。APIキーは使わない。インストール・ログインは所有者の明示操作で行う。認証済みでも追加料金が発生しないという絶対保証ではなく、契約・利用枠・認証方法による。
+
+実際のAI開発試験では、低権限の使い捨てVM内で最初は`--allow-local-tests`なしで動かす。VM隔離の検証前にコード実行テストを有効化しない。診断が`ready:true`でも、完成・実機検証済みとはみなさない。

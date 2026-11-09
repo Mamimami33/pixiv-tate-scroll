@@ -1,0 +1,35 @@
+name: Verify userscript
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # existing regression test compares with historical commit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Syntax and harness unit tests
+        run: |
+          node --check pixiv-tate-scroll.user.js
+          node --check tests/content-filter.cjs
+          python -m unittest discover -s tests -p 'test_autodev.py' -v
+          git diff --check HEAD~1 HEAD
+      - name: Install Playwright (CI only)
+        run: |
+          npm install --no-save playwright@1.56.1
+          npx playwright install --with-deps chromium
+          echo "CHROMIUM_PATH=$(node -p 'require("playwright").chromium.executablePath()')" >> "$GITHUB_ENV"
+      - name: Existing browser regression
+        run: node tests/content-filter.cjs

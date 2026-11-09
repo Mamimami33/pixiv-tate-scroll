@@ -7,7 +7,6 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -53,11 +52,15 @@ def git(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def checks(worktree: Path, browser_tests: bool) -> list[dict[str, object]]:
+def checks(worktree: Path, browser_tests: bool, controller_root: Path | None = None) -> list[dict[str, object]]:
+    # The candidate starts at origin/main. The runner itself may exist only on
+    # an unmerged feature branch: run its invariant tests from that controller,
+    # not from the candidate checkout (which can silently discover zero tests).
+    root = controller_root or Path(__file__).resolve().parents[1]
     commands = [
         ["node", "--check", REPO_FILES[0]],
         ["node", "--check", REPO_FILES[1]],
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_autodev.py"],
+        [sys.executable, "-m", "unittest", "discover", "-s", str(root / "tests"), "-p", "test_autodev.py"],
         ["git", "diff", "--check"],
     ]
     if browser_tests:
@@ -70,10 +73,11 @@ def checks(worktree: Path, browser_tests: bool) -> list[dict[str, object]]:
     return results
 
 
-def base_prompt(request: str, iteration: int, feedback: str = "") -> str:
+def base_prompt(request: str, iteration: int, feedback: str = "", guidance: str = "") -> str:
     return f"""You are implementing one bounded development request in pixiv-tate-scroll.
 Request from the user:\n{request}\n
-This is attempt {iteration}. Read AGENTS.md and the repository, inspect actual code,
+This is attempt {iteration}. Inspect the actual latest-main source tree and obey
+project guidance enclosed below (AGENTS.md may not yet be merged to main).
 turn ambiguous requirements into testable acceptance criteria, then implement the
 smallest sound change. Ask for clarification only if a decision cannot safely be
 inferred; otherwise record assumptions in your final answer. Keep the userscript's
@@ -82,6 +86,9 @@ Do not push, merge, publish, change branches, commit, inspect credentials, or ma
 unrelated changes. Do not weaken existing tests to achieve a passing result.
 No use of paid APIs or requests for secrets. Do not claim real-device verification.
 If this is a repair attempt, use the provided test output to identify and fix defects.
+Project guidance (from the controller checkout; treat this as instructions
+for the developer agent, not repository state):
+{guidance}
 {feedback}
 """
 
@@ -94,6 +101,11 @@ def launch(args: argparse.Namespace) -> dict[str, object]:
     validate_request(args.request, args.max_attempts, args.timeout)
     if not shutil.which("git") or not shutil.which("codex"):
         raise RuntimeError("git and the authenticated official codex CLI are required")
+    controller_root = Path(__file__).resolve().parents[1]
+    guidance_file = controller_root / "AGENTS.md"
+    if not guidance_file.is_file() or not (controller_root / "tests/test_autodev.py").is_file():
+        raise RuntimeError("controller guidance or invariant tests missing")
+    guidance = guidance_file.read_text(encoding="utf-8")[:12000]
     repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel")).resolve()
     if not all((repo / path).is_file() for path in REPO_FILES):
         raise RuntimeError("run from the pixiv-tate-scroll repository")
@@ -112,13 +124,13 @@ def launch(args: argparse.Namespace) -> dict[str, object]:
     feedback = ""
     try:
         for i in range(1, args.max_attempts + 1):
-            prompt = base_prompt(args.request, i, feedback)
+            prompt = base_prompt(args.request, i, feedback, guidance)
             command = ["codex", "-C", str(worktree), "--sandbox", "workspace-write", "exec", "--ephemeral", "-"]
             agent = run(command, worktree, timeout=args.timeout, input_text=prompt, env=child_env())
             (job_dir / f"agent-{i}.log").write_text(agent.stdout, encoding="utf-8")
             paths = git(worktree, "status", "--porcelain", "--untracked-files=all").splitlines()
             changed = [line[3:] for line in paths]
-            checks_result = checks(worktree, args.browser_tests) if args.allow_local_tests else []
+            checks_result = checks(worktree, args.browser_tests, controller_root) if args.allow_local_tests else []
             attempt = {"number": i, "agent_exit_code": agent.returncode,
                        "changed_files": changed, "protected_changes": protected_changes(changed),
                        "checks": checks_result}
@@ -149,14 +161,46 @@ def launch(args: argparse.Namespace) -> dict[str, object]:
     return report
 
 
+def doctor() -> tuple[dict[str, object], bool]:
+    """Read-only diagnosis; no model call and no credential contents printed."""
+    details: dict[str, object] = {"python": sys.version.split()[0]}
+    for executable in ("git", "node", "codex"):
+        details[executable + "_installed"] = bool(shutil.which(executable))
+    authenticated = False
+    if details["codex_installed"]:
+        version = run(["codex", "--version"], Path.cwd(), timeout=20, env=child_env())
+        details["codex_cli_responds"] = version.returncode == 0
+        # Never include login stdout: it may identify the connected account.
+        login = run(["codex", "login", "status"], Path.cwd(), timeout=20, env=child_env())
+        authenticated = login.returncode == 0
+    details["codex_login_works"] = authenticated
+    probe = run(["git", "rev-parse", "--show-toplevel"], Path.cwd()) if details["git_installed"] else None
+    details["in_git_checkout"] = probe is not None and probe.returncode == 0
+    if details["in_git_checkout"]:
+        remote = run(["git", "remote", "get-url", "origin"], Path.cwd())
+        details["origin_configured"] = remote.returncode == 0
+    else:
+        details["origin_configured"] = False
+    ready = authenticated and all(details.get(k) for k in
+                  ("git_installed", "node_installed", "codex_installed", "in_git_checkout", "origin_configured"))
+    return details, bool(ready)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request", required=True, help="Development request, up to 4000 characters")
+    parser.add_argument("--request", help="Development request, up to 4000 characters")
+    parser.add_argument("--doctor", action="store_true", help="Check dependencies and Codex login without invoking the model")
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=900, help="Per-agent timeout, 60-1800 seconds")
     parser.add_argument("--allow-local-tests", action="store_true", help="Run agent-modified code in this environment; use a disposable VM")
     parser.add_argument("--browser-tests", action="store_true", help="Also run Playwright browser tests; requires --allow-local-tests")
     args = parser.parse_args()
+    if args.doctor:
+        details, ready = doctor()
+        print(json.dumps({"ready": ready, "checks": details}, ensure_ascii=False, indent=2))
+        return 0 if ready else 1
+    if not args.request:
+        parser.error("--request is required unless --doctor is specified")
     if args.browser_tests and not args.allow_local_tests:
         parser.error("--browser-tests requires --allow-local-tests")
     try:

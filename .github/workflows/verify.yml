@@ -24,7 +24,7 @@ jobs:
         run: |
           node --check pixiv-tate-scroll.user.js
           node --check tests/content-filter.cjs
-          python -m unittest discover -s tests -p 'test_autodev.py' -v
+          python -m unittest discover -s tests -p 'test_autodev*.py' -v
           git diff --check HEAD~1 HEAD
       - name: Install Playwright (CI only)
         run: |

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 SOURCE = Path(__file__).resolve().parents[1] / "tools" / "autodev.py"
 spec = importlib.util.spec_from_file_location("autodev", SOURCE)
@@ -35,6 +36,26 @@ class AutoDevTests(unittest.TestCase):
         self.assertIn("Failed check: node", prompt)
         self.assertIn("Do not push, merge", prompt)
         self.assertIn("Do not weaken existing tests", prompt)
+
+    def test_windows_codex_launcher_prefers_cmd_shim(self):
+        def which(name):
+            return {"codex.cmd": r"C:\\npm\\codex.cmd",
+                    "codex.exe": None, "codex": r"C:\\npm\\codex.cmd"}.get(name)
+        with patch.object(autodev, "os", SimpleNamespace(name="nt")):
+            with patch.object(autodev.shutil, "which", side_effect=which):
+                self.assertEqual(autodev.codex_executable(), r"C:\\npm\\codex.cmd")
+
+    def test_posix_codex_launcher_uses_resolved_path(self):
+        with patch.object(autodev, "os", SimpleNamespace(name="posix")):
+            with patch.object(autodev.shutil, "which", return_value="/usr/bin/codex") as which:
+                self.assertEqual(autodev.codex_executable(), "/usr/bin/codex")
+                which.assert_called_once_with("codex")
+
+    def test_missing_executable_reports_status_instead_of_traceback(self):
+        result = autodev.run(["definitely-not-existing-autodev-executable-12345"],
+                             Path.cwd(), timeout=3)
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("PROCESS START ERROR", result.stdout)
 
     def test_review_flags_for_automation_self_changes(self):
         changes = ["pixiv-tate-scroll.user.js", "tools/autodev.py", ".github/workflows/verify.yml"]

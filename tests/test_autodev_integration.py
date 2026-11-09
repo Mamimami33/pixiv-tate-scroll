@@ -79,7 +79,7 @@ print('fake codex run complete')
             env['FAKE_CODEX_MARKER'] = str(marker)
             run = command(sys.executable, str(RUNNER), '--request',
                           'Find and fix the fixture parsing problem',
-                          '--allow-local-tests', '--max-attempts', '2', cwd=seed, env=env)
+                          '--allow-local-tests', '--confirm-isolated-worker', '--max-attempts', '2', cwd=seed, env=env)
             self.assertEqual(run.returncode, 0, run.stdout + '\n' + run.stderr)
             summary = json.loads(run.stdout)
             report = json.loads((Path(summary['report_dir']) / 'report.json').read_text(encoding='utf-8'))

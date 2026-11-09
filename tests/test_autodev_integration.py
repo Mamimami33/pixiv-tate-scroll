@@ -67,10 +67,10 @@ previous.append({{'args': args, 'has_failed_test_feedback': 'Failed checks:' in 
 marker.write_text(json.dumps(previous))
 worktree = Path(args[args.index('-C') + 1])
 if len(previous) == 1:
-    (worktree / 'pixiv-tate-scroll.user.js').write_text('function broken( {{\n', encoding='utf-8')
+    (worktree / 'pixiv-tate-scroll.user.js').write_text('function broken( {{\u005cn', encoding='utf-8')
 else:
     assert 'Failed checks:' in request
-    (worktree / 'pixiv-tate-scroll.user.js').write_text('function fixed() {{ return true; }}\n', encoding='utf-8')
+    (worktree / 'pixiv-tate-scroll.user.js').write_text('function fixed() {{ return true; }}\u005cn', encoding='utf-8')
 print('fake codex run complete')
 ''', encoding='utf-8')
             fake_executable.chmod(0o755)

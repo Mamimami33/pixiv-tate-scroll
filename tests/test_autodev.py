@@ -64,7 +64,7 @@ class AutoDevTests(unittest.TestCase):
         autodev.require_isolated_worker(True)
 
     def test_git_porcelain_z_preserves_leading_spaces_and_rename_paths(self):
-        output = " M leading space.js\\0?? 新規 file.js\\0R  renamed.js\\0old.js\\0"
+        output = " M leading space.js\0?? 新規 file.js\0R  renamed.js\0old.js\0"
         with patch.object(autodev, "run",
                           return_value=subprocess.CompletedProcess(["git"], 0, output)):
             paths = autodev.changed_paths(Path.cwd())

@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import unittest
+import subprocess
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -56,6 +57,29 @@ class AutoDevTests(unittest.TestCase):
                              Path.cwd(), timeout=3)
         self.assertEqual(result.returncode, 127)
         self.assertIn("PROCESS START ERROR", result.stdout)
+
+    def test_isolated_worker_required_before_model_invocation(self):
+        with self.assertRaisesRegex(RuntimeError, "unconfirmed host"):
+            autodev.require_isolated_worker(False)
+        autodev.require_isolated_worker(True)
+
+    def test_git_porcelain_z_preserves_leading_spaces_and_rename_paths(self):
+        output = " M leading space.js\\0?? 新規 file.js\\0R  renamed.js\\0old.js\\0"
+        with patch.object(autodev, "run",
+                          return_value=subprocess.CompletedProcess(["git"], 0, output)):
+            paths = autodev.changed_paths(Path.cwd())
+        self.assertEqual(paths, ["leading space.js", "新規 file.js", "renamed.js", "old.js"])
+
+    def test_git_porcelain_z_rejects_partial_response(self):
+        with patch.object(autodev, "run",
+                          return_value=subprocess.CompletedProcess(["git"], 0, " M file.js")):
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                autodev.changed_paths(Path.cwd())
+
+    def test_non_allowlisted_paths_require_review(self):
+        paths = ["pixiv-tate-scroll.user.js", "tests/content-filter.cjs",
+                 "index.html", "tools/autodev.py", ".github/workflows/verify.yml"]
+        self.assertEqual(autodev.protected_changes(paths), paths[1:])
 
     def test_review_flags_for_automation_self_changes(self):
         changes = ["pixiv-tate-scroll.user.js", "tools/autodev.py", ".github/workflows/verify.yml"]

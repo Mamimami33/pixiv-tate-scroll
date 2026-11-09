@@ -41,8 +41,28 @@ def run(args: list[str], cwd: Path, timeout: int = 120, input_text: str | None =
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=timeout, check=False, env=env)
     except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(args, 124, (exc.stdout or b"").decode("utf-8", "replace")
-                                 if isinstance(exc.stdout, bytes) else (exc.stdout or "") + "\nTIMEOUT")
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(args, 124, output + "\nTIMEOUT")
+    except OSError as exc:
+        # If an installed launcher cannot start, report a failed check rather
+        # than crashing out of --doctor with a traceback.
+        return subprocess.CompletedProcess(args, 127,
+                                           f"PROCESS START ERROR: {type(exc).__name__}: {exc}")
+
+
+def codex_executable() -> str | None:
+    """Return an executable pathname, never the bare Windows npm command.
+
+    npm installs a codex.cmd shim on Windows. shutil.which("codex") can
+    locate it through PATHEXT, but CreateProcess does not reliably resolve
+    the extension when Python is passed the bare command name.
+    """
+    if os.name == "nt":
+        return (shutil.which("codex.cmd") or shutil.which("codex.exe")
+                or shutil.which("codex"))
+    return shutil.which("codex")
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -99,7 +119,8 @@ def protected_changes(paths: list[str]) -> list[str]:
 
 def launch(args: argparse.Namespace) -> dict[str, object]:
     validate_request(args.request, args.max_attempts, args.timeout)
-    if not shutil.which("git") or not shutil.which("codex"):
+    codex_bin = codex_executable()
+    if not shutil.which("git") or not codex_bin:
         raise RuntimeError("git and the authenticated official codex CLI are required")
     controller_root = Path(__file__).resolve().parents[1]
     guidance_file = controller_root / "AGENTS.md"
@@ -125,7 +146,7 @@ def launch(args: argparse.Namespace) -> dict[str, object]:
     try:
         for i in range(1, args.max_attempts + 1):
             prompt = base_prompt(args.request, i, feedback, guidance)
-            command = ["codex", "-C", str(worktree), "--sandbox", "workspace-write", "exec", "--ephemeral", "-"]
+            command = [codex_bin, "-C", str(worktree), "--sandbox", "workspace-write", "exec", "--ephemeral", "-"]
             agent = run(command, worktree, timeout=args.timeout, input_text=prompt, env=child_env())
             (job_dir / f"agent-{i}.log").write_text(agent.stdout, encoding="utf-8")
             paths = git(worktree, "status", "--porcelain", "--untracked-files=all").splitlines()
@@ -164,14 +185,16 @@ def launch(args: argparse.Namespace) -> dict[str, object]:
 def doctor() -> tuple[dict[str, object], bool]:
     """Read-only diagnosis; no model call and no credential contents printed."""
     details: dict[str, object] = {"python": sys.version.split()[0]}
-    for executable in ("git", "node", "codex"):
+    for executable in ("git", "node"):
         details[executable + "_installed"] = bool(shutil.which(executable))
+    codex_bin = codex_executable()
+    details["codex_installed"] = codex_bin is not None
     authenticated = False
-    if details["codex_installed"]:
-        version = run(["codex", "--version"], Path.cwd(), timeout=20, env=child_env())
+    if codex_bin is not None:
+        version = run([codex_bin, "--version"], Path.cwd(), timeout=20, env=child_env())
         details["codex_cli_responds"] = version.returncode == 0
         # Never include login stdout: it may identify the connected account.
-        login = run(["codex", "login", "status"], Path.cwd(), timeout=20, env=child_env())
+        login = run([codex_bin, "login", "status"], Path.cwd(), timeout=20, env=child_env())
         authenticated = login.returncode == 0
     details["codex_login_works"] = authenticated
     probe = run(["git", "rev-parse", "--show-toplevel"], Path.cwd()) if details["git_installed"] else None

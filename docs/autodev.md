@@ -12,9 +12,9 @@
 - `main`には直接書かない。最新`origin/main`をfetchし、`autodev/<timestamp>`のローカルブランチと別worktreeだけを作る。push/merge/公開は自動化しない。
 - Codexは公式CLIを既存のアカウントで認証して使う。APIキーを要求しない。`--sandbox workspace-write`で実行し、従量課金APIへの自動フォールバックは作らない。**Codexの利用枠・利用可否は契約とCLIの認証状態に依存**する。
 - 子プロセスの環境変数から一般的なAPIキー・トークンを削除するが、これだけでシークレットの隔離は保証できない。CodexのサンドボックスはOSや設定によって制約が異なる。
-- AIが変更したコードをローカルテストで実行することは危険なので、`--allow-local-tests`の明示指定を要求する。**使い捨てVM/コンテナの低権限ユーザーでのみ有効化**する。日常使いのWindowsホストで無防備に実行しない。
+- Codex自身もコマンドを実行できるため、`--allow-local-tests`の有無では安全を制御できない。**使い捨ての低権限VM/コンテナで外部隔離を確認した場合だけ** `--confirm-isolated-worker` を指定してCodexを開始できる。フラグは自己申告であり隔離を構築しない。日常使いのWindowsホストでは絶対に指定しない。`--allow-local-tests`は隔離済み環境内でランナー側の検査を行うかどうかのみを制御する。
 - 操作回数・時間に上限を付ける。失敗したら「成功」にせず結果を残して停止する。テスト合格後でも人間のレビューと実機確認が必要。
-- リポジトリ内のテストそのものを変更する場合、自己検証の改ざんリスクがあるため、レポートに記録して人間が差分を検査する。
+- アプリ本体 `pixiv-tate-scroll.user.js` 以外の変更（テスト・CI・ランナー・HTML・新規ファイルを含む）があれば、検査を実行せず `protected_changes_review_required` で停止する。AIが変更した検査を自動合格の証拠にしない。未知のパスも保護する。
 
 ## 操作
 
@@ -22,10 +22,13 @@
 
 ```sh
 # リポジトリ内から。まずは「コード生成のみ」で安全に動作確認する
-python tools/autodev.py --request "画像読み込みが途中で消える原因を調査して改善する"
+python tools/autodev.py --doctor
+
+# VM/コンテナ内でのみ。日常利用のWindowsホストでは実行しない
+python tools/autodev.py --request "画像読み込みが途中で消える原因を調査して改善する" --confirm-isolated-worker
 
 # 分離された使い捨て環境でのみ、固定テストを実行して再試行まで行う
-python tools/autodev.py --request "画像読み込みが途中で消える原因を調査して改善する" --allow-local-tests --browser-tests --max-attempts 2
+python tools/autodev.py --request "画像読み込みが途中で消える原因を調査して改善する" --confirm-isolated-worker --allow-local-tests --browser-tests --max-attempts 2
 ```
 
 `--allow-local-tests`無しでは自動テストを省略し、最初のAI実行後に未検証状態で停止する。実験時のデフォルトはこれ。出力には`branch`、`base_sha`、`worktree`、`report_dir`、`status`が含まれる。`report_dir/report.json`に検査ごとの終了コードと変更ファイル、`agent-N.log`にAIの実行ログを保存する。ログには機密情報が入る可能性があるので共有・公開前に確認する。
@@ -74,3 +77,12 @@ python tools/autodev.py --doctor
 Codex CLIが未導入なら、公式案内に従い`npm install -g @openai/codex@latest`と`codex login`でChatGPTアカウント認証する。APIキーは使わない。インストール・ログインは所有者の明示操作で行う。認証済みでも追加料金が発生しないという絶対保証ではなく、契約・利用枠・認証方法による。
 
 実際のAI開発試験では、低権限の使い捨てVM内で最初は`--allow-local-tests`なしで動かす。VM隔離の検証前にコード実行テストを有効化しない。診断が`ready:true`でも、完成・実機検証済みとはみなさない。
+
+
+## 第3段階：安全境界と検証の強化（2026-11-10）
+
+- `--confirm-isolated-worker` がない限りAI実行を開始しない。これは確認済みの外部VM/コンテナ隔離の<b>申告</b>でありOSレベルの保護機能そのものではない。ホストからの秘密・ホームディレクトリ・認証情報・SSH・ネットワークへのアクセスを隔離し、ローカルユーザーも低権限にする。
+- Git変更一覧は `git status --porcelain=v1 -z` で読み、ファイル名の空白、日本語、リネームの両パス、未追跡ファイルを扱う。
+- 自動的に認める変更はアプリ本体のJSファイルだけとする。テストやCIなどを含むそれ以外の変更は検査を実行せずレビュー待ちで終了する。
+- ランナー起動の準備確認 `--doctor` はモデルを起動せず従来どおり実行できる。モデル実行と同じ環境に隔離したことを意味しない。
+- CIの模擬テストはCodex本物の挙動、実機Safari、実際の隔離や安全性を証明するものではない。

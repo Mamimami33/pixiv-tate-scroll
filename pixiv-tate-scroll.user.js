@@ -4802,6 +4802,7 @@
   function openSearchGrid(value) {
     const word = String(value || '').trim();
     if (!word || !overlay || !searchGrid.root) return;
+    clearUpscale();
 
     gridReturnState = null;
     closeSearchGrid(false);
@@ -6745,6 +6746,7 @@
   async function refreshCurrentSlide() {
     const s = slides[currentIndex()];
     if (!s || s.refreshBusy) return;
+    clearUpscale();
 
     s.refreshBusy = true;
     const generation = feedGeneration;

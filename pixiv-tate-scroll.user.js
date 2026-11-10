@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.22
+// @version      3.13.23
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -64,6 +64,87 @@
     return u;
   }
 
+  /* ---------- pixiv GET通信の負荷制御 ---------- */
+
+  // サーバー側の閾値は非公開。これは検出回避ではなく、不要な負荷を減らすための暫定設定。
+  const PIXIV_GET_GAP_MS = 1500;
+  const PIXIV_GET_LIMIT_PAUSE_MS = 60 * 60 * 1000;
+  const PIXIV_GET_PAUSE_KEY = 'PTS_PIXIV_GET_PAUSE_UNTIL_V1';
+  let pixivGetTail = Promise.resolve();
+  let pixivGetNextAt = 0;
+  let pixivGetPauseUntil = 0;
+
+  function pixivGetAbortError() {
+    return new DOMException('通信を中止しました', 'AbortError');
+  }
+
+  function readPixivGetPauseUntil() {
+    try {
+      const saved = Number(localStorage.getItem(PIXIV_GET_PAUSE_KEY) || 0);
+      if (Number.isFinite(saved)) {
+        pixivGetPauseUntil = Math.max(pixivGetPauseUntil, saved);
+      }
+    } catch (e) { /* ストレージが使えなくても、メモリ内で制限を維持する。 */ }
+    return pixivGetPauseUntil;
+  }
+
+  function waitForPixivGet(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(pixivGetAbortError()); return; }
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        reject(pixivGetAbortError());
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  // GETを共通キューに通し、前の応答が完了してから次を送る。
+  // 429では自動再試行せず、Retry-Afterと最短1時間の長い方だけ通信を停止する。
+  function pacedPixivGet(url, options = {}) {
+    const task = pixivGetTail.then(async () => {
+      if (options.signal?.aborted) throw pixivGetAbortError();
+      if (readPixivGetPauseUntil() > Date.now()) {
+        throw new Error('pixivからアクセス制限が返されたため、追加のGET通信を一時停止しています');
+      }
+      const remaining = pixivGetNextAt - Date.now();
+      if (remaining > 0) await waitForPixivGet(remaining, options.signal);
+      if (options.signal?.aborted) throw pixivGetAbortError();
+      if (readPixivGetPauseUntil() > Date.now()) {
+        throw new Error('pixivへのGET通信を一時停止しています');
+      }
+      pixivGetNextAt = Date.now() + PIXIV_GET_GAP_MS;
+      const response = await fetch(url, options);
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After')?.trim() || '';
+        let retryAt = 0;
+        if (/^\d+$/.test(retryAfter)) {
+          retryAt = Date.now() + Number(retryAfter) * 1000;
+        } else if (retryAfter) {
+          retryAt = Date.parse(retryAfter) || 0;
+        }
+        pixivGetPauseUntil = Math.max(
+          readPixivGetPauseUntil(),
+          Date.now() + PIXIV_GET_LIMIT_PAUSE_MS,
+          Number.isFinite(retryAt) ? retryAt : 0
+        );
+        try {
+          localStorage.setItem(PIXIV_GET_PAUSE_KEY, String(pixivGetPauseUntil));
+        } catch (e) { /* 保存に失敗しても現在のタブでは停止する。 */ }
+        console.warn('[PTS] pixiv GET requests paused after HTTP 429');
+      }
+      return response;
+    });
+    // 失敗したリクエストが次のリクエストまで連鎖して停止しないようにする。
+    pixivGetTail = task.then(() => {}, () => {});
+    return task;
+  }
+
   async function fetchJson(url, signal, cacheMode) {
     const options = {
       method: 'GET',
@@ -73,7 +154,7 @@
 
     if (cacheMode) options.cache = cacheMode;
 
-    const res = await fetch(url, options);
+    const res = await pacedPixivGet(url, options);
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
@@ -1296,7 +1377,7 @@
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
       try {
-        const response = await fetch('https://www.pixiv.net/', {
+        const response = await pacedPixivGet('https://www.pixiv.net/', {
           credentials: 'include', signal: controller.signal
         });
         if (response.ok) {
@@ -1712,7 +1793,7 @@
   // 通常の履歴取得でもHTTPステータスを確認する。
   // 既存のfetchJson()には変更を加えない。
   async function getBookmarkApiBody(url) {
-    const res = await fetch(url, {
+    const res = await pacedPixivGet(url, {
       method: 'GET',
       credentials: 'same-origin'
     });
@@ -2036,7 +2117,7 @@
   let contentFilterConfirmed = false;
   let contentFilterDialog = null;
   const contentMetadata = new Map();
-  const CONTENT_DETAIL_LIMIT = 24;
+  const CONTENT_DETAIL_LIMIT = 8;
 
   function contentEnum(value) {
     if (typeof value !== 'number' && typeof value !== 'string') return null;
@@ -2076,7 +2157,7 @@
         if (!pending) {
           if (requests++ >= CONTENT_DETAIL_LIMIT) return null;
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 5000);
+          const timeout = setTimeout(() => controller.abort(), 30000);
           pending = fetchJson('/ajax/illust/' + encodeURIComponent(id), controller.signal)
             .then(body => ({illustType: contentEnum(body.illustType),
               xRestrict: contentEnum(body.xRestrict)})).catch(() => null)
@@ -4142,7 +4223,7 @@
   }
 
   async function readFollowStatus(authorId) {
-    const response = await fetch(
+    const response = await pacedPixivGet(
       '/ajax/user/' + encodeURIComponent(authorId) + '?full=1',
       {credentials:'same-origin',cache:'no-store'}
     );
@@ -6003,7 +6084,7 @@
 
       const home = async () => {
         try {
-          const res = await fetch('https://www.pixiv.net/', {
+          const res = await pacedPixivGet('https://www.pixiv.net/', {
             method: 'GET',
             credentials: 'same-origin',
             cache: 'no-store'
@@ -6582,7 +6663,7 @@
         if (!s.resolved) resolveSlide(s);
         else upgradeSlide(s);
       });
-    }, { root: null, rootMargin: '300% 0px 300% 0px', threshold: 0 });
+    }, { root: null, rootMargin: '150% 0px 150% 0px', threshold: 0 });
     // 「表示中」の決定は markCurrentFromScroll（スクロール位置ベース）に一本化した。
     // 以前はIntersectionObserverと二重に書き換えて競合していた（ChatGPTレビュー反映）
   }
@@ -6767,7 +6848,7 @@
     }, 12000);
 
     try {
-      const res = await fetch(url, {
+      const res = await pacedPixivGet(url, {
         method: 'GET',
         credentials: 'same-origin',
         cache: 'no-store',

@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - fix/pixiv-low-load-review-20261111
+      - feat/local-upscale-20261111
   pull_request:
     paths:
       - 'pixiv-tate-scroll.user.js'
       - 'tests/request-pacing.cjs'
+      - 'tests/local-upscale.cjs'
       - '.github/workflows/low-load.yml'
 
 jobs:
@@ -24,3 +26,5 @@ jobs:
         run: node --check pixiv-tate-scroll.user.js
       - name: Traffic regression
         run: node tests/request-pacing.cjs
+      - name: Local upscaling regression
+        run: node tests/local-upscale.cjs

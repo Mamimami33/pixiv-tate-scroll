@@ -1153,6 +1153,9 @@
         if(!m)return false;
         m.imageWidth=a.naturalWidth;m.imageHeight=a.naturalHeight;
       }
+      if(m.skipped?.index===index && m.skipped.a===a && m.skipped.b===b){
+        m.canvas.style.display='none';return false;
+      }
       if(m.pair?.index!==index||m.pair.a!==a||m.pair.b!==b){
         const scale=Math.min(1,MOTION_ANALYSIS_SIZE/a.naturalWidth,
           MOTION_ANALYSIS_SIZE/a.naturalHeight);
@@ -1161,7 +1164,10 @@
         const grayA=motionGrayFromImage(a,w,h);
         const grayB=motionGrayFromImage(b,w,h);
         const field=estimateUgoiraMotion(grayA,grayB,w,h);
-        if(!field){m.canvas.style.display='none';return false;}
+        if(!field){
+          m.skipped={index,a,b};m.canvas.style.display='none';return false;
+        }
+        m.skipped=null;
         const gl=m.gl;
         for(const tex of [m.a,m.b,m.flow])if(tex)gl.deleteTexture(tex);
         m.a=motionTexture(gl,0,a,null);

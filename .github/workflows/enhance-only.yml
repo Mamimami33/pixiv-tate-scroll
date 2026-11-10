@@ -1,0 +1,30 @@
+name: Enhance-only regression
+
+on:
+  push:
+    branches:
+      - feat/pixiv-enhance-only-20261111
+  pull_request:
+    paths:
+      - 'pixiv-tate-scroll.user.js'
+      - 'tests/enhance-only.cjs'
+      - '.github/workflows/enhance-only.yml'
+
+jobs:
+  enhance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: JavaScript syntax
+        run: node --check pixiv-tate-scroll.user.js
+      - name: Install local browser test driver
+        run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.58.2
+      - name: Synthetic enhancement regression
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/enhance-only.cjs

@@ -63,3 +63,14 @@
 
 - Anime4K: https://github.com/bloc97/Anime4K/blob/master/glsl/Upscale/Anime4K_Upscale_CNN_x2_S.glsl
 - CSS/HTML向けCORSの説明: https://developer.mozilla.org/en-US/docs/Web/HTML/How_to/CORS_enabled_image
+
+
+## v4.0.0-alpha.3 — pixivの表示位置へ直接適用（2026-11-11）
+
+- 右下の「画質・コマ補間」を1回押すと、表示中のpixiv静止画を検出し、その表示座標にAnime4K CNN結果を重ねる。既存のpixiv画面は残す。
+- pixiv CDN画像のCORSで直接GPUに取り込めないため、Userscriptsの明示的な `@grant GM.xmlHttpRequest` / content worldを利用。ユーザー操作時に**対象画像のURLだけ1回**追加GETする。画像の比較・スクロールでは再取得しない。GM権限未対応・HTTPエラー時は保存ファイル選択へフォールバック。Safari Userscripts実機での可否は未検証。
+- 元画像が200万画素を超えた場合は余計な再取得や大規模GPU処理をしない。
+- うごイラは作品JSON×1、フレームJSON×1、ZIP×1を明示的に取得。ZIPのCORS制限もUserscripts権限の単一GETで解決を試み、pixivページ上の表示中canvas/video/画像領域へ生成フレームを重ねる。媒体を検出できない場合だけ従来のプレビュー領域を使用。
+- 元のpixiv画像・プレイヤーDOMは変更せず、補間用Canvasは画面移動・終了時に解放。シーク、スクロール、タッチ操作はpixiv側に残るが、元プレイヤーと補間タイミングの同期精度は実機未検証。
+- 新たなSNS機能や検索・推薦・スクロールフィードは復活させていない。
+- Playwright/Chromiumの合成画像テストではAI出力のpixivページ内重ね描き、比較切替、スクロール位置追従、動き補間オーバーレイ、GMネットワークリクエスト数を検査。iPhone Safari実機・本物のpixiv画像では未検証。

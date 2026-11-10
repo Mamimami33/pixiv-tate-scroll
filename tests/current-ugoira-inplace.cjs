@@ -63,6 +63,16 @@ function zipStored(names,files){
       return route.abort();
     });
     await page.goto('https://www.pixiv.net/artworks/123');
+    await page.evaluate(bytes=>{
+      window.__gmZipRequests=0;
+      window.GM={xmlHttpRequest(options){
+        if(!options.url.endsWith('/ugoira/123.zip'))throw new Error('unexpected privileged URL');
+        window.__gmZipRequests++;
+        const result=Promise.resolve({status:200,response:new Uint8Array(bytes).buffer});
+        result.abort=()=>{};
+        return result;
+      }};
+    },[...zip]);
     await page.addScriptTag({content:source});
     assert.equal(requests.filter(x=>x.includes('/ajax/')).length,0,'no unrequested API');
     await page.locator('#pts-only-launch').click();
@@ -75,7 +85,10 @@ function zipStored(names,files){
       'the control panel remains small; no fullscreen replacement viewer');
     assert.equal(requests.filter(x=>x.endsWith('/ajax/illust/123')).length,1);
     assert.equal(requests.filter(x=>x.endsWith('/ajax/illust/123/ugoira_meta')).length,1);
-    assert.equal(requests.filter(x=>x.endsWith('/ugoira/123.zip')).length,1);
+    assert.equal(requests.filter(x=>x.endsWith('/ugoira/123.zip')).length,0,
+      'CORS-blocked ZIP does not use browser fetch');
+    assert.equal(await page.evaluate(()=>window.__gmZipRequests),1,
+      'the chosen ZIP is fetched exactly once via userscript permission');
     await page.locator('#pts-only-current-motion').click();
     assert.equal(await page.locator('#pts-only-current-motion').textContent(),'動き補間: ON');
     await page.waitForFunction(()=>!!document.querySelector('#pts-only-motion-surface .pts-ugoira-motion-canvas'),
@@ -92,6 +105,6 @@ function zipStored(names,files){
     assert.equal(await host.count(),0,'the processed layer is released');
     assert(await page.locator('#pixiv-player').isVisible(),'native player preserved after close');
     assert.deepEqual(errors,[]);
-    console.log('PASS ugoira in-place playback: original player remains, one ZIP, two JSON, working interpolation, scroll tracking, cleanup');
+    console.log('PASS ugoira in-place playback: native player preserved, one privileged ZIP, two JSON, working interpolation, scroll tracking, cleanup');
   }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

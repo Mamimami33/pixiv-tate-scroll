@@ -24,6 +24,8 @@
   let currentRequest = null;
   let operationId = 0;
   let sessionBlocked = false;
+  let lastSiteRequest = 0;
+  let lastUgoiraMeta = null;
   let currentImage = null;
   let currentImageURL = '';
   let enhancedImage = null;
@@ -75,6 +77,7 @@
     }
     s.frameUrls = null;
     state = null;
+    slides=[];
   }
   function resetStage() {
     cancelRequest();
@@ -146,6 +149,10 @@
     resetStage();
     ensureOpen();
     if (!id) throw new Error('pixiv作品ページを開いてください');
+    if(sessionBlocked)throw new Error('アクセス制限後の通信は停止しています');
+    const now=Date.now();
+    if(now-lastSiteRequest<5000)throw new Error('連続アクセスを防ぐため、5秒間隔で操作してください');
+    lastSiteRequest=now;
     const controller = new AbortController();
     currentRequest = controller;
     const idAtStart = ++operationId;
@@ -189,6 +196,7 @@
     if(!Array.isArray(frames) || frames.length<2 || frames.length>120) {
       throw new Error('このうごイラはフレーム数の安全上限（2〜120）外です');
     }
+    lastUgoiraMeta={id,frames:frames.map(item=>({file:String(item.file||''),delay:Number(item.delay)||100}))};
     const zip=meta.originalSrc||meta.src;
     if(!zip)throw new Error('うごイラZIPのURLがありません');
     say('元画質ZIPを1回取得しています…');
@@ -253,8 +261,12 @@
       const names=listZipImageEntries(bytes);
       if(names.length<2||names.length>120)throw new Error('ZIP内画像は2〜120枚にしてください');
       // ZIPにはtimingが含まれない場合がある。後からpixiv APIの遅延を適用しない。
-      const frames=names.map(name=>({file:name,delay:100}));
-      say('ZIPを展開しています（既定100ms/フレーム）…');
+      const timings=new Map((lastUgoiraMeta?.id===currentArtworkId()?lastUgoiraMeta.frames:[])
+        .map(item=>[item.file,item.delay]));
+      const accurate=names.length>0 && names.every(name=>timings.has(name));
+      const frames=names.map(name=>({file:name,delay:accurate?timings.get(name):100}));
+      say(accurate?'pixivの正確なフレーム間隔でZIPを展開しています…':
+        'ZIPを展開しています（時間情報なし：既定100ms/フレーム）…');
       await loadUgoira(url,frames,signal,token);
     } finally {
       URL.revokeObjectURL(url);
@@ -566,8 +578,16 @@
     const LEN_EXT = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
     const DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
     const DIST_EXT = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
-    const out = [];
-    const push = byte => { if (out.length >= maxSize) throw new Error('ZIP展開上限（1フレーム8MB）'); out.push(byte); };
+    let out = new Uint8Array(Math.min(65536,maxSize));
+    let written = 0;
+    const push = byte => {
+      if(written>=maxSize) throw new Error('ZIP展開上限（1フレーム8MB）');
+      if(written>=out.length) {
+        const next=new Uint8Array(Math.min(maxSize,out.length*2));
+        next.set(out);out=next;
+      }
+      out[written++]=byte;
+    };
     let last = 0;
     while (!last) {
       last = bits(1);
@@ -618,14 +638,14 @@
             const dsym = decode(distHuff);
             if (dsym < 0 || dsym >= DIST_BASE.length) throw new Error('deflate: bad distance symbol');
             const dist = DIST_BASE[dsym] + bits(DIST_EXT[dsym]);
-            if (dist < 1 || dist > out.length) throw new Error('deflate: bad back-reference');
-            const start = out.length - dist;
+            if (dist < 1 || dist > written) throw new Error('deflate: bad back-reference');
+            const start = written - dist;
             for (let i = 0; i < len; i++) push(out[start + i]);
           }
         }
       }
     }
-    return new Uint8Array(out);
+    return out.subarray(0,written);
   }
 
   async function unzipFrames(zipUrl, frames, signal) {
@@ -637,6 +657,7 @@
       if (e && e.name === 'AbortError') throw e;
       throw new Error('ZIP取得失敗(通信/CORS): ' + (e && e.message ? e.message : e));
     }
+    if(res.status===429)sessionBlocked=true;
     if (!res.ok) throw new Error('ZIP取得失敗: HTTP ' + res.status);
     const declaredSize = Number(res.headers.get('content-length') || 0);
     if (declaredSize > 64 * 1024 * 1024) throw new Error('ZIPは64MB以下にしてください');

@@ -182,20 +182,8 @@
         await loadArtworkUgoiraMeta(id,controller.signal,idAtStart);
         return;
       }
-      const url = meta.urls?.original || meta.urls?.regular;
-      if (!url) throw new Error('この作品の画像URLが取得できません');
-      say('元画像を取得しています（CORS非対応なら保存画像を選択）…');
-      // Do not bypass browser CORS or route through an external image proxy.
-      const response = await fetch(url,{mode:'cors',credentials:'omit',signal:controller.signal});
-      if(response.status===429)sessionBlocked=true;
-      if(!response.ok)throw new Error('元画像の取得に失敗: HTTP '+response.status);
-      const size=Number(response.headers.get('content-length')||0);
-      if(size>MAX_IMAGE_FILE_BYTES)throw new Error('画像サイズが18MBを超えています');
-      const blob=await response.blob();
-      if(blob.size>MAX_IMAGE_FILE_BYTES)throw new Error('画像サイズが18MBを超えています');
-      if(idAtStart!==operationId)return;
-      const file=new File([blob],id+'.png',{type:blob.type||'image/png'});
-      await loadImageFile(file);
+      say('静止画の場合は「表示中の画像をAI超解像」を使ってください。追加の画像取得はしません');
+      return;
     } catch (error) {
       if(error?.name==='AbortError')return;
       const media=lastUgoiraMeta?.id===id?'うごイラZIPを保存し「うごイラZIPを選ぶ」':
@@ -731,7 +719,7 @@
     }
     overlay.insertBefore(directGroup,stage);
     byId('pts-only-close').onclick=closeUI;
-    byId('pts-only-artwork').textContent='うごイラを処理／作品を読み込む';
+    byId('pts-only-artwork').textContent='うごイラを処理する';
     byId('pts-only-artwork').onclick=()=>{
       const id=currentArtworkId();
       void loadArtworkImage(id);
@@ -1122,20 +1110,72 @@
     return out.subarray(0,written);
   }
 
+
+  async function readZipBytes(zipUrl, signal) {
+    let parsed;
+    try { parsed = new URL(zipUrl,location.href); } catch (_) {}
+    const fromPixiv = parsed?.hostname === 'i.pximg.net' && parsed.protocol === 'https:';
+    // The browser's normal fetch is unable to inspect pixiv CDN ZIPs without CORS.
+    // Userscripts' granted GM API retrieves just the one ZIP explicitly requested.
+    if (fromPixiv && typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function') {
+      if (sessionBlocked) throw new Error('アクセス制限後のZIP取得は停止しています');
+      let request;
+      const abort = () => request?.abort?.();
+      try {
+        request=GM.xmlHttpRequest({
+          method:'GET',url:parsed.href,responseType:'arraybuffer',timeout:60000,
+          headers:{Referer:'https://www.pixiv.net/'},
+          onprogress:progress=>{
+            if(progress.loaded>ZIP_MAX_BYTES)request?.abort?.();
+          }
+        });
+        signal?.addEventListener('abort',abort,{once:true});
+        if (signal?.aborted) {
+          abort();
+          throw new DOMException('中止','AbortError');
+        }
+        const response=await request;
+        if (signal?.aborted) throw new DOMException('中止','AbortError');
+        if(response.status===429)sessionBlocked=true;
+        if(response.status!==200)throw new Error('ZIP取得 HTTP '+response.status);
+        const payload=response.response;
+        const buf=payload instanceof ArrayBuffer ? payload :
+          ArrayBuffer.isView(payload) ?
+            payload.buffer.slice(payload.byteOffset,payload.byteOffset+payload.byteLength) :
+          payload instanceof Blob ? await payload.arrayBuffer() : null;
+        if(!buf||buf.byteLength<22||buf.byteLength>ZIP_MAX_BYTES)
+          throw new Error('ZIPが不正か64MBを超えています');
+        return buf;
+      }finally{
+        signal?.removeEventListener('abort',abort);
+      }
+    }
+    // Local blob: URLs are already stored on the device. Fetching the
+    // same blob does not contact pixiv or any external network.
+    if(parsed?.protocol==='blob:'){
+      const response=await fetch(parsed.href,{signal});
+      if(!response.ok)throw new Error('ZIPファイルの読み込みに失敗しました');
+      const blob=await response.blob();
+      if(blob.size>ZIP_MAX_BYTES)throw new Error('ZIPが64MBを超えています');
+      return blob.arrayBuffer();
+    }
+    // Browser fallback for unsupported userscript managers.
+    if(fromPixiv){
+      const res=await fetch(parsed.href,{signal});
+      if(res.status===429)sessionBlocked=true;
+      if(!res.ok)throw new Error('ZIP取得 HTTP '+res.status);
+      const size=Number(res.headers.get('content-length')||0);
+      if(size>ZIP_MAX_BYTES)throw new Error('ZIPが64MBを超えています');
+      const blob=await res.blob();
+      if(blob.size>ZIP_MAX_BYTES)throw new Error('ZIPが64MBを超えています');
+      return blob.arrayBuffer();
+    }
+    throw new Error('許可されていないZIP URLです');
+  }
+
   async function unzipFrames(zipUrl, frames, signal) {
     if (!Array.isArray(frames) || frames.length < 2 || frames.length > 120) throw new Error('フレーム数は2〜120に制限しています');
-    let res;
-    try {
-      res = await fetch(zipUrl, { signal });
-    } catch (e) {
-      if (e && e.name === 'AbortError') throw e;
-      throw new Error('ZIP取得失敗(通信/CORS): ' + (e && e.message ? e.message : e));
-    }
-    if(res.status===429)sessionBlocked=true;
-    if (!res.ok) throw new Error('ZIP取得失敗: HTTP ' + res.status);
-    const declaredSize = Number(res.headers.get('content-length') || 0);
-    if (declaredSize > 64 * 1024 * 1024) throw new Error('ZIPは64MB以下にしてください');
-    const buf = await res.arrayBuffer();
+    const buf = await readZipBytes(zipUrl,signal);
     if (buf.byteLength > 64 * 1024 * 1024 || buf.byteLength < 22) throw new Error('ZIPの容量が不正です');
     const view = new DataView(buf);
     // End of Central Directory を後ろから探す

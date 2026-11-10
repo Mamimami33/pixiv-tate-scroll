@@ -31,6 +31,8 @@
   document.head.appendChild(pc);
 
 
+  let preferOriginalUgoira = false; // 高画質優先は次に解決する作品から反映
+
   function pickPair(urls) {
     if (!urls) return { r: '', o: '' };
     return { r: urls.regular || urls.original || '', o: urls.original || urls.regular || '' };
@@ -356,7 +358,8 @@
 
           s.zipSmall = meta.src || null;
           s.zipFull = meta.originalSrc || null;
-          s.zipUrl = s.zipSmall || s.zipFull;
+          s.zipUrl = preferOriginalUgoira
+            ? (s.zipFull || s.zipSmall) : (s.zipSmall || s.zipFull);
           s.frames = Array.isArray(meta.frames)
             ? meta.frames : null;
 
@@ -1182,6 +1185,20 @@
       motionInterpolationAvailable=false;
       return false;
     }
+  }
+
+
+  function syncUgoiraQualityButton() {
+    const button=overlay?.querySelector('.pts-ugoira-quality');
+    if(!button)return;
+    button.textContent=preferOriginalUgoira?'うご原寸優先: ON':'うご原寸優先: OFF';
+    button.title='次に読み込むうごイラから元サイズZIPを直接取得。小さいZIPと両方取得するのを避けます。';
+    button.setAttribute('aria-pressed',preferOriginalUgoira?'true':'false');
+  }
+
+  function toggleUgoiraQuality() {
+    preferOriginalUgoira=!preferOriginalUgoira;
+    syncUgoiraQualityButton();
   }
 
   function syncMotionButton(){
@@ -4855,6 +4872,8 @@
     syncUpscaleButton();
     addButton('pts-motion', '動き補間: OFF', toggleMotionInterpolation);
     syncMotionButton();
+    addButton('pts-ugoira-quality', 'うご原寸優先: OFF', toggleUgoiraQuality);
+    syncUgoiraQualityButton();
 
     // 診断・更新の既存イベントを保持してDOM移動。
     for (const selector of [

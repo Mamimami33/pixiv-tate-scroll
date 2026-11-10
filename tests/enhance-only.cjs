@@ -4,7 +4,7 @@
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),zlib=require('node:zlib');
 const {chromium}=require('playwright');
 const source=fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js'),'utf8');
-assert.match(source, /@version\s+4\.0\.0-alpha\.1/);
+assert.match(source, /@version\s+4\.0\.0-alpha\.2/);
 assert.match(source, /const AI_CNN_MODEL_PASSES/);
 assert.match(source, /function estimateUgoiraMotion/);
 assert(!/function (?:startCustomFeed|startSearchFeed|fetchBookmarkRelatedCandidates|tasteScore)\s*\(/.test(source),

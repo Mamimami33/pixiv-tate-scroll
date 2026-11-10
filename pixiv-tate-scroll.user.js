@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.1
+// @version      4.0.0-alpha.3
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
-// @grant        none
+// @grant        GM.xmlHttpRequest
+// @inject-into  content
+// @connect      i.pximg.net
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -24,6 +26,13 @@
   let currentRequest = null;
   let operationId = 0;
   let sessionBlocked = false;
+  let inPlaceResult = null;
+  let inPlaceTarget = null;
+  let inPlaceOriginalURL = '';
+  let inPlaceXHR = null;
+  let inPlaceToken = 0;
+  let inPlaceBusy = false;
+  let inPlaceVisible = true;
   let lastSiteRequest = 0;
   let lastUgoiraMeta = null;
   let currentImage = null;
@@ -78,10 +87,12 @@
       if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
     }
     s.frameUrls = null;
+    if (s.motionAnchored) s.sectionEl?.remove();
     state = null;
     slides=[];
   }
   function resetStage() {
+    discardInPlace();
     cancelRequest();
     stopPlayback();
     releaseImage();
@@ -99,6 +110,7 @@
   function ensureOpen() {
     createUI();
     overlay.hidden = false;
+    overlay.classList.add('pts-only-compact');
   }
   function finishError(error) {
     say(error?.message || String(error), 'error');
@@ -122,6 +134,7 @@
   async function showStaticImage(img, sourceUrl, title) {
     resetStage();
     ensureOpen();
+    overlay.classList.remove('pts-only-compact');
     const {holder} = createHolder();
     const image = img;
     image.className = 'pts-only-image';
@@ -169,20 +182,8 @@
         await loadArtworkUgoiraMeta(id,controller.signal,idAtStart);
         return;
       }
-      const url = meta.urls?.original || meta.urls?.regular;
-      if (!url) throw new Error('この作品の画像URLが取得できません');
-      say('元画像を取得しています（CORS非対応なら保存画像を選択）…');
-      // Do not bypass browser CORS or route through an external image proxy.
-      const response = await fetch(url,{mode:'cors',credentials:'omit',signal:controller.signal});
-      if(response.status===429)sessionBlocked=true;
-      if(!response.ok)throw new Error('元画像の取得に失敗: HTTP '+response.status);
-      const size=Number(response.headers.get('content-length')||0);
-      if(size>MAX_IMAGE_FILE_BYTES)throw new Error('画像サイズが18MBを超えています');
-      const blob=await response.blob();
-      if(blob.size>MAX_IMAGE_FILE_BYTES)throw new Error('画像サイズが18MBを超えています');
-      if(idAtStart!==operationId)return;
-      const file=new File([blob],id+'.png',{type:blob.type||'image/png'});
-      await loadImageFile(file);
+      say('静止画の場合は「表示中の画像をAI超解像」を使ってください。追加の画像取得はしません');
+      return;
     } catch (error) {
       if(error?.name==='AbortError')return;
       const media=lastUgoiraMeta?.id===id?'うごイラZIPを保存し「うごイラZIPを選ぶ」':
@@ -208,6 +209,78 @@
     say('元画質ZIPを1回取得しています…');
     await loadUgoira(zip,frames,signal,token);
   }
+
+  /* ---------- うごイラを現在のpixivメディアの位置へ重ねて再生 ---------- */
+  function pickVisibleArtworkMedia() {
+    let best=null, bestScore=0;
+    const id=currentArtworkId();
+    for(const media of document.querySelectorAll('canvas,video,img')){
+      if(media.closest('#pts-only-overlay') ||
+         media.closest('#pts-only-motion-surface') ||
+         media.closest('#pts-only-launch'))continue;
+      const r=media.getBoundingClientRect();
+      const vw=Math.max(0,Math.min(innerWidth,r.right)-Math.max(0,r.left));
+      const vh=Math.max(0,Math.min(innerHeight,r.bottom)-Math.max(0,r.top));
+      if(vw<160||vh<150)continue;
+      if(media.tagName==='IMG'){
+        let src;
+        try{src=new URL(media.currentSrc||media.src||'',location.href);}catch(_){continue;}
+        if(src.hostname!=='i.pximg.net' ||
+          !src.pathname.includes(id))continue;
+      }
+      const d=Math.hypot((r.left+r.right)/2-innerWidth/2,
+        (r.top+r.bottom)/2-innerHeight/2);
+      const score=vw*vh/(1+d/1400)*
+        ((media.tagName==='CANVAS'||media.tagName==='VIDEO')?1.6:1);
+      if(score>bestScore){best=media;bestScore=score;}
+    }
+    return best;
+  }
+
+  function mountUgoiraOnArtwork(s) {
+    const media=pickVisibleArtworkMedia();
+    if(!media)return false;
+    const section=s.sectionEl;
+    if(!section)return false;
+    section.id='pts-only-motion-surface';
+    s.motionAnchored=true;
+    s.followTarget=media;
+    document.body.appendChild(section);
+    overlay.classList.add('pts-only-compact');
+    positionUgoiraOnArtwork();
+    return true;
+  }
+
+  function positionUgoiraOnArtwork() {
+    const s=state;
+    if(!s?.motionAnchored)return;
+    if(!s.followTarget?.isConnected){
+      stopPlayback();
+      say('元の作品の表示が変わったので動き補間を停止しました');
+      updateButtons();
+      return;
+    }
+    const media=s.followTarget,rect=media.getBoundingClientRect();
+    const visible=rect.bottom>0&&rect.top<innerHeight&&rect.right>0&&rect.left<innerWidth;
+    const host=s.sectionEl;
+    if(!visible){
+      host.style.display='none';
+      if(s.animTimer!=null){
+        stopUgoira(s);
+        s.pausedByScroll=true;
+      }
+      return;
+    }
+    Object.assign(host.style,{
+      display:'block',left:rect.left+'px',top:rect.top+'px',
+      width:rect.width+'px',height:rect.height+'px'
+    });
+    if(s.pausedByScroll&&!document.hidden){
+      s.pausedByScroll=false;
+      s.isCurrent=true;
+      startUgoira(s);
+    }
+  }
   async function loadUgoira(zipUrl,frames,signal,token) {
     let urls;
     try {
@@ -218,6 +291,7 @@
       }
       if(urls.filter(Boolean).length<2)throw new Error('有効なフレームが不足しています');
       stopPlayback();releaseImage();
+      overlay.classList.remove('pts-only-compact');
       const {section}=createHolder();
       const s={
         id:currentArtworkId(),kind:'ugoira',sectionEl:section,frameUrls:urls,frames,
@@ -226,6 +300,10 @@
         pageChip:null,motionRenderer:null,motionPair:null
       };
       state=s;slides=[s];
+      if(!mountUgoiraOnArtwork(s)) {
+        overlay.classList.remove('pts-only-compact');
+        say('このページで表示中の再生領域が見つからず、プレビューで再生します');
+      }
       startUgoira(s);
       say('うごイラを再生中：動き補間はON/OFF可能。中間フレームは端末内で生成します');
       updateButtons();
@@ -339,6 +417,224 @@
     if(!motionInterpolationEnabled && state)releaseUgoiraMotion(state);
     syncMotionButton();updateButtons();
   }
+
+  /* ---------- 現在pixivで表示している画像を直接高画質化 ---------- */
+  // This operation performs at most ONE explicit, privileged image GET when
+  // the existing page <img> cannot be read by WebGL due to CDN CORS.
+  // No searches, image crawling, retries or background downloads.
+  function visiblePixivArtworkImage() {
+    const id = currentArtworkId();
+    if (!id) return null;
+    let selected = null, best = 0;
+    for (const img of document.querySelectorAll('img')) {
+      if (img.closest('#pts-only-overlay') || !img.complete || !img.naturalWidth ||
+          !img.naturalHeight) continue;
+      const raw = img.currentSrc || img.src || '';
+      let parsed;
+      try { parsed = new URL(raw, location.href); } catch (_) { continue; }
+      if (parsed.protocol !== 'https:' || parsed.hostname !== 'i.pximg.net') continue;
+      if (!new RegExp('(?:^|[/_])' + id + '_p\\d+(?:[_./]|$)').test(parsed.pathname)) continue;
+      const rect = img.getBoundingClientRect();
+      if (rect.width < 120 || rect.height < 120) continue;
+      const visibleWidth = Math.max(0, Math.min(window.innerWidth, rect.right) -
+        Math.max(0, rect.left));
+      const visibleHeight = Math.max(0, Math.min(window.innerHeight, rect.bottom) -
+        Math.max(0, rect.top));
+      if (visibleWidth < 100 || visibleHeight < 100) continue;
+      const area = visibleWidth * visibleHeight;
+      const distance = Math.hypot(
+        (rect.left + rect.right) / 2 - window.innerWidth / 2,
+        (rect.top + rect.bottom) / 2 - window.innerHeight / 2
+      );
+      const score = area / (1 + distance / 1200) *
+        (img.closest('[role="dialog"]') ? 1.35 : 1);
+      if (score > best) { best = score; selected = img; }
+    }
+    return selected;
+  }
+
+  function discardInPlace() {
+    inPlaceToken++;
+    try { inPlaceXHR?.abort?.(); } catch (_) {}
+    inPlaceXHR = null;
+    if (inPlaceResult) {
+      inPlaceResult.remove();
+      inPlaceResult.width = 0;
+      inPlaceResult.height = 0;
+    }
+    inPlaceResult = null;
+    inPlaceTarget = null;
+    inPlaceOriginalURL = '';
+    inPlaceBusy = false;
+    inPlaceVisible = true;
+    updateInPlaceButtons();
+  }
+
+  function positionInPlace() {
+    if (!inPlaceResult || !inPlaceTarget) return;
+    if (!inPlaceTarget.isConnected || document.hidden ||
+        inPlaceOriginalURL !== (inPlaceTarget.currentSrc || inPlaceTarget.src)) {
+      discardInPlace();
+      return;
+    }
+    const rect = inPlaceTarget.getBoundingClientRect();
+    if (rect.bottom <= 0 || rect.top >= innerHeight ||
+        rect.right <= 0 || rect.left >= innerWidth) {
+      inPlaceResult.style.display = 'none';
+      return;
+    }
+    inPlaceResult.style.display = inPlaceVisible ? 'block' : 'none';
+    Object.assign(inPlaceResult.style, {
+      left: rect.left + 'px', top: rect.top + 'px',
+      width: rect.width + 'px', height: rect.height + 'px'
+    });
+    const style = getComputedStyle(inPlaceTarget);
+    inPlaceResult.style.objectFit = style.objectFit || 'contain';
+    inPlaceResult.style.objectPosition = style.objectPosition || 'center';
+  }
+
+  function updateInPlaceButtons() {
+    const button = byId('pts-only-current');
+    const compare = byId('pts-only-current-compare');
+    if (button) {
+      button.disabled = inPlaceBusy;
+      button.textContent = inPlaceBusy ? '画像をGPU処理中…' :
+        inPlaceResult ? '別の表示画像を処理' : '表示中の画像をAI超解像';
+    }
+    if (compare) {
+      compare.disabled = !inPlaceResult;
+      compare.textContent = inPlaceVisible ? '元画像に戻す' : 'AI画像に戻す';
+    }
+  }
+
+  function compareInPlace() {
+    if (!inPlaceResult) return;
+    inPlaceVisible = !inPlaceVisible;
+    positionInPlace();
+    updateInPlaceButtons();
+    say(inPlaceVisible ? '現在の画像にAI超解像を適用中' : 'pixivの元画像を表示中');
+  }
+
+  function currentImageCanBeProcessed(image) {
+    return image.naturalWidth > 0 && image.naturalHeight > 0 &&
+      image.naturalWidth * image.naturalHeight <= AI_CNN_LARGE_MAX_PIXELS;
+  }
+
+  async function gmReadVisibleImage(url, token) {
+    if (sessionBlocked) throw new Error('HTTP 429発生後のため通信を停止しています');
+    if (typeof GM === 'undefined' || typeof GM.xmlHttpRequest !== 'function')
+      throw new Error('Userscriptsの画像アクセス権限がありません。保存画像を選択してください');
+    const now = Date.now();
+    if (now - lastSiteRequest < 5000)
+      throw new Error('pixivへの連続アクセスを防ぐため5秒空けてください');
+    lastSiteRequest = now;
+    let parsed;
+    try { parsed = new URL(url, location.href); } catch (_) {}
+    if (parsed?.protocol !== 'https:' || parsed.hostname !== 'i.pximg.net')
+      throw new Error('pixivの公式画像CDN以外からは取得しません');
+    let request;
+    try {
+      request = GM.xmlHttpRequest({
+        method: 'GET',
+        url: parsed.href,
+        responseType: 'arraybuffer',
+        timeout: 25000,
+        // Pixiv CDN commonly requires the pixiv Referer to serve the image.
+        headers: { Referer: 'https://www.pixiv.net/' },
+        onprogress: progress => {
+          if (progress.loaded > MAX_IMAGE_FILE_BYTES) request?.abort?.();
+        }
+      });
+      inPlaceXHR = request;
+      const response = await request;
+      if (token !== inPlaceToken) throw new DOMException('中止','AbortError');
+      if (response.status === 429) sessionBlocked = true;
+      if (response.status !== 200) throw new Error('画像取得 HTTP ' + response.status);
+      const payload = response.response;
+      const blob = payload instanceof Blob ? payload :
+        payload instanceof ArrayBuffer ? new Blob([payload]) :
+        ArrayBuffer.isView(payload) ? new Blob([payload]) : null;
+      if (!blob || blob.size < 1 || blob.size > MAX_IMAGE_FILE_BYTES)
+        throw new Error('画像の取得形式または18MB上限に対応していません');
+      return blob;
+    } finally {
+      if (inPlaceXHR === request) inPlaceXHR = null;
+    }
+  }
+
+  async function enhanceVisiblePixivImage() {
+    ensureOpen();
+    // Do not redownload merely to toggle a result already created.
+    const target = visiblePixivArtworkImage();
+    if (!target) {
+      say('表示中の作品画像が見つかりません。画像を開くか、保存画像を選んでください','error');
+      return;
+    }
+    const url = target.currentSrc || target.src;
+    if (inPlaceResult && inPlaceTarget === target && inPlaceOriginalURL === url) {
+      compareInPlace(); return;
+    }
+    if (!currentImageCanBeProcessed(target)) {
+      say('この元画像は200万画素以上です。iPhoneの安全上限のため追加取得・AI処理をしません','error');
+      return;
+    }
+    discardInPlace();
+    const ticket = inPlaceToken;
+    inPlaceBusy = true;
+    updateInPlaceButtons();
+    say('表示中の画像をその場でAI超解像します。初回は画像CDNへ1回の取得があります');
+    let localUrl = '';
+    let workingImage = target;
+    let output = null;
+    try {
+      if (!aiCnnCanUseSource(target)) {
+        const blob = await gmReadVisibleImage(url, ticket);
+        if (ticket !== inPlaceToken) return;
+        localUrl = URL.createObjectURL(blob);
+        workingImage = new Image();
+        workingImage.src = localUrl;
+        await workingImage.decode();
+        if (workingImage.naturalWidth * workingImage.naturalHeight >
+            AI_CNN_LARGE_MAX_PIXELS)
+          throw new Error('元画像が安全上限200万画素を超えました。元画像のまま表示します');
+      }
+      const isCurrent = () => ticket === inPlaceToken && !overlay?.hidden &&
+        target.isConnected && url === (target.currentSrc || target.src) && !document.hidden;
+      output = await anime4kCnnProcessLarge(workingImage, isCurrent,
+        (done, total) => say('CNN超解像：' + done + ' / ' + total));
+      if (!isCurrent()) {
+        output.width = 0; output.height = 0;
+        output = null; return;
+      }
+      output.id = 'pts-only-inplace-canvas';
+      output.style.cssText = [
+        'position:fixed', 'z-index:2147480999', 'pointer-events:none',
+        'display:block', 'margin:0', 'padding:0', 'border:0'
+      ].join(';');
+      document.body.appendChild(output);
+      inPlaceResult = output;
+      inPlaceTarget = target;
+      inPlaceOriginalURL = url;
+      inPlaceVisible = true;
+      positionInPlace();
+      say('表示中の画像にAI超解像を適用しました。元画像との切替は通信なし');
+    } catch (error) {
+      if (ticket === inPlaceToken && error?.name !== 'AbortError') {
+        say('高画質化できませんでした。画像を保存して「画像を選ぶ」でも処理できます。' +
+          String(error?.message || error), 'error');
+      }
+      if (output && output !== inPlaceResult) {
+        output.width = 0; output.height = 0;
+      }
+    } finally {
+      if (localUrl) URL.revokeObjectURL(localUrl);
+      if (ticket === inPlaceToken) {
+        inPlaceBusy = false;
+        updateInPlaceButtons();
+      }
+    }
+  }
+
   function updateButtons() {
     const still=!!currentImage,animated=!!state;
     byId('pts-only-upscale').disabled=!still;
@@ -348,6 +644,17 @@
     byId('pts-only-motion').textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
     byId('pts-only-play').disabled=!animated;
     byId('pts-only-play').textContent=state?.animTimer!=null?'一時停止':'再生';
+    const compactMotion=byId('pts-only-current-motion');
+    if(compactMotion){
+      compactMotion.disabled=!animated||!motionInterpolationAvailable;
+      compactMotion.textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
+    }
+    const compactPlay=byId('pts-only-current-play');
+    if(compactPlay){
+      compactPlay.disabled=!animated;
+      compactPlay.textContent=state?.animTimer!=null?'一時停止':'再生';
+    }
+    updateInPlaceButtons();
   }
   function togglePlayback() {
     if(!state)return;
@@ -368,13 +675,51 @@
     if(overlay)return;
     const css=document.createElement('style');css.id='pts-only-style';
     css.textContent="\n#pts-only-overlay{position:fixed;inset:0;z-index:2147481000;background:#08090c;color:#fff;display:flex;flex-direction:column;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif}\n#pts-only-overlay[hidden]{display:none!important}\n#pts-only-overlay button{cursor:pointer;min-height:44px;border-radius:10px;border:1px solid #667;background:#252b3c;color:#fff;padding:8px 12px;touch-action:manipulation}\n#pts-only-overlay button:disabled{opacity:.42;cursor:default}\n#pts-only-overlay header{display:flex;justify-content:space-between;align-items:center;padding:calc(8px + env(safe-area-inset-top)) 12px 8px;gap:12px}\n#pts-only-overlay strong{font-size:15px}\n#pts-only-controls{display:flex;gap:6px;flex-wrap:wrap;padding:7px 12px;justify-content:center}\n#pts-only-stage{min-height:0;flex:1;position:relative;overflow:hidden;background:#000}\n#pts-only-stage .pts-only-section{position:absolute;inset:0}\n#pts-only-stage .pts-holder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}\n#pts-only-stage img.pts-only-image{width:100%;height:100%;object-fit:contain}\n#pts-only-stage canvas.pts-ugoira-canvas,#pts-only-stage canvas.pts-ugoira-motion-canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none}\n#pts-only-stage canvas.pts-ugoira-motion-canvas{z-index:2}\n#pts-only-stage canvas.pts-only-enhanced{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:2}\n#pts-only-stage canvas.pts-only-enhanced[hidden]{display:none!important}\n#pts-only-status{padding:9px 12px calc(11px + env(safe-area-inset-bottom));min-height:38px;color:#c7cedb;font-size:12px}\n#pts-only-status[data-kind=\"error\"]{color:#ffd6d6}\n#pts-only-overlay.pts-only-busy #pts-only-status{color:#fff8b0}\n";
+    css.textContent += `
+#pts-only-motion-surface{
+  position:fixed;z-index:2147480998;pointer-events:none;
+  background:#000;overflow:hidden;
+}
+#pts-only-motion-surface .pts-holder{position:absolute;inset:0}
+#pts-only-motion-surface .pts-ugoira-canvas,
+#pts-only-motion-surface .pts-ugoira-motion-canvas{
+  position:absolute;inset:0;width:100%;height:100%;
+  object-fit:contain;pointer-events:none
+}
+#pts-only-motion-surface .pts-ugoira-motion-canvas{z-index:2}
+#pts-only-overlay.pts-only-compact {
+  inset:auto 10px calc(18px + env(safe-area-inset-bottom)) auto;
+  width:min(350px,calc(100vw - 20px));height:auto;max-height:75vh;
+  border:1px solid #586277;border-radius:14px;overflow:auto;
+  box-shadow:0 4px 28px #000a;
+}
+#pts-only-overlay.pts-only-compact header {padding:8px 10px}
+#pts-only-overlay.pts-only-compact #pts-only-stage {display:none}
+#pts-only-overlay.pts-only-compact #pts-only-stage + #pts-only-controls {display:none}
+#pts-only-overlay.pts-only-compact #pts-only-status{max-height:90px;overflow:auto;padding:8px 10px}
+`;
     document.head.appendChild(css);
     overlay=document.createElement('div');
     overlay.id='pts-only-overlay';overlay.hidden=true;
     overlay.innerHTML="\n<header><strong>画質向上・フレーム補間</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
     document.body.appendChild(overlay);
     stage=byId('pts-only-stage');
+    const directGroup = document.createElement('div');
+    directGroup.id = 'pts-only-controls';
+    for (const [id, label, action] of [
+      ['pts-only-current','表示中の画像をAI超解像',()=>void enhanceVisiblePixivImage()],
+      ['pts-only-current-compare','元画像に戻す',compareInPlace],
+      ['pts-only-current-motion','動き補間: OFF',toggleMotion],
+      ['pts-only-current-play','一時停止',togglePlayback]
+    ]) {
+      const button=document.createElement('button');
+      button.type='button';button.id=id;button.textContent=label;
+      button.addEventListener('click',action);
+      directGroup.appendChild(button);
+    }
+    overlay.insertBefore(directGroup,stage);
     byId('pts-only-close').onclick=closeUI;
+    byId('pts-only-artwork').textContent='うごイラを処理する';
     byId('pts-only-artwork').onclick=()=>{
       const id=currentArtworkId();
       void loadArtworkImage(id);
@@ -386,11 +731,17 @@
     byId('pts-only-motion').onclick=toggleMotion;
     byId('pts-only-play').onclick=togglePlayback;
     document.addEventListener('visibilitychange',()=>{
+      if (document.hidden && inPlaceResult) discardInPlace();
       if(document.hidden&&state&&state.animTimer!=null) {
         stopUgoira(state);
         updateButtons();say('非表示中は停止しました');
       }
     });
+    window.addEventListener('resize',positionInPlace,{passive:true});
+    window.addEventListener('resize',positionUgoiraOnArtwork,{passive:true});
+    document.addEventListener('scroll',positionInPlace,true);
+    document.addEventListener('scroll',positionUgoiraOnArtwork,true);
+    window.addEventListener('popstate',discardInPlace);
     updateButtons();
   }
   function startButton() {
@@ -399,7 +750,11 @@
     button.id='pts-only-launch';button.type='button';
     button.textContent='画質・コマ補間';
     button.title='作品の超解像と、うごイラの動き補間のみ';
-    button.addEventListener('click',ensureOpen);
+    button.addEventListener('click',()=>{
+      ensureOpen();
+      if (visiblePixivArtworkImage()) void enhanceVisiblePixivImage();
+      else say('このページの画像がまだ見つかりません。画像を表示してから操作してください');
+    });
     const style=document.createElement('style');
     style.textContent='#pts-only-launch{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:2147480000;background:#252534;color:#fff;padding:12px 14px;border:1px solid #777;border-radius:12px;font:600 13px system-ui;box-shadow:0 5px 22px #0008;touch-action:manipulation}';
     document.head.appendChild(style);
@@ -755,20 +1110,72 @@
     return out.subarray(0,written);
   }
 
+
+  async function readZipBytes(zipUrl, signal) {
+    let parsed;
+    try { parsed = new URL(zipUrl,location.href); } catch (_) {}
+    const fromPixiv = parsed?.hostname === 'i.pximg.net' && parsed.protocol === 'https:';
+    // The browser's normal fetch is unable to inspect pixiv CDN ZIPs without CORS.
+    // Userscripts' granted GM API retrieves just the one ZIP explicitly requested.
+    if (fromPixiv && typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function') {
+      if (sessionBlocked) throw new Error('アクセス制限後のZIP取得は停止しています');
+      let request;
+      const abort = () => request?.abort?.();
+      try {
+        request=GM.xmlHttpRequest({
+          method:'GET',url:parsed.href,responseType:'arraybuffer',timeout:60000,
+          headers:{Referer:'https://www.pixiv.net/'},
+          onprogress:progress=>{
+            if(progress.loaded>ZIP_MAX_BYTES)request?.abort?.();
+          }
+        });
+        signal?.addEventListener('abort',abort,{once:true});
+        if (signal?.aborted) {
+          abort();
+          throw new DOMException('中止','AbortError');
+        }
+        const response=await request;
+        if (signal?.aborted) throw new DOMException('中止','AbortError');
+        if(response.status===429)sessionBlocked=true;
+        if(response.status!==200)throw new Error('ZIP取得 HTTP '+response.status);
+        const payload=response.response;
+        const buf=payload instanceof ArrayBuffer ? payload :
+          ArrayBuffer.isView(payload) ?
+            payload.buffer.slice(payload.byteOffset,payload.byteOffset+payload.byteLength) :
+          payload instanceof Blob ? await payload.arrayBuffer() : null;
+        if(!buf||buf.byteLength<22||buf.byteLength>ZIP_MAX_BYTES)
+          throw new Error('ZIPが不正か64MBを超えています');
+        return buf;
+      }finally{
+        signal?.removeEventListener('abort',abort);
+      }
+    }
+    // Local blob: URLs are already stored on the device. Fetching the
+    // same blob does not contact pixiv or any external network.
+    if(parsed?.protocol==='blob:'){
+      const response=await fetch(parsed.href,{signal});
+      if(!response.ok)throw new Error('ZIPファイルの読み込みに失敗しました');
+      const blob=await response.blob();
+      if(blob.size>ZIP_MAX_BYTES)throw new Error('ZIPが64MBを超えています');
+      return blob.arrayBuffer();
+    }
+    // Browser fallback for unsupported userscript managers.
+    if(fromPixiv){
+      const res=await fetch(parsed.href,{signal});
+      if(res.status===429)sessionBlocked=true;
+      if(!res.ok)throw new Error('ZIP取得 HTTP '+res.status);
+      const size=Number(res.headers.get('content-length')||0);
+      if(size>ZIP_MAX_BYTES)throw new Error('ZIPが64MBを超えています');
+      const blob=await res.blob();
+      if(blob.size>ZIP_MAX_BYTES)throw new Error('ZIPが64MBを超えています');
+      return blob.arrayBuffer();
+    }
+    throw new Error('許可されていないZIP URLです');
+  }
+
   async function unzipFrames(zipUrl, frames, signal) {
     if (!Array.isArray(frames) || frames.length < 2 || frames.length > 120) throw new Error('フレーム数は2〜120に制限しています');
-    let res;
-    try {
-      res = await fetch(zipUrl, { signal });
-    } catch (e) {
-      if (e && e.name === 'AbortError') throw e;
-      throw new Error('ZIP取得失敗(通信/CORS): ' + (e && e.message ? e.message : e));
-    }
-    if(res.status===429)sessionBlocked=true;
-    if (!res.ok) throw new Error('ZIP取得失敗: HTTP ' + res.status);
-    const declaredSize = Number(res.headers.get('content-length') || 0);
-    if (declaredSize > 64 * 1024 * 1024) throw new Error('ZIPは64MB以下にしてください');
-    const buf = await res.arrayBuffer();
+    const buf = await readZipBytes(zipUrl,signal);
     if (buf.byteLength > 64 * 1024 * 1024 || buf.byteLength < 22) throw new Error('ZIPの容量が不正です');
     const view = new DataView(buf);
     // End of Central Directory を後ろから探す

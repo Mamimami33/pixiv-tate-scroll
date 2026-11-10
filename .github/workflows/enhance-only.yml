@@ -4,11 +4,14 @@ on:
   push:
     branches:
       - feat/pixiv-enhance-only-20261111
+      - feat/pixiv-current-image-inplace-20261111
   pull_request:
     paths:
       - 'pixiv-tate-scroll.user.js'
       - 'tests/enhance-only.cjs'
       - 'tests/ai-tiling.cjs'
+      - 'tests/current-image-inplace.cjs'
+      - 'tests/current-ugoira-inplace.cjs'
       - '.github/workflows/enhance-only.yml'
 
 jobs:
@@ -33,3 +36,11 @@ jobs:
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: node tests/ai-tiling.cjs
+      - name: Current pixiv image in-place regression
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/current-image-inplace.cjs
+      - name: Current pixiv ugoira in-place regression
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/current-ugoira-inplace.cjs

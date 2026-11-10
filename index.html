@@ -3,80 +3,31 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow">
-<title>pixiv縦スクロール インストール</title>
+<meta name="robots" content="noindex,nofollow">
+<title>pixiv 画質向上・フレーム補間専用（試作）</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background: #0b1220; color: #e8edf5; line-height: 1.7; }
-  main { max-width: 640px; margin: 0 auto; padding: 24px 18px 56px; }
-  h1 { font-size: 1.45rem; margin: 8px 0 4px; }
-  h2 { font-size: 1.1rem; margin: 34px 0 8px; padding-left: 10px; border-left: 4px solid #2f81f7; }
-  p, li { font-size: .95rem; }
-  .sub { color: #9fb0c7; font-size: .9rem; margin-top: 0; }
-  .ver { display: inline-block; background: #16263f; color: #8db8f8; border-radius: 999px; padding: 2px 12px; font-size: .8rem; }
-  .install { display: block; text-align: center; background: #2f81f7; color: #fff; font-weight: 700; font-size: 1.1rem; text-decoration: none; border-radius: 14px; padding: 16px; margin: 22px 0 6px; }
-  .install:active { background: #1f6ae0; }
-  ol { padding-left: 1.3em; }
-  li { margin: 6px 0; }
-  .note { background: #111c2e; border-radius: 12px; padding: 12px 16px; margin-top: 14px; }
-  .note p { margin: 6px 0; font-size: .88rem; color: #c4d2e6; }
-  a { color: #8db8f8; }
-  .small { font-size: .82rem; color: #9fb0c7; }
+:root{color-scheme:dark}body{margin:0;background:#10131b;color:#ecf1fa;font:15px/1.7 -apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+main{max-width:670px;margin:auto;padding:26px 18px 50px}h1{font-size:1.5em}h2{font-size:1.12em;margin-top:30px}
+a{color:#a8caff}.install{display:block;margin:20px 0;padding:15px;background:#2674df;color:white;border-radius:12px;text-align:center;text-decoration:none;font-weight:700}
+small,.muted{color:#aab9cf}li{margin:8px 0}code{color:#f2dba4}
 </style>
 </head>
-<body>
-<main>
-  <span class="ver">v3.13.22</span>
-  <h1>pixiv縦スクロール</h1>
-  <p class="sub">pixivをTikTokみたいな縦スクロールで見るためのユーザースクリプトです。自分のpixivアカウントでログインして使います。</p>
-
-  <a class="install" href="https://cdn.jsdelivr.net/gh/Mamimami33/pixiv-tate-scroll@43b590423506e34ea6a90a48ec1737b34ccb544e/pixiv-tate-scroll.user.js">インストールする</a>
-  <p class="small">ボタンは下の手順を先に済ませてから押してください。スクリプト本体が開きます。</p>
-
-  <h2>iPhone（Safari）</h2>
-  <ol>
-    <li>App Storeで無料アプリ「Userscripts」をインストールする</li>
-    <li>アプリを一度開いてから、設定アプリ → Safari → 拡張機能 で「Userscripts」を有効にする</li>
-    <li>このページに戻って、上の「インストールする」ボタンをタップする</li>
-    <li>Userscriptsの確認が出たら「インストール」する</li>
-    <li>Safariでpixivに自分のアカウントでログインして、作品ページか検索ページを開くと使えます</li>
-  </ol>
-
-  <h2>Android（Firefox）</h2>
-  <ol>
-    <li>Firefoxブラウザをインストールする（Android版Chromeは拡張機能が使えないのでFirefoxを使います）</li>
-    <li>Firefoxのメニュー → アドオン から「Tampermonkey」を追加する</li>
-    <li>Firefoxでこのページを開いて、上の「インストールする」ボタンをタップする</li>
-    <li>Tampermonkeyの確認画面で「インストール」する</li>
-    <li>Firefoxでpixivに自分のアカウントでログインして、作品ページか検索ページを開くと使えます</li>
-  </ol>
-
-  <h2>使い方</h2>
-  <p>pixivで作品ページを開くと、ビューア（フィード）が自動で開きます。元のページは後ろに残っているので、閉じれば元のページに戻れます。縦スクロールで上下にスワイプして作品を見ていけます。</p>
-  <p>フィードは開いたページの種類で自動で決まります。作品ページからは、あなたの好みに合わせて並ぶ「自前フィード（おすすめ）」が始まります。検索結果ページを開くと、その検索結果のフィードが開きます。</p>
-  <p>検索フィードでは、先頭に検索ワードの候補（チップ）が出ます。タップすると、そのワードの検索結果フィードへ移動できます。</p>
-  <p>画面下のドックには、履歴・診断・更新・閉じるなどのボタンが常時並んでいます。気に入った作品はダブルタップでブックマーク（❤️）できます。</p>
-  <p>v3.13.22で、起動時のフィルタを追加しました。pixivを開くたびに、種別（すべて／マンガのみ／イラスト・うごイラ）と年齢（すべて／全年齢のみ／R-18のみ）を選ぶ画面が出て、前回の選択が初期表示になります。ドックから途中で変更もできます。種別や年齢が分からない作品は表示されず、フィルタで外れた作品は好みの学習にも使われません。</p>
-  <p>v3.13.21で、シリーズもののマンガにシリーズ表示を追加しました。下部のバーにシリーズ名と話数が出て、タップすると全話一覧から話を選べます。あわせてアンビエント・ミュート・興味なしの機能を取り除きました。</p>
-  <p>v3.13.20で、ドックに「作者をフォロー」と「検索結果へ戻る」を追加しました。検索結果へ戻ると、元のスクロール位置に戻れます。</p>
-  <p>v3.13.19で、PCの矢印キーで作品を送れるようにし、うごイラの再生を滑らかに作り直しました。タップで次へ進む操作は無くしました。</p>
-  <p>v3.13.18で、検索の並び順を新しい方式に統一しました。検索ワードとの一致の強さを最優先にし、その中では好みに合わせて並びます。一度並んだカードが後から入れ替わることはありません。</p>
-  <p>あわせて、ビューアを閉じたあとに勝手に開き直してしまう問題を直し、ドックの「pixivで開く」ボタンを取り除きました。</p>
-  <p>v3.13.17で、ブックマークしたときの関連作品の差し込みに、同じキャラ・作品のものは最大2件までという制限を入れました。あわせて差し込み候補の取り方も広げたので、同じキャラや作品名に引っ張られすぎない並びになります。</p>
-  <p>v3.13.17では、検索ワードを入れている間はワードとの一致度を並びの主役にしました（好みスコアは小さめに反映）。検索中の差し込みも、ワードに一致する候補だけが入ります。</p>
-  <p>v3.13.17で、学習をTikTok式に高度化しました。閲覧時間は「想定消費時間に対する割合」で連続評価し、セッション中の「今の気分」も短期プロフィールとして反映します。ドックには「興味なし」「作者をミュート」ボタンも追加しました。</p>
-  <p>v3.13.17では、検索ランキング検証用の診断機能を追加しました。診断パネルから「検索ランキング診断を実行」すると、その検索語の上位約108件について、一致度・好みスコア内訳・モデル別の順位をJSONで出力できます（閲覧状態には影響しません）。</p>
-  <p>v3.13.13で、検索フィードの並び方を変更しました。検索結果の中だけで、好みに合わせて並べ替える形にし、検索ワードと離れた関連作品が外から混ざって出てくることはなくなりました（グリッド表示も同じです）。</p>
-  <p>v3.13.12で、ログインIDを検出できず履歴学習が止まってしまう問題を修正しました。検出方法を複数用意し、一度検出できたら端末に保存して次回からも使えるようにしたので、履歴学習が再開します。ドックの「診断」で検出結果（成否・取得元・保存値の有無）を確認できます。</p>
-  <p>v3.13.11で、ブックマークが付かない問題を修正しました。保存に失敗したときは理由をトーストで表示します。ドックの「診断」を開くと、最後のブックマーク送信結果（成否・HTTPステータス・取得元）も確認できます。</p>
-  <p>画面上の検索バーで検索すると、正方形のサムネイルが横4列に並ぶグリッド画面で結果が出ます。並びは好みに合わせて調整され、タップでその作品を開けます。検索中にブックマークすると、その検索ワードに合った関連作品が優先して差し込まれます。</p>
-  <p>見る作品やブックマークに合わせて、おすすめの並びは自動で学習していきます。</p>
-
-  <div class="note">
-    <p>・使うのは各自のpixivアカウントです。他人のアカウント情報は不要です。</p>
-    <p>・おすすめ学習のデータは、この端末の中だけに保存されます。外部に送信されることはありません。</p>
-    <p>・アカウントの判別は自動で行われるので、IDなどの設定は要りません。</p>
-  </div>
-</main>
-</body>
+<body><main>
+<p class="muted">試験用ブランチ / main未統合</p>
+<h1>pixiv 画質向上・フレーム補間専用</h1>
+<p>おすすめ・縦スクロール・検索・ブックマークを含まない、画像のAI超解像と、うごイラのフレーム補間だけに絞ったiPhone Safari向けUserscriptsです。</p>
+<a class="install" href="https://raw.githubusercontent.com/Mamimami33/pixiv-tate-scroll/feat/pixiv-enhance-only-20261111/pixiv-tate-scroll.user.js">試作版JavaScriptを開く</a>
+<h2>使い方</h2>
+<ol>
+<li>既存の「pixiv縦スクロール」は無効にし、上記のスクリプトだけをUserscriptsに登録します。</li>
+<li>Safariのpixiv作品ページ（<code>/artworks/作品ID</code>）を開きます。</li>
+<li>右下の「画質・コマ補間」を押し、「今の作品を読み込む」または「画像を選ぶ」「うごイラZIPを選ぶ」を選択します。</li>
+<li>静止画なら「AI超解像2×」。うごイラなら「動き補間：ON」。通常画像と超解像結果は比較できます。</li>
+</ol>
+<h2>通信・画質について</h2>
+<p>ファイルから処理するとpixivにAPIリクエストを送りません。「今の作品を読み込む」を明示的に押した場合に限り、必要な作品情報と元画像またはZIPを取得します。自動巡回や再試行は行いません。</p>
+<p>pixiv CDNにCanvas / WebGLのCORS許可がない場合は、画像・ZIPを保存し、ファイル選択から読み込んでください。画質改善結果や画像を外部AIサービスへ送信しません。</p>
+<p>静止画はAnime4K CNN x2の学習済み係数による超解像で、出力・GPUの負荷上限を設けています。うごイラは動きベクトル方式の非AI補間です。<strong>RIFE等によるAIフレーム補間は未実装</strong>で、実機でのFPSや画質改善はまだ検証していません。</p>
+<p class="muted">この試作には多くの画像・作品で未検証の部分があります。現在のmainには影響しません。元画像が十分高解像度の場合、2倍超解像が原画より良く見えるとは限りません。</p>
+</main></body>
 </html>

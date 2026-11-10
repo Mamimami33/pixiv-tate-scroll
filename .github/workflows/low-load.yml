@@ -6,12 +6,15 @@ on:
       - fix/pixiv-low-load-review-20261111
       - feat/local-upscale-20261111
       - feat/ugoira-motion-interpolation-20261111
+      - feat/anime4k-cnn-local-20261111
   pull_request:
     paths:
       - 'pixiv-tate-scroll.user.js'
       - 'tests/request-pacing.cjs'
       - 'tests/local-upscale.cjs'
       - 'tests/ugoira-motion.cjs'
+      - 'tests/anime4k-cnn.cjs'
+      - 'tests/content-filter.cjs'
       - '.github/workflows/low-load.yml'
 
 jobs:
@@ -21,6 +24,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -32,3 +37,13 @@ jobs:
         run: node tests/local-upscale.cjs
       - name: Ugoira motion interpolation regression
         run: node tests/ugoira-motion.cjs
+      - name: Install browser-test driver (no browser download)
+        run: npm install --no-save --no-package-lock --ignore-scripts playwright-core@1.58.2
+      - name: Trained Anime4K CNN WebGL2 regression
+        run: node tests/anime4k-cnn.cjs
+      - name: Install Playwright UI driver
+        run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.58.2
+      - name: Existing content/filter UI regression (mock network)
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/content-filter.cjs

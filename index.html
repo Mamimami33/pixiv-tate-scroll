@@ -13,20 +13,20 @@ small,.muted{color:#aab9cf}li{margin:8px 0}code{color:#f2dba4}
 </style>
 </head>
 <body><main>
-<p class="muted">試験用ブランチ / main未統合</p>
+<p class="muted">v4.0.0-alpha.3 / 試験用ブランチ / main未統合</p>
 <h1>pixiv 画質向上・フレーム補間専用</h1>
 <p>おすすめ・縦スクロール・検索・ブックマークを含まない、画像のAI超解像と、うごイラのフレーム補間だけに絞ったiPhone Safari向けUserscriptsです。</p>
-<a class="install" href="https://raw.githubusercontent.com/Mamimami33/pixiv-tate-scroll/feat/pixiv-enhance-only-20261111/pixiv-tate-scroll.user.js">試作版JavaScriptを開く</a>
+<a class="install" href="https://raw.githubusercontent.com/Mamimami33/pixiv-tate-scroll/feat/pixiv-current-image-inplace-20261111/pixiv-tate-scroll.user.js">試作版JavaScriptを開く</a>
 <h2>使い方</h2>
 <ol>
 <li>既存の「pixiv縦スクロール」は無効にし、上記のスクリプトだけをUserscriptsに登録します。</li>
 <li>Safariのpixiv作品ページ（<code>/artworks/作品ID</code>）を開きます。</li>
-<li>右下の「画質・コマ補間」を押し、「今の作品を読み込む」または「画像を選ぶ」「うごイラZIPを選ぶ」を選択します。</li>
-<li>静止画なら「AI超解像2×」。うごイラなら「動き補間：ON」。通常画像と超解像結果は比較できます。</li>
+<li>静止画を表示したまま右下の「画質・コマ補間」を押すと、見ている画像をその位置でAI超解像します。元画像との切替も可能です。</li>
+<li>うごイラでは「うごイラを処理する」を選び、読み込み完了後に「動き補間：ON」。作品の再生領域へ結果を重ねます。読み込めない場合は端末内の画像・ZIPファイルも使用できます。</li>
 </ol>
 <h2>通信・画質について</h2>
-<p>ファイルから処理するとpixivにAPIリクエストを送りません。「今の作品を読み込む」を明示的に押した場合に限り、必要な作品情報と元画像またはZIPを取得します。自動巡回や再試行は行いません。</p>
-<p>pixiv CDNにCanvas / WebGLのCORS許可がない場合は、画像・ZIPを保存し、ファイル選択から読み込んでください。画質改善結果や画像を外部AIサービスへ送信しません。</p>
+<p>ページを開いた時点では追加通信を行いません。表示中の静止画を高画質化すると、その画像をpixiv CDNから明示的に1回取得する場合があります。元画像との比較では再取得しません。うごイラは操作時だけ作品JSON・フレーム情報・元ZIPを各1回取得し、自動巡回・自動再試行はしません。</p>
+<p>Safari Userscriptsの <code>GM.xmlHttpRequest</code> 権限を使って、ブラウザ内のCORS制限とは別の許可された画像取得を試みます。拡張機能側の許可・pixivの応答によって失敗する場合は、画像・ZIPを保存し、ファイル選択から読み込んでください。画像を外部AIサービスへ送信しません。</p>
 <p>静止画はAnime4K CNN x2の学習済み係数による超解像で、出力・GPUの負荷上限を設けています。うごイラは動きベクトル方式の非AI補間です。<strong>RIFE等によるAIフレーム補間は未実装</strong>で、実機でのFPSや画質改善はまだ検証していません。</p>
 <p class="muted">この試作には多くの画像・作品で未検証の部分があります。現在のmainには影響しません。元画像が十分高解像度の場合、2倍超解像が原画より良く見えるとは限りません。</p>
 </main></body>

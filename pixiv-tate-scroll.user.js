@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.24
+// @version      3.13.25
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -880,6 +880,7 @@
     player.ready.clear();
     player.loading.clear();
     player.displayed = -1;
+    releaseUgoiraMotion(s);
     player.urls = s.frameUrls;
   }
 
@@ -946,6 +947,258 @@
     return true;
   }
 
+
+  /* ---------- うごイラ: 動き推定を用いた端末内フレーム補間（実験的） ---------- */
+  // これはRIFEなどのAI推論ではない。隣接ZIPフレーム間の局所ブロックマッチングで
+  // 動きベクトルを推定し、WebGL2で前後の画像を位置補正して描画する。
+  // クロスフェードのみの処理とは異なるが、激しい動きには破綻があり得る。
+  // ソースは既に展開したblobフレームのみ。pixivへの追加GETを行わない。
+  const MOTION_ANALYSIS_SIZE = 160;
+  const MOTION_BLOCK_SIZE = 12;
+  const MOTION_SEARCH_RADIUS = 4;
+  const MOTION_MAX_FRAME_PIXELS = 2_500_000;
+  const MOTION_MAX_OUTPUT_PIXELS = 1_250_000;
+  let motionInterpolationEnabled = false;
+  let motionInterpolationAvailable = true;
+
+  function motionGrayFromImage(image, width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    if (!ctx) return null;
+    ctx.drawImage(image, 0, 0, width, height);
+    // うごイラZIPを展開して生成したsame-origin blob: のみを対象にする。
+    const data = ctx.getImageData(0,0,width,height).data;
+    const gray = new Uint8Array(width * height);
+    for (let k=0, i=0; i<gray.length; i++, k+=4) {
+      gray[i]=(data[k]*77+data[k+1]*150+data[k+2]*29)>>8;
+    }
+    canvas.width=0;canvas.height=0;
+    return gray;
+  }
+
+  function estimateUgoiraMotion(grayA, grayB, width, height,
+    blockSize = MOTION_BLOCK_SIZE, radius = MOTION_SEARCH_RADIUS) {
+    if (!grayA || !grayB || width<24 || height<24 ||
+        grayA.length!==width*height || grayB.length!==width*height) return null;
+    const columns=Math.ceil(width/blockSize), rows=Math.ceil(height/blockSize);
+    const pixels=new Uint8Array(columns*rows*4);
+    let totalDifference=0;
+    for(let i=0;i<grayA.length;i+=3) totalDifference+=Math.abs(grayA[i]-grayB[i]);
+    const meanDifference=totalDifference/Math.ceil(grayA.length/3);
+    // カット切り替えを誤って補間すると残像が出る。
+    if(meanDifference>65)return null;
+    for(let by=0;by<rows;by++)for(let bx=0;bx<columns;bx++){
+      const centerX=bx*blockSize+Math.floor(blockSize/2);
+      const centerY=by*blockSize+Math.floor(blockSize/2);
+      const x0=Math.max(0,centerX-4),x1=Math.min(width-1,centerX+4);
+      const y0=Math.max(0,centerY-4),y1=Math.min(height-1,centerY+4);
+      let bestDx=0,bestDy=0,bestScore=Infinity;
+      for(let dy=-radius;dy<=radius;dy++)for(let dx=-radius;dx<=radius;dx++){
+        let score=0,samples=0;
+        for(let y=y0;y<=y1;y+=2)for(let x=x0;x<=x1;x+=2){
+          const tx=x+dx,ty=y+dy;
+          if(tx<0||ty<0||tx>=width||ty>=height)continue;
+          score+=Math.abs(grayA[y*width+x]-grayB[ty*width+tx]);
+          samples++;
+        }
+        if(samples<8)continue;
+        // 均一色の領域で意味のない大きな移動を推定しない。
+        const normalized=score/samples+0.5*(dx*dx+dy*dy);
+        if(normalized<bestScore){
+          bestScore=normalized;bestDx=dx;bestDy=dy;
+        }
+      }
+      // WebGLテクスチャの行は下から並ぶので順序を反転。
+      const dest=((rows-1-by)*columns+bx)*4;
+      pixels[dest]=Math.max(0,Math.min(255,128+bestDx*12));
+      pixels[dest+1]=Math.max(0,Math.min(255,128-bestDy*12));
+      pixels[dest+2]=0;pixels[dest+3]=255;
+    }
+    return {pixels,columns,rows,width,height,meanDifference};
+  }
+
+  function releaseUgoiraMotion(s) {
+    const m=s?.motionRenderer;
+    if(m){
+      try{
+        const gl=m.gl;
+        for(const tex of [m.a,m.b,m.flow]) if(tex)gl.deleteTexture(tex);
+        if(m.program)gl.deleteProgram(m.program);
+        if(m.vao)gl.deleteVertexArray(m.vao);
+      }catch(_){}
+      m.canvas?.remove();
+      if(m.canvas){m.canvas.width=0;m.canvas.height=0;}
+    }
+    if(s) {s.motionRenderer=null;s.motionPair=null;}
+  }
+
+  function motionShader(gl,type,code) {
+    const shader=gl.createShader(type);
+    if(!shader)return null;
+    gl.shaderSource(shader,code);gl.compileShader(shader);
+    if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS)){
+      gl.deleteShader(shader);return null;
+    }
+    return shader;
+  }
+
+  function createUgoiraMotionRenderer(s,width,height) {
+    const holder=s.sectionEl?.querySelector('.pts-holder');
+    if(!holder||!motionInterpolationAvailable)return null;
+    const canvas=document.createElement('canvas');
+    canvas.className='pts-ugoira-motion-canvas';
+    const scale=Math.min(1,Math.sqrt(MOTION_MAX_OUTPUT_PIXELS/(width*height)));
+    canvas.width=Math.max(1,Math.floor(width*scale));
+    canvas.height=Math.max(1,Math.floor(height*scale));
+    const gl=canvas.getContext('webgl2',{
+      alpha:false,depth:false,stencil:false,antialias:false,
+      preserveDrawingBuffer:false,powerPreference:'low-power'
+    });
+    if(!gl){motionInterpolationAvailable=false;return null;}
+    const vertex=motionShader(gl,gl.VERTEX_SHADER,`#version 300 es
+      out vec2 uv;
+      void main(){
+        vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));
+        uv=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);
+      }`);
+    const fragment=motionShader(gl,gl.FRAGMENT_SHADER,`#version 300 es
+      precision highp float;
+      in vec2 uv;out vec4 color;
+      uniform sampler2D frameA,frameB,motionField;
+      uniform vec2 invAnalysis;uniform float mixTime;
+      void main(){
+        vec2 flow=(texture(motionField,uv).rg*255.0-vec2(128.0))
+          /12.0*invAnalysis;
+        vec2 a=clamp(uv-flow*mixTime,0.0,1.0);
+        vec2 b=clamp(uv+flow*(1.0-mixTime),0.0,1.0);
+        color=mix(texture(frameA,a),texture(frameB,b),mixTime);
+      }`);
+    if(!vertex||!fragment){
+      if(vertex)gl.deleteShader(vertex);if(fragment)gl.deleteShader(fragment);
+      canvas.width=0;canvas.height=0;motionInterpolationAvailable=false;return null;
+    }
+    const program=gl.createProgram();
+    gl.attachShader(program,vertex);gl.attachShader(program,fragment);
+    gl.linkProgram(program);gl.deleteShader(vertex);gl.deleteShader(fragment);
+    if(!gl.getProgramParameter(program,gl.LINK_STATUS)){
+      gl.deleteProgram(program);canvas.width=0;canvas.height=0;
+      motionInterpolationAvailable=false;return null;
+    }
+    const vao=gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.useProgram(program);
+    gl.uniform1i(gl.getUniformLocation(program,'frameA'),0);
+    gl.uniform1i(gl.getUniformLocation(program,'frameB'),1);
+    gl.uniform1i(gl.getUniformLocation(program,'motionField'),2);
+    const m={gl,canvas,program,vao,a:null,b:null,flow:null,pair:null,
+      alpha:gl.getUniformLocation(program,'mixTime'),
+      inv:gl.getUniformLocation(program,'invAnalysis')};
+    canvas.style.display='none';
+    canvas.addEventListener('webglcontextlost',event=>{
+      event.preventDefault();motionInterpolationAvailable=false;
+      releaseUgoiraMotion(s);
+    },{once:true});
+    holder.appendChild(canvas);
+    s.motionRenderer=m;
+    return m;
+  }
+
+  function motionTexture(gl,unit,image,field) {
+    const texture=gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0+unit);
+    gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    if(field){
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,field.columns,field.rows,0,
+        gl.RGBA,gl.UNSIGNED_BYTE,field.pixels);
+    }else{
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,image);
+    }
+    return texture;
+  }
+
+  function drawUgoiraMotion(s,index,fraction,duration){
+    if(!motionInterpolationEnabled||!motionInterpolationAvailable||
+       !s.isCurrent||document.hidden||searchGrid.open||
+       !(fraction>0.03&&fraction<0.97)||duration>300||duration<25){
+      if(s.motionRenderer)s.motionRenderer.canvas.style.display='none';
+      return false;
+    }
+    const player=s.ugoiraPlayer;
+    const a=player?.ready.get(index);
+    const next=(index+1)%s.frameUrls.length;
+    const b=player?.ready.get(next);
+    if(!a||!b||!a.src.startsWith('blob:')||!b.src.startsWith('blob:')||
+      a.naturalWidth!==b.naturalWidth||a.naturalHeight!==b.naturalHeight||
+      !a.naturalWidth||a.naturalWidth*a.naturalHeight>MOTION_MAX_FRAME_PIXELS){
+      if(s.motionRenderer)s.motionRenderer.canvas.style.display='none';
+      return false;
+    }
+    try{
+      let m=s.motionRenderer;
+      if(m&&(m.imageWidth!==a.naturalWidth||m.imageHeight!==a.naturalHeight)){
+        releaseUgoiraMotion(s);m=null;
+      }
+      if(!m){
+        m=createUgoiraMotionRenderer(s,a.naturalWidth,a.naturalHeight);
+        if(!m)return false;
+        m.imageWidth=a.naturalWidth;m.imageHeight=a.naturalHeight;
+      }
+      if(m.pair?.index!==index||m.pair.a!==a||m.pair.b!==b){
+        const scale=Math.min(1,MOTION_ANALYSIS_SIZE/a.naturalWidth,
+          MOTION_ANALYSIS_SIZE/a.naturalHeight);
+        const w=Math.max(24,Math.round(a.naturalWidth*scale));
+        const h=Math.max(24,Math.round(a.naturalHeight*scale));
+        const grayA=motionGrayFromImage(a,w,h);
+        const grayB=motionGrayFromImage(b,w,h);
+        const field=estimateUgoiraMotion(grayA,grayB,w,h);
+        if(!field){m.canvas.style.display='none';return false;}
+        const gl=m.gl;
+        for(const tex of [m.a,m.b,m.flow])if(tex)gl.deleteTexture(tex);
+        m.a=motionTexture(gl,0,a,null);
+        m.b=motionTexture(gl,1,b,null);
+        m.flow=motionTexture(gl,2,null,field);
+        m.pair={index,a,b,field};
+      }
+      const gl=m.gl;
+      gl.viewport(0,0,m.canvas.width,m.canvas.height);
+      gl.useProgram(m.program);gl.bindVertexArray(m.vao);
+      gl.uniform1f(m.alpha,fraction);
+      gl.uniform2f(m.inv,1/m.pair.field.width,1/m.pair.field.height);
+      for(const [unit,tex] of [[0,m.a],[1,m.b],[2,m.flow]]){
+        gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,tex);
+      }
+      gl.drawArrays(gl.TRIANGLES,0,3);
+      m.canvas.style.display='block';
+      return true;
+    }catch(e){
+      releaseUgoiraMotion(s);
+      motionInterpolationAvailable=false;
+      return false;
+    }
+  }
+
+  function syncMotionButton(){
+    const button=overlay?.querySelector('.pts-motion');
+    if(!button)return;
+    button.textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
+    button.setAttribute('aria-pressed',motionInterpolationEnabled?'true':'false');
+    button.disabled=!motionInterpolationAvailable;
+    button.title='うごイラの前後フレームを動き推定で補間。AI RIFEではありません。';
+  }
+
+  function toggleMotionInterpolation(){
+    motionInterpolationEnabled=!motionInterpolationEnabled;
+    if(!motionInterpolationEnabled)slides.forEach(releaseUgoiraMotion);
+    syncMotionButton();
+  }
+
   function startUgoira(s) {
     if (s.animTimer != null || !s.frameUrls?.length ||
         !s.frames?.length || !s.isCurrent) return;
@@ -999,6 +1252,8 @@
       queueUgoiraFrame(s,index);
       for(let n=1;n<=UGOIRA_DECODE_AHEAD;n++) queueUgoiraFrame(s,index+n);
       if(player.ready.has(index)&&player.displayed!==index)renderUgoiraFrame(s,index);
+      const frameMs=timeline[index+1]-timeline[index];
+      drawUgoiraMotion(s,index,(player.elapsed-timeline[index])/frameMs,frameMs);
       const pct=timeline[index]/total*100;
       if(s.seekFill)s.seekFill.style.width=pct+'%';
       if(s.seekKnob)s.seekKnob.style.left=pct+'%';
@@ -1028,6 +1283,7 @@
   }
 
   function stopUgoira(s) {
+    releaseUgoiraMotion(s);
     if(s.animTimer!=null){
       cancelAnimationFrame(s.animTimer);
       s.animTimer=null;
@@ -1043,6 +1299,7 @@
   // シーク中のstopUgoiraとは分離し、ドラッグ中に表示が消えるのを防ぐ。
   function releaseUgoiraCanvas(s) {
     if (s.kind !== 'ugoira') return;
+    releaseUgoiraMotion(s);
     s.ugoiraCanvas?.remove();
     s.ugoiraCanvas = null;
     s.sectionEl?.querySelector('.pts-holder')
@@ -4376,6 +4633,10 @@
         display:block;position:absolute;inset:0;width:100%;height:100%;
         object-fit:contain;pointer-events:none
       }
+      #pts-overlay .pts-holder .pts-ugoira-motion-canvas{
+        display:block;position:absolute;inset:0;width:100%;height:100%;
+        object-fit:contain;pointer-events:none;z-index:1
+      }
       #pts-overlay .pts-holder.pts-ugoira-active > .pts-img{
         visibility:hidden
       }
@@ -4592,6 +4853,8 @@
     addButton('pts-history-button', '履歴', showSessionHistory);
     addButton('pts-upscale', '補間2×: OFF', toggleUpscale);
     syncUpscaleButton();
+    addButton('pts-motion', '動き補間: OFF', toggleMotionInterpolation);
+    syncMotionButton();
 
     // 診断・更新の既存イベントを保持してDOM移動。
     for (const selector of [

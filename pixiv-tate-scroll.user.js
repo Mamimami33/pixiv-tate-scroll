@@ -609,7 +609,7 @@
 }
 #pts-only-overlay.pts-only-compact header {padding:8px 10px}
 #pts-only-overlay.pts-only-compact #pts-only-stage {display:none}
-#pts-only-overlay.pts-only-compact #pts-only-controls:not(:has(#pts-only-current)) {display:none}
+#pts-only-overlay.pts-only-compact #pts-only-stage + #pts-only-controls {display:none}
 #pts-only-overlay.pts-only-compact #pts-only-status{max-height:90px;overflow:auto;padding:8px 10px}
 `;
     document.head.appendChild(css);

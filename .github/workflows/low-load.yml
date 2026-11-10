@@ -1,0 +1,26 @@
+name: Low-load regression checks
+
+on:
+  push:
+    branches:
+      - fix/pixiv-low-load-review-20261111
+  pull_request:
+    paths:
+      - 'pixiv-tate-scroll.user.js'
+      - 'tests/request-pacing.cjs'
+      - '.github/workflows/low-load.yml'
+
+jobs:
+  request-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Script syntax
+        run: node --check pixiv-tate-scroll.user.js
+      - name: Traffic regression
+        run: node tests/request-pacing.cjs

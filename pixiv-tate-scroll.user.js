@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.22
+// @version      3.13.23
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -64,7 +64,143 @@
     return u;
   }
 
-  async function fetchJson(url, signal, cacheMode) {
+  /* ---------- pixiv GET通信の負荷制御 ---------- */
+
+  // サーバー側の閾値は非公開。これは検出回避ではなく、不要な負荷を減らすための暫定設定。
+  const PIXIV_GET_GAP_MS = 1500;
+  const PIXIV_GET_LIMIT_PAUSE_MS = 60 * 60 * 1000;
+  const PIXIV_GET_PAUSE_KEY = 'PTS_PIXIV_GET_PAUSE_UNTIL_V1';
+  let pixivGetNextAt = 0;
+  let pixivGetPauseUntil = 0;
+  const pixivGetQueue = [];
+  let pixivGetRunning = false;
+  let pixivGetWakeTimer = null;
+  let pixivGetSequence = 0;
+
+  function pixivGetAbortError() {
+    return new DOMException('通信を中止しました', 'AbortError');
+  }
+
+  function readPixivGetPauseUntil() {
+    try {
+      const saved = Number(localStorage.getItem(PIXIV_GET_PAUSE_KEY) || 0);
+      if (Number.isFinite(saved)) {
+        pixivGetPauseUntil = Math.max(pixivGetPauseUntil, saved);
+      }
+    } catch (e) { /* ストレージが使えなくてもタブ内では停止。 */ }
+    return pixivGetPauseUntil;
+  }
+
+  function rejectQueuedPixivGets(error) {
+    while (pixivGetQueue.length) {
+      const job = pixivGetQueue.shift();
+      job.done = true;
+      job.cleanup();
+      job.reject(error);
+    }
+  }
+
+  // 実際のfetch直前に再確認する。古いフィードの予約は送信せず捨てる。
+  // 閲覧中の作品情報は、予約済みの候補取得より先に送る。
+  function pumpPixivGetQueue() {
+    if (pixivGetRunning || pixivGetWakeTimer) return;
+    if (readPixivGetPauseUntil() > Date.now()) {
+      rejectQueuedPixivGets(new Error('pixivへのGET通信を一時停止しています'));
+      return;
+    }
+
+    while (pixivGetQueue.length) {
+      const waitMs = Math.max(0, pixivGetNextAt - Date.now());
+      if (waitMs > 0) {
+        pixivGetWakeTimer = setTimeout(() => {
+          pixivGetWakeTimer = null;
+          pumpPixivGetQueue();
+        }, waitMs);
+        return;
+      }
+
+      const score = job => typeof job.priority === 'function' ? job.priority() : job.priority;
+      pixivGetQueue.sort((x, y) => (score(y) - score(x)) || (x.sequence - y.sequence));
+      const job = pixivGetQueue.shift();
+      if (job.done) continue;
+      if (job.options.signal?.aborted || (job.shouldRun && !job.shouldRun())) {
+        job.done = true;
+        job.cleanup();
+        job.reject(pixivGetAbortError());
+        continue;
+      }
+
+      pixivGetRunning = true;
+      job.running = true;
+      pixivGetNextAt = Date.now() + PIXIV_GET_GAP_MS;
+      Promise.resolve().then(() => fetch(job.url, job.options)).then(response => {
+        if (response.status === 429) {
+          const retryAfter = response.headers.get('Retry-After')?.trim() || '';
+          let retryAt = 0;
+          if (/^\d+$/.test(retryAfter)) {
+            retryAt = Date.now() + Number(retryAfter) * 1000;
+          } else if (retryAfter) {
+            retryAt = Date.parse(retryAfter) || 0;
+          }
+          pixivGetPauseUntil = Math.max(
+            readPixivGetPauseUntil(), Date.now() + PIXIV_GET_LIMIT_PAUSE_MS,
+            Number.isFinite(retryAt) ? retryAt : 0
+          );
+          try {
+            localStorage.setItem(PIXIV_GET_PAUSE_KEY, String(pixivGetPauseUntil));
+          } catch (e) { /* 保存不能でもタブ内では停止。 */ }
+          rejectQueuedPixivGets(new Error('pixivがHTTP 429を返したためGET通信を停止しました'));
+          console.warn('[PTS] HTTP 429: additional pixiv GET requests cancelled');
+        }
+        job.resolve(response);
+      }).catch(error => job.reject(error)).finally(() => {
+        job.done = true;
+        job.cleanup();
+        pixivGetRunning = false;
+        pumpPixivGetQueue();
+      });
+      return;
+    }
+  }
+
+  // 応答待ちも含めて同時GETは1件、送信間隔も確保する。
+  // 中断済み・旧世代の通信は送らない。429は自動再試行しない。
+  function pacedPixivGet(url, options = {}, shouldRun, priority = 0) {
+    return new Promise((resolve, reject) => {
+      if (options.signal?.aborted || (shouldRun && !shouldRun())) {
+        reject(pixivGetAbortError());
+        return;
+      }
+      if (readPixivGetPauseUntil() > Date.now()) {
+        reject(new Error('pixivへのGET通信を一時停止しています'));
+        return;
+      }
+      const initialPriority = typeof priority === 'function' ? priority() : priority;
+      if (pixivGetQueue.length >= 48 && initialPriority <= 0) {
+        reject(new Error('通信待ちが多いため、新しい候補取得を見送りました'));
+        return;
+      }
+      const job = {
+        url, options, shouldRun, priority, resolve, reject,
+        sequence: ++pixivGetSequence, running: false, done: false,
+        cleanup: null, onAbort: null
+      };
+      job.cleanup = () => options.signal?.removeEventListener('abort', job.onAbort);
+      job.onAbort = () => {
+        if (job.running || job.done) return; // 送信済みのfetchはsignal自身が止める。
+        job.done = true;
+        const index = pixivGetQueue.indexOf(job);
+        if (index >= 0) pixivGetQueue.splice(index, 1);
+        job.cleanup();
+        reject(pixivGetAbortError());
+      };
+      options.signal?.addEventListener('abort', job.onAbort, { once: true });
+      pixivGetQueue.push(job);
+      pumpPixivGetQueue();
+    });
+  }
+
+  async function fetchJson(url, signal, cacheMode, shouldRun, priority = 0) {
     const options = {
       method: 'GET',
       credentials: 'same-origin',
@@ -73,7 +209,7 @@
 
     if (cacheMode) options.cache = cacheMode;
 
-    const res = await fetch(url, options);
+    const res = await pacedPixivGet(url, options, shouldRun, priority);
 
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
@@ -140,7 +276,11 @@
   async function resolveSlideImpl(s, signal) {
     const cacheMode = s.forceRefetch ? 'no-store' : undefined;
     const get = (path, sig) =>
-      fetchJson(path, sig, cacheMode);
+      fetchJson(path, sig, cacheMode,
+        () => !signal?.aborted && s.contentFilterEpoch === contentFilterEpoch &&
+          slides.includes(s) && (s.isCurrent ||
+            Math.abs(slides.indexOf(s) - currentIndex()) <= 2),
+        () => s.isCurrent ? 10 : -2);
 
     try {
       const body = await get(`/ajax/illust/${s.id}`, signal);
@@ -830,24 +970,32 @@
 
   // うごイラ：小さいZIPで先に再生を始め、裏で元サイズのZIPに差し替えて綺麗にする
   async function upgradeUgoiraHiRes(s) {
-    // 高画質化は表示中の作品だけ（画面外まで展開するとiPhoneのメモリを圧迫する）
+    // フルサイズZIPは表示中のみ取得。離脱時は即中断し、展開済みblobも破棄する。
     if (!s.isCurrent) return;
     if (!s.zipFull || s.zipFull === s.zipUrl || s.hiDone || s.hiRunning) return;
+    const controller = new AbortController();
+    s.hiAbort = controller;
     s.hiRunning = true;
     try {
-      const urls = await unzipFrames(s.zipFull, s.frames, undefined);
-      if (urls.filter(Boolean).length > 0) {
+      const urls = await unzipFrames(s.zipFull, s.frames, controller.signal);
+      if (controller.signal.aborted || !s.isCurrent || !slides.includes(s)) {
+        urls.forEach(u => { if (u?.startsWith('blob:')) URL.revokeObjectURL(u); });
+        return;
+      }
+      if (urls.some(Boolean)) {
         const old = s.frameUrls;
         s.frameUrls = urls;
         s.hiDone = true;
         clearUgoiraDecodeCache(s);
-        // 旧フレームは表示中imgがまだ参照していることがある。即解放すると画像が消えるので遅らせて解放
         if (old) setTimeout(() => {
-          old.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
+          old.forEach(u => { if (u?.startsWith('blob:')) URL.revokeObjectURL(u); });
         }, 5000);
       }
-    } catch (e) { /* 小さいまま続行 */ }
-    s.hiRunning = false;
+    } catch (e) { /* 中止時は小さいZIPでの再生を維持。 */ }
+    finally {
+      if (s.hiAbort === controller) s.hiAbort = null;
+      s.hiRunning = false;
+    }
   }
 
   /* ---------- 閲覧中の読み込み優先（滞り検知つき） ---------- */
@@ -856,10 +1004,12 @@
   function prioritize(s) {
     slides.forEach((o) => {
       if (o !== s && o.ugoiraAbort) o.ugoiraAbort.abort();
+      if (o !== s && o.hiAbort) o.hiAbort.abort();
       if (o.mainImg) { try { o.mainImg.fetchPriority = (o === s) ? 'high' : 'low'; } catch (e) {} }
     });
     if (!s.resolved) resolveSlide(s);
     if (s.kind === 'ugoira' && !s.frameUrls && s.resolved) prepareUgoira(s);
+    else if (s.kind === 'ugoira' && s.frameUrls && !s.hiRunning) void upgradeUgoiraHiRes(s);
   }
 
   // 画像の読み込みを強制的にやり直す（壊れて終わっているときだけ。読み込み途中では呼ばない）
@@ -901,7 +1051,7 @@
           else if (im2 && im2.complete && im2.naturalWidth === 0) forceReloadImage(s);
           // 読み込みが続いているだけなら、やり直すとかえって遅くなるので触らない
         }
-      }, 4000);
+      }, 20000); // 1.5秒間隔の通信キューで正常に待機している取得を誤中断しない
     }, 2600);
   }
 
@@ -1170,7 +1320,10 @@
         else void resolveSlide(s);
 
         if (s.kind === 'ugoira') {
-          if (s.frameUrls?.length) startUgoira(s);
+          if (s.frameUrls?.length) {
+            startUgoira(s);
+            if (!s.hiRunning) void upgradeUgoiraHiRes(s);
+          }
           else if (s.resolved) void prepareUgoira(s);
         }
 
@@ -1178,6 +1331,7 @@
 
       } else if (!current && s.isCurrent) {
         s.isCurrent = false;
+        if (s.hiAbort) s.hiAbort.abort();
         stopUgoira(s);
         releaseUgoiraCanvas(s);
         if (s.resolved) upgradeSlide(s);
@@ -1296,7 +1450,7 @@
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
       try {
-        const response = await fetch('https://www.pixiv.net/', {
+        const response = await pacedPixivGet('https://www.pixiv.net/', {
           credentials: 'include', signal: controller.signal
         });
         if (response.ok) {
@@ -1712,7 +1866,7 @@
   // 通常の履歴取得でもHTTPステータスを確認する。
   // 既存のfetchJson()には変更を加えない。
   async function getBookmarkApiBody(url) {
-    const res = await fetch(url, {
+    const res = await pacedPixivGet(url, {
       method: 'GET',
       credentials: 'same-origin'
     });
@@ -2036,7 +2190,7 @@
   let contentFilterConfirmed = false;
   let contentFilterDialog = null;
   const contentMetadata = new Map();
-  const CONTENT_DETAIL_LIMIT = 24;
+  const CONTENT_DETAIL_LIMIT = 8;
 
   function contentEnum(value) {
     if (typeof value !== 'number' && typeof value !== 'string') return null;
@@ -2076,8 +2230,8 @@
         if (!pending) {
           if (requests++ >= CONTENT_DETAIL_LIMIT) return null;
           const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 5000);
-          pending = fetchJson('/ajax/illust/' + encodeURIComponent(id), controller.signal)
+          const timeout = setTimeout(() => controller.abort(), 30000);
+          pending = fetchJson('/ajax/illust/' + encodeURIComponent(id), controller.signal, undefined, valid, -2)
             .then(body => ({illustType: contentEnum(body.illustType),
               xRestrict: contentEnum(body.xRestrict)})).catch(() => null)
             .finally(() => clearTimeout(timeout));
@@ -2706,6 +2860,7 @@
     const generation = feedGeneration, epoch = contentFilterEpoch;
     const valid = () => generation === feedGeneration && epoch === contentFilterEpoch;
     const filter = {...contentFilter};
+    const fetchSource = url => fetchJson(url, undefined, undefined, valid, -5);
     const first = customBatchNumber === 0;
     const jobs = [];
     const seeds = customPickSeeds();
@@ -2720,7 +2875,7 @@
       const ids = customNextIds.slice(0, 60);
       jobs.push({
         type: 'next', ids,
-        run: () => fetchJson(
+        run: () => fetchSource(
           '/ajax/illust/recommend/illusts?illustIds=' +
           encodeURIComponent(ids.join(',')) + '&lang=ja'
         )
@@ -2730,7 +2885,7 @@
     for (const id of seeds) {
       jobs.push({
         type: 'seed',
-        run: () => fetchJson(
+        run: () => fetchSource(
           `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
         )
       });
@@ -2738,7 +2893,7 @@
 
     jobs.push({
       type: 'discovery',
-      run: () => fetchJson(
+      run: () => fetchSource(
         contentDiscoveryUrl(filter)
       )
     });
@@ -2759,7 +2914,7 @@
 
     jobs.push({
       type: 'tag',
-      run: () => fetchJson(
+      run: () => fetchSource(
         '/ajax/search/artworks/' + encodeURIComponent(tag) +
         '?' + new URLSearchParams({
           word: tag, order: 'popular_d',
@@ -2773,7 +2928,7 @@
       const page = customFollowPage;
       jobs.push({
         type: 'follow', page,
-        run: () => fetchJson(
+        run: () => fetchSource(
           `/ajax/follow_latest/illust?mode=${contentSourceMode(filter)}&p=${page}`
         )
       });
@@ -2791,7 +2946,7 @@
 
       jobs.push({
         type: 'author',
-        run: () => fetchJson(
+        run: () => fetchSource(
           `/ajax/user/${encodeURIComponent(authorId)}/illusts?limit=30&tag=&lang=ja`
         )
       });
@@ -2907,7 +3062,7 @@
 
     try {
       let items = [];
-      for (let attempt = 0; attempt < 3 && !items.length; attempt++) {
+      for (let attempt = 0; attempt < 1 && !items.length; attempt++) {
         items = await customFetchBatch();
         if (generation !== feedGeneration) return;
         if (!items.length) customBatchNumber++;
@@ -4142,7 +4297,7 @@
   }
 
   async function readFollowStatus(authorId) {
-    const response = await fetch(
+    const response = await pacedPixivGet(
       '/ajax/user/' + encodeURIComponent(authorId) + '?full=1',
       {credentials:'same-origin',cache:'no-store'}
     );
@@ -4633,7 +4788,8 @@
           let body;
           try {
             // ここにはフィード/グリッド固有のsignalを渡さない。
-            body = await fetchJson(searchApiUrl(ctx.config, page));
+            body = await fetchJson(searchApiUrl(ctx.config, page), undefined, undefined,
+              () => searchContextValid(ctx), -3);
           } catch (e) {
             error = e;
             break;
@@ -5779,7 +5935,7 @@
 
     updateCounter();
 
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       if (
         generation !== feedGeneration ||
         searchFinished ||
@@ -6003,7 +6159,7 @@
 
       const home = async () => {
         try {
-          const res = await fetch('https://www.pixiv.net/', {
+          const res = await pacedPixivGet('https://www.pixiv.net/', {
             method: 'GET',
             credentials: 'same-origin',
             cache: 'no-store'
@@ -6407,6 +6563,7 @@
     s.sectionEl?.querySelector('.pts-holder')?.classList.remove('pts-ugoira-active');
     if (s.loadWatch) { clearTimeout(s.loadWatch); s.loadWatch = null; }
     if (s.ugoiraAbort) { try { s.ugoiraAbort.abort(); } catch (e) {} s.ugoiraAbort = null; }
+    if (s.hiAbort) { try { s.hiAbort.abort(); } catch (e) {} s.hiAbort = null; }
     if (s.resolveAbort) { try { s.resolveAbort.abort(); } catch (e) {} }
     if (s.frameUrls) {
       s.frameUrls.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
@@ -6582,7 +6739,7 @@
         if (!s.resolved) resolveSlide(s);
         else upgradeSlide(s);
       });
-    }, { root: null, rootMargin: '300% 0px 300% 0px', threshold: 0 });
+    }, { root: null, rootMargin: '150% 0px 150% 0px', threshold: 0 });
     // 「表示中」の決定は markCurrentFromScroll（スクロール位置ベース）に一本化した。
     // 以前はIntersectionObserverと二重に書き換えて競合していた（ChatGPTレビュー反映）
   }
@@ -6767,7 +6924,7 @@
     }, 12000);
 
     try {
-      const res = await fetch(url, {
+      const res = await pacedPixivGet(url, {
         method: 'GET',
         credentials: 'same-origin',
         cache: 'no-store',

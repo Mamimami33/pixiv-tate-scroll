@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.23
+// @version      3.13.24
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -517,8 +517,161 @@
 
       if (s.kind === 'ugoira') prepareUgoira(s);
     }
+    if (s.isCurrent && s.kind !== 'ugoira') scheduleUpscale();
   }
 
+
+
+  /* ---------- 現在表示中だけのローカル拡大補間 ---------- */
+  // 既に読み込んだ画像を描画するだけ。AI超解像/追加通信/ピクセル読取なし。
+  // OFFを初期値とし、非対応・メモリ不足時は元画像へフォールバックする。
+  const UPSCALE_MAX_PIXELS = 2_500_000;
+  let upscaleEnabled = false;
+  let upscaleCanvas = null;
+  let upscaleOwner = null;
+  let upscaleImage = null;
+  let upscaleSource = '';
+  let upscalePage = -1;
+  let upscaleTimer = null;
+  let upscaleTicket = 0;
+
+  function upscalePlan(imageWidth, imageHeight, viewWidth, viewHeight,
+    deviceRatio = 1, maxPixels = UPSCALE_MAX_PIXELS) {
+    if (![imageWidth, imageHeight, viewWidth, viewHeight, deviceRatio, maxPixels]
+      .every(value => Number.isFinite(value) && value > 0)) return null;
+    const zoom = Math.min(
+      2, deviceRatio, Math.sqrt(maxPixels / (viewWidth * viewHeight))
+    );
+    if (zoom <= 1.1) return null;
+    const fit = Math.min(viewWidth / imageWidth, viewHeight / imageHeight);
+    const displayedWidth = imageWidth * fit;
+    const displayedHeight = imageHeight * fit;
+    if (imageWidth >= displayedWidth * zoom * .95 &&
+        imageHeight >= displayedHeight * zoom * .95) return null;
+    const width = Math.floor(viewWidth * zoom);
+    const height = Math.floor(viewHeight * zoom);
+    if (width < 1 || height < 1 || width * height > maxPixels) return null;
+    return {
+      width, height,
+      x: Math.round((width - displayedWidth * zoom) / 2),
+      y: Math.round((height - displayedHeight * zoom) / 2),
+      drawWidth: Math.round(displayedWidth * zoom),
+      drawHeight: Math.round(displayedHeight * zoom)
+    };
+  }
+
+  function clearUpscale() {
+    clearTimeout(upscaleTimer);
+    upscaleTimer = null;
+    upscaleTicket++;
+    if (upscaleCanvas) {
+      upscaleCanvas.remove();
+      // Canvasのバッファを速やかに破棄する。
+      upscaleCanvas.width = 0;
+      upscaleCanvas.height = 0;
+    }
+    upscaleCanvas = null;
+    upscaleOwner = null;
+    upscaleImage = null;
+    upscaleSource = '';
+    upscalePage = -1;
+  }
+
+  function renderUpscale() {
+    if (!upscaleEnabled || !overlay || overlay.style.display === 'none' ||
+        document.hidden || searchGrid.open || seriesUI.layerOpen) {
+      clearUpscale();
+      return;
+    }
+    const s = slides[currentIndex()];
+    if (!s?.isCurrent || !s.resolved ||
+        (s.kind !== 'single' && s.kind !== 'multi')) {
+      clearUpscale();
+      return;
+    }
+    const holder = s.sectionEl?.querySelector('.pts-holder');
+    const page = s.kind === 'multi' ? (s.pageIdx || 0) : 0;
+    const image = s.kind === 'multi'
+      ? holder?.querySelectorAll('.pts-page img')[page] : s.mainImg;
+    const pair = s.pairs?.[page];
+    if (!holder || !image?.isConnected || !pair || !image.complete ||
+        !image.naturalWidth || !image.naturalHeight) {
+      clearUpscale();
+      return;
+    }
+    // 元画像への差し替えが済む前のサムネイルは補間しない。
+    const currentUrl = image.currentSrc || image.src;
+    if (pair.o && currentUrl !== pair.o) {
+      clearUpscale();
+      return;
+    }
+    const plan = upscalePlan(
+      image.naturalWidth, image.naturalHeight,
+      holder.clientWidth, holder.clientHeight,
+      window.devicePixelRatio || 1
+    );
+    if (!plan) {
+      clearUpscale();
+      return;
+    }
+    if (upscaleCanvas && upscaleOwner === s && upscaleImage === image &&
+        upscaleSource === currentUrl && upscalePage === page &&
+        upscaleCanvas.width === plan.width && upscaleCanvas.height === plan.height) {
+      return;
+    }
+    clearUpscale();
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.className = 'pts-upscaled-canvas';
+      canvas.width = plan.width;
+      canvas.height = plan.height;
+      const context = canvas.getContext('2d', {alpha:false});
+      if (!context) { canvas.width = 0; canvas.height = 0; return; }
+      context.fillStyle = '#000';
+      context.fillRect(0, 0, plan.width, plan.height);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      // Cross-origin画像でも描画は可能。画像データは読み戻さない。
+      context.drawImage(image, plan.x, plan.y, plan.drawWidth, plan.drawHeight);
+      if (!s.isCurrent || !holder.isConnected) {
+        canvas.width = 0;
+        canvas.height = 0;
+        return;
+      }
+      holder.appendChild(canvas);
+      upscaleCanvas = canvas;
+      upscaleOwner = s;
+      upscaleImage = image;
+      upscaleSource = currentUrl;
+      upscalePage = page;
+    } catch (error) {
+      clearUpscale();
+    }
+  }
+
+  function scheduleUpscale() {
+    if (!upscaleEnabled) return;
+    clearTimeout(upscaleTimer);
+    const ticket = ++upscaleTicket;
+    upscaleTimer = setTimeout(() => {
+      if (ticket === upscaleTicket) renderUpscale();
+    }, 160);
+  }
+
+  function syncUpscaleButton() {
+    const button = overlay?.querySelector('.pts-upscale');
+    if (!button) return;
+    button.textContent = upscaleEnabled ? '補間2×: ON' : '補間2×: OFF';
+    button.setAttribute('aria-pressed', upscaleEnabled ? 'true' : 'false');
+    button.title = '端末内の拡大補間（AI超解像ではありません）';
+  }
+
+  function toggleUpscale() {
+    upscaleEnabled = !upscaleEnabled;
+    if (upscaleEnabled) scheduleUpscale();
+    else clearUpscale();
+    syncUpscaleButton();
+  }
 
   /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
 
@@ -1111,7 +1264,9 @@
           )
         );
 
+        if (s.pageIdx !== idx && upscaleOwner === s) clearUpscale();
         s.pageIdx = idx;
+        if (s.isCurrent) scheduleUpscale();
 
         if (s.pageChip) {
           s.pageChip.textContent =
@@ -1314,6 +1469,7 @@
       s.sectionEl?.classList.toggle('pts-current', current);
 
       if (current && !s.isCurrent) {
+        clearUpscale();
         s.isCurrent = true;
 
         if (s.resolved) upgradeSlide(s);
@@ -1330,6 +1486,7 @@
         armWatchdog(s);
 
       } else if (!current && s.isCurrent) {
+        if (upscaleOwner === s) clearUpscale();
         s.isCurrent = false;
         if (s.hiAbort) s.hiAbort.abort();
         stopUgoira(s);
@@ -4206,6 +4363,10 @@
         border-radius:999px;padding:7px 11px;font-size:12px
       }
 
+      #pts-overlay .pts-holder > .pts-upscaled-canvas{
+        position:absolute;inset:0;width:100%;height:100%;
+        pointer-events:none;image-rendering:auto
+      }
       #pts-overlay .pts-img{
         display:block;width:100%;height:100%;
         max-width:100%;max-height:100%;
@@ -4429,6 +4590,8 @@
     };
 
     addButton('pts-history-button', '履歴', showSessionHistory);
+    addButton('pts-upscale', '補間2×: OFF', toggleUpscale);
+    syncUpscaleButton();
 
     // 診断・更新の既存イベントを保持してDOM移動。
     for (const selector of [
@@ -4506,6 +4669,11 @@
       });
 
     bindExperienceGestures();
+    window.addEventListener('resize', scheduleUpscale);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) clearUpscale();
+      else scheduleUpscale();
+    });
     document.addEventListener('keydown', handleViewerKeyboard, true);
 
     document.addEventListener('keydown', e => {
@@ -4586,6 +4754,7 @@
         !searchContextValid(g.rankContext)) return false;
     const current = slides[currentIndex()];
     if (current?.kind === 'ugoira') stopUgoira(current);
+    clearUpscale();
     reconcileSearchGridBookmarks();
     g.open = true;
     g.root.hidden = false;
@@ -4620,6 +4789,7 @@
     }
 
     if (wasOpen && resume) {
+      scheduleUpscale();
       const s = slides[currentIndex()];
       if (s?.isCurrent && s.kind === 'ugoira' &&
           s.frameUrls?.length) {
@@ -6555,6 +6725,7 @@
 
   // スライドの後片付け（タイマー・通信・Blobを残さない。長時間閲覧でのメモリ圧迫対策）
   function cleanupSlide(s) {
+    if (upscaleOwner === s) clearUpscale();
     stopUgoira(s);
     s.ugoiraPlayer=null;
     s.animSeekMs=null;
@@ -8349,6 +8520,7 @@
   }
 
   function closeViewer() {
+    clearUpscale();
     if (contentFilterDialog) { contentFilterDialog.close(); contentFilterDialog.remove(); contentFilterDialog=null; }
     if (!overlay) return;
     tickViewing();
@@ -8403,6 +8575,10 @@
     `;
 
     feedEl = overlay.querySelector('.pts-feed');
+    // 元画像の読み込み完了後に現在表示中の画像だけを補間する。
+    feedEl.addEventListener('load', event => {
+      if (event.target?.matches?.('img.pts-img')) scheduleUpscale();
+    }, true);
 
     overlay.querySelector('.pts-close')
       .addEventListener('click', closeViewer);

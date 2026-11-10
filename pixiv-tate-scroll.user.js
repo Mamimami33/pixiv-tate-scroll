@@ -964,6 +964,12 @@
   let motionInterpolationEnabled = false;
   let motionInterpolationAvailable = true;
 
+  function disableMotionInterpolation() {
+    motionInterpolationAvailable = false;
+    motionInterpolationEnabled = false;
+    syncMotionButton();
+  }
+
   function motionGrayFromImage(image, width, height) {
     const canvas = document.createElement('canvas');
     canvas.width = width; canvas.height = height;
@@ -1058,7 +1064,7 @@
       alpha:false,depth:false,stencil:false,antialias:false,
       preserveDrawingBuffer:false,powerPreference:'low-power'
     });
-    if(!gl){motionInterpolationAvailable=false;return null;}
+    if(!gl){disableMotionInterpolation();return null;}
     const vertex=motionShader(gl,gl.VERTEX_SHADER,`#version 300 es
       out vec2 uv;
       void main(){
@@ -1079,14 +1085,14 @@
       }`);
     if(!vertex||!fragment){
       if(vertex)gl.deleteShader(vertex);if(fragment)gl.deleteShader(fragment);
-      canvas.width=0;canvas.height=0;motionInterpolationAvailable=false;return null;
+      canvas.width=0;canvas.height=0;disableMotionInterpolation();return null;
     }
     const program=gl.createProgram();
     gl.attachShader(program,vertex);gl.attachShader(program,fragment);
     gl.linkProgram(program);gl.deleteShader(vertex);gl.deleteShader(fragment);
     if(!gl.getProgramParameter(program,gl.LINK_STATUS)){
       gl.deleteProgram(program);canvas.width=0;canvas.height=0;
-      motionInterpolationAvailable=false;return null;
+      disableMotionInterpolation();return null;
     }
     const vao=gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -1099,7 +1105,7 @@
       inv:gl.getUniformLocation(program,'invAnalysis')};
     canvas.style.display='none';
     canvas.addEventListener('webglcontextlost',event=>{
-      event.preventDefault();motionInterpolationAvailable=false;
+      event.preventDefault();disableMotionInterpolation();
       releaseUgoiraMotion(s);
     },{once:true});
     holder.appendChild(canvas);
@@ -1188,7 +1194,7 @@
       return true;
     }catch(e){
       releaseUgoiraMotion(s);
-      motionInterpolationAvailable=false;
+      disableMotionInterpolation();
       return false;
     }
   }

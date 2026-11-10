@@ -8,6 +8,7 @@ on:
     paths:
       - 'pixiv-tate-scroll.user.js'
       - 'tests/enhance-only.cjs'
+      - 'tests/ai-tiling.cjs'
       - '.github/workflows/enhance-only.yml'
 
 jobs:
@@ -28,3 +29,7 @@ jobs:
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: node tests/enhance-only.cjs
+      - name: Anime4K CNN tiled real-GPU regression
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/ai-tiling.cjs

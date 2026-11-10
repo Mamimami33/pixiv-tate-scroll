@@ -30,7 +30,9 @@
   let currentImageURL = '';
   let enhancedImage = null;
   let showEnhanced = true;
-  let userGestureFileInput = null;
+  const AI_CNN_LARGE_MAX_PIXELS = 2_000_000;
+  const AI_CNN_TILE_SIDE = 512;
+  const AI_CNN_TILE_PAD = 12;
   let state = null;
   const byId = id => document.getElementById(id);
 
@@ -135,11 +137,13 @@
       throw new Error('PNG/JPEG/WebPを選んでください');
     if (file.size > MAX_IMAGE_FILE_BYTES) throw new Error('画像は18MB以下にしてください');
     resetStage();
+    const token = operationId;
     const url = URL.createObjectURL(file);
     const image = new Image();
     image.src = url;
     try {
       await image.decode();
+      if(token!==operationId || overlay?.hidden){URL.revokeObjectURL(url);return;}
       await showStaticImage(image,url,file.name);
     } catch (err) {
       URL.revokeObjectURL(url); throw err;
@@ -181,7 +185,9 @@
       await loadImageFile(file);
     } catch (error) {
       if(error?.name==='AbortError')return;
-      say('自動読込できません。画像を保存して「画像を選ぶ」から読み込んでください。 '+String(error?.message||error),'error');
+      const media=lastUgoiraMeta?.id===id?'うごイラZIPを保存し「うごイラZIPを選ぶ」':
+        '画像を保存し「画像を選ぶ」';
+      say('自動読込できません。'+media+'から読み込んでください。 '+String(error?.message||error),'error');
     } finally {
       if(idAtStart === operationId) {
         currentRequest=null;showBusy(false);
@@ -305,14 +311,20 @@
     try {
       // Only existing local or legitimately CORS-enabled images; never export pixiv pixels.
       if(!imageSourceAllowed(currentImage))throw new Error('この画像はCORS制限の対象です。端末から選択してください');
-      const canvas=anime4kCnnProcessImage(currentImage);
-      if(!currentImage.isConnected){canvas.width=0;canvas.height=0;return;}
+      const source=currentImage;
+      const ticket=operationId;
+      const canvas=await anime4kCnnProcessLarge(source,
+        ()=>ticket===operationId && source.isConnected && !overlay.hidden,
+        (done,total)=>say('Anime4K CNN：'+done+' / '+total+' タイルを処理しました'));
+      if(!currentImage.isConnected || currentImage!==source || ticket!==operationId){
+        canvas.width=0;canvas.height=0;return;
+      }
       canvas.classList.add('pts-only-enhanced');
       currentImage.parentElement.appendChild(canvas);
       enhancedImage=canvas;showEnhanced=true;
       updateButtons();
       say('AI超解像2×完了。比較ボタンで元画像と切替できます');
-    }catch(error){finishError(error);}
+    }catch(error){if(error?.name!=='AbortError')finishError(error);}
     finally {showBusy(false);}
   }
   function toggleComparison() {
@@ -402,6 +414,9 @@
   const AI_CNN_MAX_OUTPUT_PIXELS = 2_560_000;
 
   function aiCnnCanUseSource(image) {
+    // Internal decoded image tiles are canvases. A tainted Canvas still fails
+    // browser-enforced WebGL tex upload; no cross-origin bypass is attempted.
+    if(image?.tagName==='CANVAS')return image.width>0&&image.height>0;
     const url=String(image?.currentSrc||image?.src||'');
     if(!image?.complete||!image.naturalWidth||!image.naturalHeight)return false;
     if(/^blob:|^data:/i.test(url))return true;
@@ -457,7 +472,7 @@
   }
 
   function anime4kCnnProcessImage(image) {
-    const width=image.naturalWidth, height=image.naturalHeight;
+    const width=image.naturalWidth||image.width, height=image.naturalHeight||image.height;
     if(!aiCnnCanUseSource(image))throw new Error('IMAGE_CORS_OR_UNAVAILABLE');
     if(!Number.isSafeInteger(width)||!Number.isSafeInteger(height)||width<1||height<1||
        width*height>AI_CNN_MAX_INPUT_PIXELS||
@@ -546,6 +561,72 @@
     }
   }
 
+
+
+  // Each tile runs the real trained four-convolution Anime4K CNN. A 12px
+  // margin is larger than the model's receptive field, avoiding tile seams.
+  // This keeps GPU intermediates bounded even for a multi-megapixel image.
+  async function anime4kCnnProcessLarge(image, isCurrent=()=>true, onProgress=()=>{}) {
+    if(!aiCnnCanUseSource(image))throw new Error('画像をGPU処理できません（CORS等）');
+    const width=image.naturalWidth||image.width,height=image.naturalHeight||image.height;
+    if(!Number.isSafeInteger(width)||!Number.isSafeInteger(height) ||
+       width<1||height<1||width*height>AI_CNN_LARGE_MAX_PIXELS){
+      throw new Error('AI超解像の安全上限は元画像200万画素（出力800万画素）です');
+    }
+    if(width*height<=AI_CNN_MAX_INPUT_PIXELS) {
+      if(!isCurrent())throw new DOMException('中断','AbortError');
+      const output=anime4kCnnProcessImage(image);
+      onProgress(1,1);
+      return output;
+    }
+    const full=document.createElement('canvas');
+    full.width=width*2;full.height=height*2;
+    const context=full.getContext('2d',{alpha:false});
+    if(!context)throw new Error('画像の合成用Canvasを使えません');
+    context.imageSmoothingEnabled=false;
+    const nX=Math.ceil(width/AI_CNN_TILE_SIDE),nY=Math.ceil(height/AI_CNN_TILE_SIDE);
+    const total=nX*nY;
+    let done=0;
+    try{
+      for(let row=0;row<nY;row++)for(let col=0;col<nX;col++){
+        if(!isCurrent())throw new DOMException('中断','AbortError');
+        const x=col*AI_CNN_TILE_SIDE,y=row*AI_CNN_TILE_SIDE;
+        const coreWidth=Math.min(AI_CNN_TILE_SIDE,width-x);
+        const coreHeight=Math.min(AI_CNN_TILE_SIDE,height-y);
+        const fromX=Math.max(0,x-AI_CNN_TILE_PAD);
+        const fromY=Math.max(0,y-AI_CNN_TILE_PAD);
+        const toX=Math.min(width,x+coreWidth+AI_CNN_TILE_PAD);
+        const toY=Math.min(height,y+coreHeight+AI_CNN_TILE_PAD);
+        const tile=document.createElement('canvas');
+        tile.width=toX-fromX;tile.height=toY-fromY;
+        let predicted;
+        try{
+          const input=tile.getContext('2d',{alpha:false});
+          if(!input)throw new Error('タイルの入力Canvasを使えません');
+          input.drawImage(image,fromX,fromY,tile.width,tile.height,
+            0,0,tile.width,tile.height);
+          predicted=anime4kCnnProcessImage(tile);
+          // Extract only the tile's unpadded center.
+          context.drawImage(predicted,
+            (x-fromX)*2,(y-fromY)*2,coreWidth*2,coreHeight*2,
+            x*2,y*2,coreWidth*2,coreHeight*2);
+        }finally{
+          if(predicted){predicted.width=0;predicted.height=0;}
+          tile.width=0;tile.height=0;
+        }
+        done++;
+        onProgress(done,total);
+        // Yield to Safari between tiles and honor close/new image immediately.
+        await new Promise(resolve=>requestAnimationFrame(resolve));
+      }
+      if(!isCurrent())throw new DOMException('中断','AbortError');
+      full.className='pts-ai-cnn-canvas';
+      return full;
+    }catch(error){
+      full.width=0;full.height=0;
+      throw error;
+    }
+  }
 
   function inflateRaw(bytes, maxSize = 8 * 1024 * 1024) {
     let pos = 0;

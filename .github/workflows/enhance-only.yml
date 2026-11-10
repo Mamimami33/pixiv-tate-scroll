@@ -11,6 +11,7 @@ on:
       - 'tests/enhance-only.cjs'
       - 'tests/ai-tiling.cjs'
       - 'tests/current-image-inplace.cjs'
+      - 'tests/current-ugoira-inplace.cjs'
       - '.github/workflows/enhance-only.yml'
 
 jobs:
@@ -39,3 +40,7 @@ jobs:
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: node tests/current-image-inplace.cjs
+      - name: Current pixiv ugoira in-place regression
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/current-ugoira-inplace.cjs

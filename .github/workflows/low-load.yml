@@ -14,6 +14,7 @@ on:
       - 'tests/local-upscale.cjs'
       - 'tests/ugoira-motion.cjs'
       - 'tests/anime4k-cnn.cjs'
+      - 'tests/content-filter.cjs'
       - '.github/workflows/low-load.yml'
 
 jobs:
@@ -23,6 +24,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -38,3 +41,9 @@ jobs:
         run: npm install --no-save --no-package-lock --ignore-scripts playwright-core@1.58.2
       - name: Trained Anime4K CNN WebGL2 regression
         run: node tests/anime4k-cnn.cjs
+      - name: Install Playwright UI driver
+        run: npm install --no-save --no-package-lock --ignore-scripts playwright@1.58.2
+      - name: Existing content/filter UI regression (mock network)
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/content-filter.cjs

@@ -224,8 +224,6 @@
 
   /* ---------- うごイラを現在のpixivメディアの位置へ重ねて再生 ---------- */
   function pickVisibleArtworkMedia() {
-    const direct = visiblePixivArtworkImage();
-    if (direct) return direct;
     let best=null, bestScore=0;
     const id=currentArtworkId();
     for(const media of document.querySelectorAll('canvas,video,img')){
@@ -245,7 +243,7 @@
       const d=Math.hypot((r.left+r.right)/2-innerWidth/2,
         (r.top+r.bottom)/2-innerHeight/2);
       const score=vw*vh/(1+d/1400)*
-        ((media.tagName==='CANVAS'||media.tagName==='VIDEO')?1.2:1);
+        ((media.tagName==='CANVAS'||media.tagName==='VIDEO')?1.6:1);
       if(score>bestScore){best=media;bestScore=score;}
     }
     return best;

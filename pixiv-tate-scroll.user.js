@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.2
+// @version      4.0.0-alpha.3
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
 // @grant        GM.xmlHttpRequest
@@ -87,6 +87,7 @@
       if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
     }
     s.frameUrls = null;
+    if (s.motionAnchored) s.sectionEl?.remove();
     state = null;
     slides=[];
   }
@@ -220,6 +221,80 @@
     say('元画質ZIPを1回取得しています…');
     await loadUgoira(zip,frames,signal,token);
   }
+
+  /* ---------- うごイラを現在のpixivメディアの位置へ重ねて再生 ---------- */
+  function pickVisibleArtworkMedia() {
+    const direct = visiblePixivArtworkImage();
+    if (direct) return direct;
+    let best=null, bestScore=0;
+    const id=currentArtworkId();
+    for(const media of document.querySelectorAll('canvas,video,img')){
+      if(media.closest('#pts-only-overlay') ||
+         media.closest('#pts-only-motion-surface') ||
+         media.closest('#pts-only-launch'))continue;
+      const r=media.getBoundingClientRect();
+      const vw=Math.max(0,Math.min(innerWidth,r.right)-Math.max(0,r.left));
+      const vh=Math.max(0,Math.min(innerHeight,r.bottom)-Math.max(0,r.top));
+      if(vw<160||vh<150)continue;
+      if(media.tagName==='IMG'){
+        let src;
+        try{src=new URL(media.currentSrc||media.src||'',location.href);}catch(_){continue;}
+        if(src.hostname!=='i.pximg.net' ||
+          !src.pathname.includes(id))continue;
+      }
+      const d=Math.hypot((r.left+r.right)/2-innerWidth/2,
+        (r.top+r.bottom)/2-innerHeight/2);
+      const score=vw*vh/(1+d/1400)*
+        ((media.tagName==='CANVAS'||media.tagName==='VIDEO')?1.2:1);
+      if(score>bestScore){best=media;bestScore=score;}
+    }
+    return best;
+  }
+
+  function mountUgoiraOnArtwork(s) {
+    const media=pickVisibleArtworkMedia();
+    if(!media)return false;
+    const section=s.sectionEl;
+    if(!section)return false;
+    section.id='pts-only-motion-surface';
+    s.motionAnchored=true;
+    s.followTarget=media;
+    document.body.appendChild(section);
+    overlay.classList.add('pts-only-compact');
+    positionUgoiraOnArtwork();
+    return true;
+  }
+
+  function positionUgoiraOnArtwork() {
+    const s=state;
+    if(!s?.motionAnchored)return;
+    if(!s.followTarget?.isConnected){
+      stopPlayback();
+      say('元の作品の表示が変わったので動き補間を停止しました');
+      updateButtons();
+      return;
+    }
+    const media=s.followTarget,rect=media.getBoundingClientRect();
+    const visible=rect.bottom>0&&rect.top<innerHeight&&rect.right>0&&rect.left<innerWidth;
+    const host=s.sectionEl;
+    if(!visible){
+      host.style.display='none';
+      if(s.animTimer!=null){
+        stopUgoira(s);
+        s.pausedByScroll=true;
+      }
+      return;
+    }
+    Object.assign(host.style,{
+      display:'block',left:rect.left+'px',top:rect.top+'px',
+      width:rect.width+'px',height:rect.height+'px'
+    });
+    if(s.pausedByScroll&&!document.hidden){
+      s.pausedByScroll=false;
+      s.isCurrent=true;
+      startUgoira(s);
+    }
+  }
   async function loadUgoira(zipUrl,frames,signal,token) {
     let urls;
     try {
@@ -239,6 +314,10 @@
         pageChip:null,motionRenderer:null,motionPair:null
       };
       state=s;slides=[s];
+      if(!mountUgoiraOnArtwork(s)) {
+        overlay.classList.remove('pts-only-compact');
+        say('このページで表示中の再生領域が見つからず、プレビューで再生します');
+      }
       startUgoira(s);
       say('うごイラを再生中：動き補間はON/OFF可能。中間フレームは端末内で生成します');
       updateButtons();
@@ -579,6 +658,16 @@
     byId('pts-only-motion').textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
     byId('pts-only-play').disabled=!animated;
     byId('pts-only-play').textContent=state?.animTimer!=null?'一時停止':'再生';
+    const compactMotion=byId('pts-only-current-motion');
+    if(compactMotion){
+      compactMotion.disabled=!animated||!motionInterpolationAvailable;
+      compactMotion.textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
+    }
+    const compactPlay=byId('pts-only-current-play');
+    if(compactPlay){
+      compactPlay.disabled=!animated;
+      compactPlay.textContent=state?.animTimer!=null?'一時停止':'再生';
+    }
     updateInPlaceButtons();
   }
   function togglePlayback() {
@@ -601,6 +690,17 @@
     const css=document.createElement('style');css.id='pts-only-style';
     css.textContent="\n#pts-only-overlay{position:fixed;inset:0;z-index:2147481000;background:#08090c;color:#fff;display:flex;flex-direction:column;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif}\n#pts-only-overlay[hidden]{display:none!important}\n#pts-only-overlay button{cursor:pointer;min-height:44px;border-radius:10px;border:1px solid #667;background:#252b3c;color:#fff;padding:8px 12px;touch-action:manipulation}\n#pts-only-overlay button:disabled{opacity:.42;cursor:default}\n#pts-only-overlay header{display:flex;justify-content:space-between;align-items:center;padding:calc(8px + env(safe-area-inset-top)) 12px 8px;gap:12px}\n#pts-only-overlay strong{font-size:15px}\n#pts-only-controls{display:flex;gap:6px;flex-wrap:wrap;padding:7px 12px;justify-content:center}\n#pts-only-stage{min-height:0;flex:1;position:relative;overflow:hidden;background:#000}\n#pts-only-stage .pts-only-section{position:absolute;inset:0}\n#pts-only-stage .pts-holder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}\n#pts-only-stage img.pts-only-image{width:100%;height:100%;object-fit:contain}\n#pts-only-stage canvas.pts-ugoira-canvas,#pts-only-stage canvas.pts-ugoira-motion-canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none}\n#pts-only-stage canvas.pts-ugoira-motion-canvas{z-index:2}\n#pts-only-stage canvas.pts-only-enhanced{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:2}\n#pts-only-stage canvas.pts-only-enhanced[hidden]{display:none!important}\n#pts-only-status{padding:9px 12px calc(11px + env(safe-area-inset-bottom));min-height:38px;color:#c7cedb;font-size:12px}\n#pts-only-status[data-kind=\"error\"]{color:#ffd6d6}\n#pts-only-overlay.pts-only-busy #pts-only-status{color:#fff8b0}\n";
     css.textContent += `
+#pts-only-motion-surface{
+  position:fixed;z-index:2147480998;pointer-events:none;
+  background:#000;overflow:hidden;
+}
+#pts-only-motion-surface .pts-holder{position:absolute;inset:0}
+#pts-only-motion-surface .pts-ugoira-canvas,
+#pts-only-motion-surface .pts-ugoira-motion-canvas{
+  position:absolute;inset:0;width:100%;height:100%;
+  object-fit:contain;pointer-events:none
+}
+#pts-only-motion-surface .pts-ugoira-motion-canvas{z-index:2}
 #pts-only-overlay.pts-only-compact {
   inset:auto 10px calc(18px + env(safe-area-inset-bottom)) auto;
   width:min(350px,calc(100vw - 20px));height:auto;max-height:75vh;
@@ -622,7 +722,9 @@
     directGroup.id = 'pts-only-controls';
     for (const [id, label, action] of [
       ['pts-only-current','表示中の画像をAI超解像',()=>void enhanceVisiblePixivImage()],
-      ['pts-only-current-compare','元画像に戻す',compareInPlace]
+      ['pts-only-current-compare','元画像に戻す',compareInPlace],
+      ['pts-only-current-motion','動き補間: OFF',toggleMotion],
+      ['pts-only-current-play','一時停止',togglePlayback]
     ]) {
       const button=document.createElement('button');
       button.type='button';button.id=id;button.textContent=label;
@@ -631,6 +733,7 @@
     }
     overlay.insertBefore(directGroup,stage);
     byId('pts-only-close').onclick=closeUI;
+    byId('pts-only-artwork').textContent='うごイラを処理／作品を読み込む';
     byId('pts-only-artwork').onclick=()=>{
       const id=currentArtworkId();
       void loadArtworkImage(id);
@@ -649,7 +752,9 @@
       }
     });
     window.addEventListener('resize',positionInPlace,{passive:true});
+    window.addEventListener('resize',positionUgoiraOnArtwork,{passive:true});
     document.addEventListener('scroll',positionInPlace,true);
+    document.addEventListener('scroll',positionUgoiraOnArtwork,true);
     window.addEventListener('popstate',discardInPlace);
     updateButtons();
   }

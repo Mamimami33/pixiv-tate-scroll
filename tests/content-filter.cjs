@@ -3,7 +3,8 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const {chromium} = require('playwright');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js'),'utf8');
+const source = fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js'),'utf8')
+  .replace('const PIXIV_GET_GAP_MS = 1500;', 'const PIXIV_GET_GAP_MS = 10;'); // mock network, no real pixiv load
 const base = require('node:child_process').execFileSync('git',['show','4d04d45:pixiv-tate-scroll.user.js'],{encoding:'utf8'});
 function functionText(s,name) {
  const start=s.indexOf('  function '+name+'(');

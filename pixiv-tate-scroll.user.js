@@ -119,7 +119,8 @@
         return;
       }
 
-      pixivGetQueue.sort((x, y) => (y.priority - x.priority) || (x.sequence - y.sequence));
+      const score = job => typeof job.priority === 'function' ? job.priority() : job.priority;
+      pixivGetQueue.sort((x, y) => (score(y) - score(x)) || (x.sequence - y.sequence));
       const job = pixivGetQueue.shift();
       if (job.done) continue;
       if (job.options.signal?.aborted || (job.shouldRun && !job.shouldRun())) {
@@ -174,7 +175,8 @@
         reject(new Error('pixivへのGET通信を一時停止しています'));
         return;
       }
-      if (pixivGetQueue.length >= 48 && priority <= 0) {
+      const initialPriority = typeof priority === 'function' ? priority() : priority;
+      if (pixivGetQueue.length >= 48 && initialPriority <= 0) {
         reject(new Error('通信待ちが多いため、新しい候補取得を見送りました'));
         return;
       }
@@ -275,7 +277,10 @@
     const cacheMode = s.forceRefetch ? 'no-store' : undefined;
     const get = (path, sig) =>
       fetchJson(path, sig, cacheMode,
-        () => !signal?.aborted && s.contentFilterEpoch === contentFilterEpoch && slides.includes(s), 10);
+        () => !signal?.aborted && s.contentFilterEpoch === contentFilterEpoch &&
+          slides.includes(s) && (s.isCurrent ||
+            Math.abs(slides.indexOf(s) - currentIndex()) <= 2),
+        () => s.isCurrent ? 10 : -2);
 
     try {
       const body = await get(`/ajax/illust/${s.id}`, signal);
@@ -1004,6 +1009,7 @@
     });
     if (!s.resolved) resolveSlide(s);
     if (s.kind === 'ugoira' && !s.frameUrls && s.resolved) prepareUgoira(s);
+    else if (s.kind === 'ugoira' && s.frameUrls && !s.hiRunning) void upgradeUgoiraHiRes(s);
   }
 
   // 画像の読み込みを強制的にやり直す（壊れて終わっているときだけ。読み込み途中では呼ばない）
@@ -1314,7 +1320,10 @@
         else void resolveSlide(s);
 
         if (s.kind === 'ugoira') {
-          if (s.frameUrls?.length) startUgoira(s);
+          if (s.frameUrls?.length) {
+            startUgoira(s);
+            if (!s.hiRunning) void upgradeUgoiraHiRes(s);
+          }
           else if (s.resolved) void prepareUgoira(s);
         }
 

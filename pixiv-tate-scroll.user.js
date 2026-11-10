@@ -850,7 +850,7 @@
   function syncAiCnnButton(){
     const button=overlay?.querySelector('.pts-ai-cnn');
     if(!button)return;
-    button.textContent=aiCnnCanvas?'AI超解像: ON':'AI超解像';
+    button.textContent=aiCnnCanvas?'AI超解像: ON':'AI超解像(保存画像)';
     button.disabled=aiCnnBusy;
     button.title='学習済みAnime4K CNN x2。pixiv CDNのCORS制限がある画像はローカルファイルを選択。';
   }
@@ -873,6 +873,7 @@
     try{
       const result=anime4kCnnProcessImage(image);
       if(ticket!==aiCnnTicket || slides[currentIndex()]!==where.s ||
+        (where.s.kind==='multi' && (where.s.pageIdx||0)!==where.page) ||
         !where.target.isConnected || overlay?.style.display==='none'){
         result.width=0;result.height=0;return;
       }
@@ -893,6 +894,8 @@
     input.type='file';input.accept='image/png,image/jpeg,image/webp';
     input.style.display='none';
     overlay.appendChild(input);
+    const ticket=++aiCnnTicket;
+    input.addEventListener('cancel',()=>input.remove(),{once:true});
     input.addEventListener('change',async()=>{
       try{
         const file=input.files?.[0];
@@ -906,8 +909,9 @@
           const img=new Image();
           img.src=url;
           await img.decode();
-          if(slides[currentIndex()]!==where.s)return;
-          await aiCnnApplyImage(img,where,aiCnnTicket);
+          if(ticket!==aiCnnTicket || slides[currentIndex()]!==where.s ||
+            (where.s.kind==='multi' && (where.s.pageIdx||0)!==where.page))return;
+          await aiCnnApplyImage(img,where,ticket);
         }finally{URL.revokeObjectURL(url);}
       }catch(error){
         console.warn('[PTS AI CNN local]',error);

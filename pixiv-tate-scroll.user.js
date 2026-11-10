@@ -1,389 +1,660 @@
 // ==UserScript==
-// @name         pixiv縦スクロール
-// @namespace    muse.mamiya
-// @version      3.13.22
-// @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
-// @match        https://www.pixiv.net/*
+// @name         pixiv 高画質化・フレーム補間専用
+// @namespace    mamiya.pixiv.enhance.only
+// @version      4.0.0-alpha.1
+// @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
+// @match        https://www.pixiv.net/artworks/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
 (async function () {
   'use strict';
+  if (window.__ptsEnhanceOnlyLoaded) return;
+  window.__ptsEnhanceOnlyLoaded = true;
 
-  if (window.__ptsLoaded) {
-    return;
-  }
-  window.__ptsLoaded = true;
-
+  // Explicit user operation only. No polling, feed discovery, bookmark, ranking or telemetry.
+  const ZIP_MAX_BYTES = 64 * 1024 * 1024;
+  const MAX_IMAGE_FILE_BYTES = 18 * 1024 * 1024;
   let overlay = null;
-  // ユーザーが閉じた後は、ページ再読み込みまで自動起動しない。
-  let routeAutoStartSuppressed = false;
-  let feedEl = null;
+  let stage = null;
   let slides = [];
-  let mode = 'custom'; // 'custom' | 'search'
-  let nearObs = null;
-  // 画像サーバーへの接続を先に温めておく（初回表示の高速化）
-  const pc = document.createElement('link');
-  pc.rel = 'preconnect';
-  pc.href = 'https://i.pximg.net';
-  pc.crossOrigin = 'anonymous';
-  document.head.appendChild(pc);
+  let searchGrid = {open:false};
+  let preferOriginalUgoira = true;
+  let currentRequest = null;
+  let operationId = 0;
+  let sessionBlocked = false;
+  let lastSiteRequest = 0;
+  let lastUgoiraMeta = null;
+  let currentImage = null;
+  let currentImageURL = '';
+  let enhancedImage = null;
+  let showEnhanced = true;
+  const AI_CNN_LARGE_MAX_PIXELS = 2_000_000;
+  const AI_CNN_TILE_SIDE = 512;
+  const AI_CNN_TILE_PAD = 12;
+  let state = null;
+  const byId = id => document.getElementById(id);
 
-
-  function pickPair(urls) {
-    if (!urls) return { r: '', o: '' };
-    return { r: urls.regular || urls.original || '', o: urls.original || urls.regular || '' };
+  function currentArtworkId() {
+    const match = location.pathname.match(/^\/artworks\/(\d+)(?:\/|$)/);
+    return match ? match[1] : '';
   }
-
-  /* ---------- ページ内スキャン（3段構え） ---------- */
-
-
-
-  function newSlide(id, thumb, title, author) {
-    return {
-      id, thumb: thumb || '', title: title || '', author: author || '',
-      page: `https://www.pixiv.net/artworks/${id}`,
-      resolved: false, resolving: false, kind: 'single', // 'single' | 'multi' | 'ugoira'
-      pairs: null, // [{r: 1200px, o: 元画像}]
-      frames: null, zipUrl: null, frameBase: null, frameExt: null,
-      sectionEl: null, mainImg: null, titleEl: null, authorEl: null, pageChip: null,
-      animTimer: null, animIdx: 0, frameUrls: null, isCurrent: false,
-      ugoiraPlayer:null, ugoiraCanvas:null, animSeekMs:null,
-      tags: null, userId: null, bookmarked: false, bookmarkBtn: null,
-    };
-  }
-
-
-  /* ---------- 作品情報の解決（元画像・複数枚・うごイラ） ---------- */
-
-  function upgradeUrl(url) {
-    if (!url) return '';
-    let u = url.replace(/^https:\/\/i\.pximg\.net\/c\/[^/]+\//, 'https://i.pximg.net/');
-    u = u.replace(/_(square1200|custom1200)\.(\w+)$/, '_p0_master1200.jpg');
-    return u;
-  }
-
-  async function fetchJson(url, signal, cacheMode) {
-    const options = {
-      method: 'GET',
-      credentials: 'same-origin',
-      signal
-    };
-
-    if (cacheMode) options.cache = cacheMode;
-
-    const res = await fetch(url, options);
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
+  function say(message, kind) {
+    const element = byId('pts-only-status');
+    if (element) {
+      element.textContent = String(message || '');
+      element.dataset.kind = kind || 'neutral';
     }
-
-    const json = await res.json();
-
-    if (!json || typeof json !== 'object') {
-      throw new Error('JSON形式が不正');
-    }
-
-    if (json.error) {
-      throw new Error(json.message || 'api error');
-    }
-
-    if (json.body == null) {
-      throw new Error('API bodyがありません');
-    }
-
-    return json.body;
   }
-
-  // 解決処理はPromiseを共有する（同じ作品に二重で走らせない。ChatGPTレビュー反映）
-  function resolveSlide(s) {
-    if (s.contentBlocked) return Promise.resolve();
-    if (s.resolved) return Promise.resolve();
-    if (s.resolvePromise) return s.resolvePromise;
-    s.resolving = true;
-    const ctrl = new AbortController();
-    s.resolveAbort = ctrl;
-    s.resolvePromise = resolveSlideImpl(s, ctrl.signal)
-      .catch(() => {})
-      .finally(() => {
-        s.resolving = false;
-        s.resolvePromise = null;
-        s.resolveAbort = null;
-      });
-    return s.resolvePromise;
-  }
-
-  function seriesNextId(nav) {
-    if (!nav || typeof nav !== 'object') return null;
-
-    const options = [
-      nav.next, nav.nextIllust, nav.nextArtwork,
-      nav.nextWork, nav.nextEpisode,
-      nav.nextIllustId, nav.nextId
-    ];
-
-    for (const value of options) {
-      const id = value && typeof value === 'object'
-        ? (value.id ?? value.illustId ??
-           value.illust?.id ?? value.work?.id)
-        : value;
-
-      if (id != null && /^\d+$/.test(String(id))) {
-        return String(id);
-      }
+  function showBusy(busy) {
+    overlay?.classList.toggle('pts-only-busy', !!busy);
+    for (const button of overlay?.querySelectorAll('button[data-operation]') || []) {
+      button.disabled = !!busy;
     }
-
-    return null;
   }
-
-  async function resolveSlideImpl(s, signal) {
-    const cacheMode = s.forceRefetch ? 'no-store' : undefined;
-    const get = (path, sig) =>
-      fetchJson(path, sig, cacheMode);
-
+  function cancelRequest() {
+    operationId++;
+    currentRequest?.abort();
+    currentRequest = null;
+    showBusy(false);
+  }
+  function releaseImage() {
+    if (enhancedImage) {
+      enhancedImage.remove(); enhancedImage.width = 0; enhancedImage.height = 0;
+    }
+    enhancedImage = null;
+    if (currentImage) currentImage.remove();
+    currentImage = null;
+    if (currentImageURL.startsWith('blob:')) URL.revokeObjectURL(currentImageURL);
+    currentImageURL = '';
+  }
+  function stopPlayback() {
+    const s = state;
+    if (!s) return;
+    s.isCurrent = false;
+    try { stopUgoira(s); releaseUgoiraCanvas(s); } catch (_) {}
+    for (const url of s.frameUrls || []) {
+      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    }
+    s.frameUrls = null;
+    state = null;
+    slides=[];
+  }
+  function resetStage() {
+    cancelRequest();
+    stopPlayback();
+    releaseImage();
+    if (stage) stage.replaceChildren();
+  }
+  function createHolder() {
+    const section = document.createElement('section');
+    section.className = 'pts-only-section';
+    const holder = document.createElement('div');
+    holder.className = 'pts-holder';
+    section.appendChild(holder);
+    stage.replaceChildren(section);
+    return {section, holder};
+  }
+  function ensureOpen() {
+    createUI();
+    overlay.hidden = false;
+  }
+  function finishError(error) {
+    say(error?.message || String(error), 'error');
+    console.warn('[PTS enhance]', error);
+  }
+  async function fetchPixivJson(url, signal) {
+    if (sessionBlocked) throw new Error('アクセス制限が発生したため、通信を停止しています');
+    const res = await fetch(url, {credentials:'same-origin',signal});
+    if (res.status === 429) {
+      sessionBlocked = true;
+      throw new Error('pixivがHTTP 429を返しました。追加通信は停止します');
+    }
+    if (!res.ok) throw new Error('pixiv API HTTP '+res.status);
+    const data = await res.json();
+    if (data?.error || !data?.body) throw new Error(data?.message || '作品情報を取得できません');
+    return data.body;
+  }
+  function imageSourceAllowed(img) {
+    return aiCnnCanUseSource(img);
+  }
+  async function showStaticImage(img, sourceUrl, title) {
+    resetStage();
+    ensureOpen();
+    const {holder} = createHolder();
+    const image = img;
+    image.className = 'pts-only-image';
+    image.alt = title || '画像';
+    holder.appendChild(image);
+    currentImage = image;
+    currentImageURL = sourceUrl || '';
+    say('画像を読み込みました。「AI超解像2×」で画質を処理できます');
+    updateButtons();
+  }
+  async function loadImageFile(file) {
+    if (!file || !/^image\/(png|jpeg|webp)$/i.test(file.type))
+      throw new Error('PNG/JPEG/WebPを選んでください');
+    if (file.size > MAX_IMAGE_FILE_BYTES) throw new Error('画像は18MB以下にしてください');
+    resetStage();
+    const token = operationId;
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.src = url;
     try {
-      const body = await get(`/ajax/illust/${s.id}`, signal);
-
-      if (signal?.aborted || s.contentFilterEpoch !== contentFilterEpoch || !slides.includes(s)) return;
-      if (!contentMatches(body)) {
-        s.rawType = contentEnum(body.illustType);
-        s.xRestrict = contentEnum(body.xRestrict);
-        s.contentBlocked = true;
-        cleanupSlide(s);
-        s.sectionEl?.replaceChildren();
-        if (s.sectionEl) s.sectionEl.textContent = contentEmptyMessage();
-        s.isCurrent = false;
-        if (activeView?.slide === s) activeView = null;
+      await image.decode();
+      if(token!==operationId || overlay?.hidden){URL.revokeObjectURL(url);return;}
+      await showStaticImage(image,url,file.name);
+    } catch (err) {
+      URL.revokeObjectURL(url); throw err;
+    }
+  }
+  async function loadArtworkImage(id) {
+    resetStage();
+    ensureOpen();
+    if (!id) throw new Error('pixiv作品ページを開いてください');
+    if(sessionBlocked)throw new Error('アクセス制限後の通信は停止しています');
+    const now=Date.now();
+    if(now-lastSiteRequest<5000)throw new Error('連続アクセスを防ぐため、5秒間隔で操作してください');
+    lastSiteRequest=now;
+    const controller = new AbortController();
+    currentRequest = controller;
+    const idAtStart = ++operationId;
+    showBusy(true);
+    try {
+      say('作品情報を取得しています…');
+      const meta = await fetchPixivJson('/ajax/illust/'+id,controller.signal);
+      if (idAtStart !== operationId) return;
+      if(Number(meta.illustType) === 2) {
+        await loadArtworkUgoiraMeta(id,controller.signal,idAtStart);
         return;
       }
-
-      s.createDate = body.createDate || s.createDate || null;
-      s.seriesNextId = seriesNextId(body.seriesNavData);
-      s.series = parseArtworkSeries(body);
-      s.seriesInfoChecked = true;
-      if(s.isCurrent)syncSeriesBar();
-      if (!contentMatches(body) || s.contentFilterEpoch !== contentFilterEpoch || signal?.aborted) return;
-      s.rawType = contentEnum(body.illustType);
-      s.xRestrict = contentEnum(body.xRestrict);
-      s.tags = normTags(body.tags);
-      s.userId = body.userId == null
-        ? null : String(body.userId);
-      if (s.isCurrent) syncDock();
-
-      s.bookmarked = s.bookmarked ||
-        knownBookmarkedIds.has(String(s.id)) ||
-        !!body.bookmarkData;
-
-      if (s.bookmarked) {
-        knownBookmarkedIds.add(String(s.id));
-
-        if (!s.tasteLearned &&
-            !bookmarkHistory.works.some(w =>
-              String(w.id) === String(s.id))) {
-          learnFromWork(s.tags, s.userId, s.rawType, LEARN_BOOKMARK_WEIGHT, false);
-          s.tasteLearned = true;
-        }
-      }
-
-      paintBookmarkBtn(s);
-      if (s.bookmarked) syncSearchGridBookmark(s.id);
-      if (s.isCurrent) syncDock();
-
-      if (body.title && !s.title) {
-        s.title = body.title;
-        if (s.titleEl) s.titleEl.textContent = s.title;
-      }
-
-      if (body.userName) {
-        s.author = body.userName;
-        if (s.authorEl) s.authorEl.textContent = s.author;
-      }
-
-      const pageCount = Number(body.pageCount) || 1;
-
-      if (s.rawType === 2) {
-        s.kind = 'ugoira';
-        setUgoiraStatus(s, 'loading');
-
-        try {
-          const meta = await get(
-            `/ajax/illust/${s.id}/ugoira_meta`,
-            signal
-          );
-
-          if (signal?.aborted) return;
-
-          s.zipSmall = meta.src || null;
-          s.zipFull = meta.originalSrc || null;
-          s.zipUrl = s.zipSmall || s.zipFull;
-          s.frames = Array.isArray(meta.frames)
-            ? meta.frames : null;
-
-          if (!s.zipUrl) s.ugoiraError = 'ZIPなし';
-          else if (!s.frames?.length) {
-            s.ugoiraError = 'フレーム情報なし';
-          }
-        } catch (e) {
-          if (signal?.aborted) return;
-          s.ugoiraError = 'メタ取得失敗: ' +
-            (e?.message || String(e));
-        }
-
-        const pair = pickPair(body.urls);
-        s.pairs = [pair];
-
-        const m = (pair.o || '')
-          .match(/^(.*_ugoira)0(\.\w+)$/);
-
-        if (m) {
-          s.frameBase = m[1];
-          s.frameExt = m[2];
-        }
-
-        if (s.ugoiraError) {
-          setUgoiraStatus(s, 'error', s.ugoiraError);
-        }
-
-      } else if (pageCount > 1) {
-        s.kind = 'multi';
-        setUgoiraStatus(s, 'none');
-
-        try {
-          const pages = await get(
-            `/ajax/illust/${s.id}/pages`,
-            signal
-          );
-
-          if (signal?.aborted) return;
-
-          s.pairs = pages.map(p => pickPair(p.urls));
-
-        } catch (e) {
-          if (signal?.aborted) return;
-          s.pairs = [pickPair(body.urls)];
-          s.kind = 'single';
-        }
-
-      } else {
-        s.kind = 'single';
-        s.pairs = [pickPair(body.urls)];
-        setUgoiraStatus(s, 'none');
-      }
-
-    } catch (e) {
-      if (signal?.aborted) return;
-
-      s.resolveError = e?.message || String(e);
-
-      if (Number(s.rawType) === 2 || s.kind === 'ugoira') {
-        setUgoiraStatus(s, 'error', s.resolveError);
-      } else {
-        setUgoiraStatus(s, 'none');
-      }
-
-      s.kind = 'single';
-      const u = upgradeUrl(s.thumb) || s.thumb;
-      s.pairs = [{ r: u, o: u }];
-    }
-
-    if (signal?.aborted) return;
-
-    s.resolved = true;
-    applyResolved(s);
-    upgradeSlide(s);
-  }
-
-  // 表示レベルに応じて画像を差し替える：表示中は元画像、近くは1200px
-  function levelUrl(s, pair) {
-    if (!pair) return s.thumb;
-    return s.isCurrent
-      ? (pair.o || pair.r)
-      : (pair.r || pair.o);
-  }
-
-  // 複数枚作品：表示中ページの前後だけ画像を読み込む
-  function loadHorizontalNeighbors(s, idx) {
-    if (!s.sectionEl) return;
-    const imgs = s.sectionEl.querySelectorAll('.pts-page img');
-    for (let i = Math.max(0, idx - 1); i <= Math.min(imgs.length - 1, idx + 1); i++) {
-      const im = imgs[i];
-      if (im && im.dataset && im.dataset.src && !im.getAttribute('src')) {
-        im.src = im.dataset.src;
-        delete im.dataset.src;
+      const url = meta.urls?.original || meta.urls?.regular;
+      if (!url) throw new Error('この作品の画像URLが取得できません');
+      say('元画像を取得しています（CORS非対応なら保存画像を選択）…');
+      // Do not bypass browser CORS or route through an external image proxy.
+      const response = await fetch(url,{mode:'cors',credentials:'omit',signal:controller.signal});
+      if(response.status===429)sessionBlocked=true;
+      if(!response.ok)throw new Error('元画像の取得に失敗: HTTP '+response.status);
+      const size=Number(response.headers.get('content-length')||0);
+      if(size>MAX_IMAGE_FILE_BYTES)throw new Error('画像サイズが18MBを超えています');
+      const blob=await response.blob();
+      if(blob.size>MAX_IMAGE_FILE_BYTES)throw new Error('画像サイズが18MBを超えています');
+      if(idAtStart!==operationId)return;
+      const file=new File([blob],id+'.png',{type:blob.type||'image/png'});
+      await loadImageFile(file);
+    } catch (error) {
+      if(error?.name==='AbortError')return;
+      const media=lastUgoiraMeta?.id===id?'うごイラZIPを保存し「うごイラZIPを選ぶ」':
+        '画像を保存し「画像を選ぶ」';
+      say('自動読込できません。'+media+'から読み込んでください。 '+String(error?.message||error),'error');
+    } finally {
+      if(idAtStart === operationId) {
+        currentRequest=null;showBusy(false);
       }
     }
   }
-
-  // 元画像への差し替えは「裏で読み切ってから」行い、表示中の画像は絶対に格下げしない（消える・遅くなる元）
-  function swapToOriginal(s, img, pair) {
-    if (!pair || !pair.o || s.origLoading) return;
-    const cur = img.getAttribute('src') || '';
-    if (cur.includes(pair.o)) return;
-    s.origLoading = true;
-    const pre = new Image();
-    pre.decoding = 'async';
-    try { pre.fetchPriority = 'high'; } catch (e) {}
-    pre.src = pair.o;
-    const done = () => {
-      s.origLoading = false;
-      if ((img.getAttribute('src') || '').includes(pair.o)) return;
-      if (img.isConnected) img.src = pair.o;
-    };
-    // 読み込みだけでなくデコードまで終わってから差し替える（差し替え直後の白飛び・引っかかり防止）
-    if (pre.decode) pre.decode().then(done).catch(() => { s.origLoading = false; });
-    else { pre.onload = done; pre.onerror = () => { s.origLoading = false; }; }
+  async function loadArtworkUgoiraMeta(id,signal,token) {
+    say('うごイラのフレーム情報を取得しています…');
+    const meta=await fetchPixivJson('/ajax/illust/'+id+'/ugoira_meta',signal);
+    if(token!==operationId)return;
+    const frames=meta?.frames;
+    if(!Array.isArray(frames) || frames.length<2 || frames.length>120) {
+      throw new Error('このうごイラはフレーム数の安全上限（2〜120）外です');
+    }
+    lastUgoiraMeta={id,frames:frames.map(item=>({file:String(item.file||''),delay:Number(item.delay)||100}))};
+    const zip=meta.originalSrc||meta.src;
+    if(!zip)throw new Error('うごイラZIPのURLがありません');
+    say('元画質ZIPを1回取得しています…');
+    await loadUgoira(zip,frames,signal,token);
   }
-
-  function upgradeSlide(s, force) {
-    if (!contentMatches(s) || !s.resolved || !s.pairs) return;
-
-    const holder = s.sectionEl?.querySelector('.pts-holder');
-    if (!holder) return;
-
-    if (s.kind === 'multi') {
-      const imgs = holder.querySelectorAll('.pts-page img');
-
-      imgs.forEach((im, i) => {
-        const pair = s.pairs[i];
-        if (!pair) return;
-
-        if (force) {
-          const target = levelUrl(s, pair);
-          if (target && im.getAttribute('src') !== target) {
-            im.src = target;
-          }
-        } else if (s.isCurrent && i === (s.pageIdx || 0)) {
-          swapToOriginal(s, im, pair);
-        }
-      });
-
-      s.mainImg =
-        imgs[s.pageIdx || 0] || imgs[0] || s.mainImg;
-
+  async function loadUgoira(zipUrl,frames,signal,token) {
+    let urls;
+    try {
+      urls=await unzipFrames(zipUrl,frames,signal);
+      if(token!==operationId) {
+        urls.forEach(url=>{if(url?.startsWith('blob:'))URL.revokeObjectURL(url);});
+        return;
+      }
+      if(urls.filter(Boolean).length<2)throw new Error('有効なフレームが不足しています');
+      stopPlayback();releaseImage();
+      const {section}=createHolder();
+      const s={
+        id:currentArtworkId(),kind:'ugoira',sectionEl:section,frameUrls:urls,frames,
+        isCurrent:true,ugoiraPlayer:null,ugoiraCanvas:null,animTimer:null,
+        animSeekMs:0,seekDragging:false,seekEl:null,seekFill:null,seekKnob:null,
+        pageChip:null,motionRenderer:null,motionPair:null
+      };
+      state=s;slides=[s];
+      startUgoira(s);
+      say('うごイラを再生中：動き補間はON/OFF可能。中間フレームは端末内で生成します');
+      updateButtons();
+      urls=null;
+    } finally {
+      if(urls)urls.forEach(url=>{if(url?.startsWith('blob:'))URL.revokeObjectURL(url);});
+    }
+  }
+  function chooseFile(accept, handler) {
+    const input = document.createElement('input');
+    input.type='file';input.accept=accept;input.hidden=true;
+    overlay.appendChild(input);
+    input.addEventListener('change', async()=>{
+      try {
+        const file=input.files?.[0];
+        if(!file)return;
+        await handler(file);
+      }catch(error){finishError(error);}
+      finally {input.remove();}
+    },{once:true});
+    input.addEventListener('cancel',()=>input.remove(),{once:true});
+    input.click();
+  }
+  function chooseImage() {
+    chooseFile('image/png,image/jpeg,image/webp', loadImageFile);
+  }
+  async function loadUgoiraZipFile(file) {
+    if(!file||! /\.zip$/i.test(file.name))throw new Error('ZIPファイルを選んでください');
+    if(file.size>ZIP_MAX_BYTES)throw new Error('ZIPは64MB以下にしてください');
+    resetStage();
+    ensureOpen();
+    const url=URL.createObjectURL(file);
+    const token=++operationId;
+    const signal=(currentRequest=new AbortController()).signal;
+    showBusy(true);
+    try {
+      say('ZIPのフレームを検査しています…');
+      const bytes=await file.arrayBuffer();
+      const names=listZipImageEntries(bytes);
+      if(names.length<2||names.length>120)throw new Error('ZIP内画像は2〜120枚にしてください');
+      // ZIPにはtimingが含まれない場合がある。後からpixiv APIの遅延を適用しない。
+      const timings=new Map((lastUgoiraMeta?.id===currentArtworkId()?lastUgoiraMeta.frames:[])
+        .map(item=>[item.file,item.delay]));
+      const accurate=names.length>0 && names.every(name=>timings.has(name));
+      const frames=names.map(name=>({file:name,delay:accurate?timings.get(name):100}));
+      say(accurate?'pixivの正確なフレーム間隔でZIPを展開しています…':
+        'ZIPを展開しています（時間情報なし：既定100ms/フレーム）…');
+      await loadUgoira(url,frames,signal,token);
+    } finally {
+      URL.revokeObjectURL(url);
+      if(token===operationId){currentRequest=null;showBusy(false);}
+    }
+  }
+  function listZipImageEntries(buf) {
+    const view=new DataView(buf);
+    let eocd=-1;
+    for(let i=buf.byteLength-22;i>=Math.max(0,buf.byteLength-22-65536);i--){
+      if(view.getUint32(i,true)===0x06054b50){eocd=i;break;}
+    }
+    if(eocd<0)throw new Error('ZIPの終端が見つかりません');
+    const count=view.getUint16(eocd+10,true);
+    let offset=view.getUint32(eocd+16,true);
+    const names=[];
+    for(let n=0;n<count;n++){
+      if(offset+46>buf.byteLength||view.getUint32(offset,true)!==0x02014b50)break;
+      const len=view.getUint16(offset+28,true),extra=view.getUint16(offset+30,true),
+        comment=view.getUint16(offset+32,true);
+      if(offset+46+len+extra+comment>buf.byteLength)throw new Error('ZIPヘッダー範囲不正');
+      const name=new TextDecoder().decode(new Uint8Array(buf,offset+46,len));
+      if(/\.(?:png|jpg|jpeg)$/i.test(name) && !name.startsWith('__MACOSX/'))names.push(name);
+      offset+=46+len+extra+comment;
+      if(names.length>120)throw new Error('画像数は120枚以下にしてください');
+    }
+    return names.sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+  }
+  async function applySuperResolution() {
+    if (!currentImage || !currentImage.isConnected) {
+      say('先に画像を読み込んでください','error');return;
+    }
+    if(enhancedImage){toggleComparison();return;}
+    showBusy(true);
+    say('Anime4K CNN x2でGPU推論を実行しています…');
+    try {
+      // Only existing local or legitimately CORS-enabled images; never export pixiv pixels.
+      if(!imageSourceAllowed(currentImage))throw new Error('この画像はCORS制限の対象です。端末から選択してください');
+      const source=currentImage;
+      const ticket=operationId;
+      const canvas=await anime4kCnnProcessLarge(source,
+        ()=>ticket===operationId && source.isConnected && !overlay.hidden,
+        (done,total)=>say('Anime4K CNN：'+done+' / '+total+' タイルを処理しました'));
+      if(!currentImage.isConnected || currentImage!==source || ticket!==operationId){
+        canvas.width=0;canvas.height=0;return;
+      }
+      canvas.classList.add('pts-only-enhanced');
+      currentImage.parentElement.appendChild(canvas);
+      enhancedImage=canvas;showEnhanced=true;
+      updateButtons();
+      say('AI超解像2×完了。比較ボタンで元画像と切替できます');
+    }catch(error){if(error?.name!=='AbortError')finishError(error);}
+    finally {showBusy(false);}
+  }
+  function toggleComparison() {
+    if(!enhancedImage)return;
+    showEnhanced=!showEnhanced;
+    enhancedImage.hidden=!showEnhanced;
+    updateButtons();
+    say(showEnhanced?'AI超解像を表示中':'元画像を表示中');
+  }
+  function toggleMotion() {
+    motionInterpolationEnabled=!motionInterpolationEnabled;
+    if(!motionInterpolationEnabled && state)releaseUgoiraMotion(state);
+    syncMotionButton();updateButtons();
+  }
+  function updateButtons() {
+    const still=!!currentImage,animated=!!state;
+    byId('pts-only-upscale').disabled=!still;
+    byId('pts-only-compare').disabled=!enhancedImage;
+    byId('pts-only-compare').textContent=showEnhanced?'元画像を見る':'AI結果を見る';
+    byId('pts-only-motion').disabled=!animated||!motionInterpolationAvailable;
+    byId('pts-only-motion').textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
+    byId('pts-only-play').disabled=!animated;
+    byId('pts-only-play').textContent=state?.animTimer!=null?'一時停止':'再生';
+  }
+  function togglePlayback() {
+    if(!state)return;
+    if(state.animTimer!=null) {
+      stopUgoira(state);
+      say('一時停止中');
     } else {
-      const pair = s.pairs[0];
-
-      if (s.mainImg && pair) {
-        if (force) {
-          const target = levelUrl(s, pair);
-          if (target && s.mainImg.getAttribute('src') !== target) {
-            s.mainImg.src = target;
-          }
-        } else if (s.isCurrent && s.kind !== 'ugoira') {
-          swapToOriginal(s, s.mainImg, pair);
-        }
+      state.isCurrent=true;
+      startUgoira(state);
+      say('再生中');
+    }
+    updateButtons();
+  }
+  function closeUI() {
+    resetStage();overlay.hidden=true;updateButtons();
+  }
+  function createUI() {
+    if(overlay)return;
+    const css=document.createElement('style');css.id='pts-only-style';
+    css.textContent="\n#pts-only-overlay{position:fixed;inset:0;z-index:2147481000;background:#08090c;color:#fff;display:flex;flex-direction:column;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif}\n#pts-only-overlay[hidden]{display:none!important}\n#pts-only-overlay button{cursor:pointer;min-height:44px;border-radius:10px;border:1px solid #667;background:#252b3c;color:#fff;padding:8px 12px;touch-action:manipulation}\n#pts-only-overlay button:disabled{opacity:.42;cursor:default}\n#pts-only-overlay header{display:flex;justify-content:space-between;align-items:center;padding:calc(8px + env(safe-area-inset-top)) 12px 8px;gap:12px}\n#pts-only-overlay strong{font-size:15px}\n#pts-only-controls{display:flex;gap:6px;flex-wrap:wrap;padding:7px 12px;justify-content:center}\n#pts-only-stage{min-height:0;flex:1;position:relative;overflow:hidden;background:#000}\n#pts-only-stage .pts-only-section{position:absolute;inset:0}\n#pts-only-stage .pts-holder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}\n#pts-only-stage img.pts-only-image{width:100%;height:100%;object-fit:contain}\n#pts-only-stage canvas.pts-ugoira-canvas,#pts-only-stage canvas.pts-ugoira-motion-canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none}\n#pts-only-stage canvas.pts-ugoira-motion-canvas{z-index:2}\n#pts-only-stage canvas.pts-only-enhanced{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:2}\n#pts-only-stage canvas.pts-only-enhanced[hidden]{display:none!important}\n#pts-only-status{padding:9px 12px calc(11px + env(safe-area-inset-bottom));min-height:38px;color:#c7cedb;font-size:12px}\n#pts-only-status[data-kind=\"error\"]{color:#ffd6d6}\n#pts-only-overlay.pts-only-busy #pts-only-status{color:#fff8b0}\n";
+    document.head.appendChild(css);
+    overlay=document.createElement('div');
+    overlay.id='pts-only-overlay';overlay.hidden=true;
+    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
+    document.body.appendChild(overlay);
+    stage=byId('pts-only-stage');
+    byId('pts-only-close').onclick=closeUI;
+    byId('pts-only-artwork').onclick=()=>{
+      const id=currentArtworkId();
+      void loadArtworkImage(id);
+    };
+    byId('pts-only-file').onclick=chooseImage;
+    byId('pts-only-zip').onclick=()=>chooseFile('.zip,application/zip',loadUgoiraZipFile);
+    byId('pts-only-upscale').onclick=()=>void applySuperResolution();
+    byId('pts-only-compare').onclick=toggleComparison;
+    byId('pts-only-motion').onclick=toggleMotion;
+    byId('pts-only-play').onclick=togglePlayback;
+    document.addEventListener('visibilitychange',()=>{
+      if(document.hidden&&state&&state.animTimer!=null) {
+        stopUgoira(state);
+        updateButtons();say('非表示中は停止しました');
       }
+    });
+    updateButtons();
+  }
+  function startButton() {
+    if(byId('pts-only-launch'))return;
+    const button=document.createElement('button');
+    button.id='pts-only-launch';button.type='button';
+    button.textContent='画質・コマ補間';
+    button.title='作品の超解像と、うごイラの動き補間のみ';
+    button.addEventListener('click',ensureOpen);
+    const style=document.createElement('style');
+    style.textContent='#pts-only-launch{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:2147480000;background:#252534;color:#fff;padding:12px 14px;border:1px solid #777;border-radius:12px;font:600 13px system-ui;box-shadow:0 5px 22px #0008;touch-action:manipulation}';
+    document.head.appendChild(style);
+    document.body.appendChild(button);
+  }
 
-      if (s.kind === 'ugoira') prepareUgoira(s);
+  // The following engines are self-contained and have no streaming or feed APIs.
+
+  /*
+  MIT License
+  
+  Copyright (c) 2019 bloc97
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+  Trained shader source: https://github.com/bloc97/Anime4K/blob/master/glsl/Upscale/Anime4K_Upscale_CNN_x2_S.glsl
+  WebGL2 adaptation retains the upstream MIT terms.
+  */
+  const AI_CNN_MODEL_PASSES = ["#define go_0(x_off, y_off) (sampleAt(vec2(x_off, y_off)))\nvec4 hook() {\n    vec4 result = mat4(-0.0057322932, 0.12928207, -0.056848746, 0.18680117, -0.0306273, 0.25602463, 0.053723164, 0.20419341, 0.0018709862, 0.022848232, -0.04105527, 0.10169034, 0.0, 0.0, 0.0, 0.0) * go_0(-1.0, -1.0);\n    result += mat4(0.009471417, -0.12957802, 0.096014425, 0.21836184, 0.00021601951, -0.22997683, 0.23666254, 0.41192335, 0.021762101, 0.0047863554, 0.008233427, 0.108514786, 0.0, 0.0, 0.0, 0.0) * go_0(-1.0, 0.0);\n    result += mat4(-0.01156376, -0.18988979, 0.04614705, -0.044767227, 0.01050636, -0.26426336, 0.23741047, 0.0027636609, -0.027718676, -0.14202335, -0.016650287, -0.06637125, 0.0, 0.0, 0.0, 0.0) * go_0(-1.0, 1.0);\n    result += mat4(0.057809234, -0.11033858, 0.056533534, -0.06292466, 0.13880666, -0.18710336, 0.2441031, -0.25326246, 0.0032683122, -0.026437074, 0.0023248852, 7.640766e-05, 0.0, 0.0, 0.0, 0.0) * go_0(0.0, -1.0);\n    result += mat4(-0.49110603, 0.4429004, -0.44015464, -0.41174838, -0.87738293, 0.7808468, -1.0929365, -0.59699076, -0.18409836, 0.185138, -0.11773224, -0.17097276, 0.0, 0.0, 0.0, 0.0) * go_0(0.0, 0.0);\n    result += mat4(0.10580959, -0.055947904, -0.03431237, -0.080236495, 0.14862584, -0.15393938, -0.18872876, -0.3170681, 0.03559387, -0.003990826, 0.021298569, 0.012844483, 0.0, 0.0, 0.0, 0.0) * go_0(0.0, 1.0);\n    result += mat4(-0.040715586, -0.25781113, 0.08896714, -0.1225879, -0.15790503, -0.54010904, 0.29588607, 0.10401059, 0.003413123, -0.108357325, 0.0112870345, -0.11888622, 0.0, 0.0, 0.0, 0.0) * go_0(1.0, -1.0);\n    result += mat4(0.0049315444, 0.02376202, -0.08224771, 0.121118225, -0.041512914, -0.027994309, -0.585988, -0.069672115, -0.017247835, 0.0056576864, 0.04319012, 0.055003505, 0.0, 0.0, 0.0, 0.0) * go_0(1.0, 0.0);\n    result += mat4(0.37521392, 0.15916082, 0.059708964, 0.19046007, 0.8120325, 0.38343868, 0.3436578, 0.5287958, 0.16570656, 0.06957687, 0.014022592, 0.074799836, 0.0, 0.0, 0.0, 0.0) * go_0(1.0, 1.0);\n    result += vec4(-0.01050964, -0.00939481, 0.17684458, 0.027366742);\n    return result;\n}\n","#define go_0(x_off, y_off) (max((sampleAt(vec2(x_off, y_off))), 0.0))\n#define go_1(x_off, y_off) (max(-(sampleAt(vec2(x_off, y_off))), 0.0))\nvec4 hook() {\n    vec4 result = mat4(-0.011029496, 0.05866063, -0.09460646, -0.017664742, -0.022488879, 0.18384217, -0.00397663, -0.064733066, 0.08466802, 0.10667488, 8.0212536e-05, 0.0908869, 0.13580276, 0.00097438256, 0.12176522, -0.08218466) * go_0(-1.0, -1.0);\n    result += mat4(0.16062798, -0.10190268, 0.03280682, 0.05621916, -0.009684231, -0.08464307, 0.17058301, -0.096469186, 0.1967505, -0.1450099, 0.093607284, -0.28240147, -0.21377413, 0.10079291, -0.1741522, 0.17330575) * go_0(-1.0, 0.0);\n    result += mat4(-0.060160473, 0.06316997, 0.0046929033, -0.049405966, 0.13851729, 0.06830702, -0.0586872, -0.040827133, 0.007052838, -0.03576886, -0.111261636, 0.039155316, -0.07380389, -0.09369825, 0.04471156, 0.09678487) * go_0(-1.0, 1.0);\n    result += mat4(-0.36683616, -0.035950605, -0.24414362, -0.009159744, 0.19335322, -0.099253505, 0.075083904, -0.00076695543, 0.65291303, -0.25599423, 0.19827642, 0.065899536, -0.07423247, -0.068967685, 0.0050554527, -0.060272824) * go_0(0.0, -1.0);\n    result += mat4(-0.020688485, -0.83178276, 0.11104878, 0.26454413, 0.13655476, 0.37675047, -0.22219229, -0.01751935, 0.44552696, 0.92510307, 0.16063261, -0.62011045, 0.19366647, -0.06996067, -0.2504841, 0.00803723) * go_0(0.0, 0.0);\n    result += mat4(0.0051537007, -0.057168536, -0.16110587, 0.25232598, -0.04447099, 0.11997351, 0.14808103, -0.34443566, -0.26212573, -0.21970181, 0.2724405, 0.21050811, -0.07949061, -0.064808235, -0.21208277, -0.0042361654) * go_0(0.0, 1.0);\n    result += mat4(-0.0888952, -0.20169449, 0.19144905, -0.016882861, -0.013283103, 0.07552998, -0.24686803, 0.012453213, -0.065454446, -0.016123284, -0.47316182, 0.070926026, 0.09219782, 0.13118166, 0.074736096, 0.0077910526) * go_0(1.0, -1.0);\n    result += mat4(0.5832154, 0.1138069, -0.039765622, 0.3182784, -0.25497997, 0.0013993139, 0.39285088, -0.48511526, -0.39891505, -0.19094779, -0.082146175, -0.20826934, 0.020590555, -0.0012490178, -0.4398621, 0.14377014) * go_0(1.0, 0.0);\n    result += mat4(0.21917395, 3.4314657e-05, 0.25734863, -0.3433305, 0.015720673, 0.2676127, -0.06807297, 0.15040149, -0.23638041, -0.0050233034, -0.13666134, 0.4542111, -0.033572577, -0.08450588, -0.23341487, 0.053490847) * go_0(1.0, 1.0);\n    result += mat4(-0.17482175, 0.057647135, 0.33135444, 0.0850751, -0.1718849, -0.0854123, 0.036795795, -0.13874969, -0.10903869, -0.19007301, -0.06064334, -0.03786032, -0.036696054, 0.07844446, 0.012523185, -0.01562906) * go_1(-1.0, -1.0);\n    result += mat4(-0.04411997, -0.10331819, 0.10050193, 0.12406485, 0.07431592, 0.30109692, -0.17511666, -0.13263564, -0.10192587, 0.07821255, -0.22415096, 0.25552443, 0.17881326, -0.13914281, 0.109979235, -0.0016463579) * go_1(-1.0, 0.0);\n    result += mat4(-0.01911644, -0.15412527, 0.028903123, 0.20831817, 0.00375175, 0.08110953, 0.074919395, -0.17581624, -0.015677985, 0.06504228, 0.08817818, -0.12518327, -0.09537373, 0.028905088, -0.051288474, 0.054334078) * go_1(-1.0, 1.0);\n    result += mat4(0.2852779, -0.28924024, 0.36805123, 0.21079305, -0.28336474, 0.1679663, -0.08641141, -0.10699407, -0.16090055, 0.1287612, -0.15910125, 0.05734755, 0.15883245, 0.0053026294, 0.080674745, 0.0505137) * go_1(0.0, -1.0);\n    result += mat4(0.17639062, 0.3790122, -0.19588692, -0.020314282, 0.26197383, 0.09014768, 0.19696823, -0.41025418, -0.08308115, -0.33279485, -0.22528782, 0.06172439, -0.1365661, -0.13094363, -0.005086559, 0.089024484) * go_1(0.0, 0.0);\n    result += mat4(0.05262993, 0.0006296959, 0.1657725, -0.32591924, 0.12126701, 0.061543245, -0.10526848, 0.041583937, 0.094976954, 0.09416157, -0.22019257, -0.058390073, -0.2073888, 0.057273377, 0.19558284, 0.004208022) * go_1(0.0, 1.0);\n    result += mat4(0.30005738, 0.18478931, -0.23342943, 0.22455733, -0.016488122, 0.099634305, 0.31620836, -0.15731157, 0.09595808, 0.0013774688, 0.48273298, -0.07027936, -0.18764344, -0.26194447, -0.11794225, -0.012173601) * go_1(1.0, -1.0);\n    result += mat4(0.117986746, -0.13846518, -0.019614812, -0.3011192, 0.5501164, 0.3408611, -0.40090847, 0.15706886, 0.13050972, 0.051776595, 0.20792943, 0.23389706, -0.22965533, -0.053367328, 0.3911586, -0.032988597) * go_1(1.0, 0.0);\n    result += mat4(0.054753624, -0.008485731, -0.2451672, 0.17528129, 0.13657846, 0.010480436, 0.07651423, -0.43316832, 0.12736236, 0.13804524, 0.12529011, -0.30946237, -0.14423579, 0.08403089, 0.24335162, 0.057288036) * go_1(1.0, 1.0);\n    result += vec4(0.012077211, 0.013045883, 0.0380778, -0.02908858);\n    return result;\n}\n","#define go_0(x_off, y_off) (max((sampleAt(vec2(x_off, y_off))), 0.0))\n#define go_1(x_off, y_off) (max(-(sampleAt(vec2(x_off, y_off))), 0.0))\nvec4 hook() {\n    vec4 result = mat4(-0.036115196, -0.06971895, -0.07508942, 0.016036168, 0.12120111, 0.24536026, 0.044755507, -0.20663576, 0.029635755, -0.15427187, 0.027148994, -0.20795093, 0.10170582, 0.077919215, 0.66063017, -0.4632968) * go_0(-1.0, -1.0);\n    result += mat4(-0.0052889925, -0.019060908, -0.08660142, -0.022095207, -0.08097976, -0.015142803, -0.18552722, -0.078493506, -0.16293915, -0.20099808, -0.08370822, 0.3701389, 0.09094984, 0.2487225, 0.24338846, 0.044003833) * go_0(-1.0, 0.0);\n    result += mat4(-0.061406493, -0.017232792, -0.10917424, 0.11203319, 0.040699825, -0.019294346, 0.084953666, -0.018133596, 0.07209552, 0.016069936, 0.17805555, -0.089537814, 0.15809004, 0.1027023, 0.15044671, -0.15530108) * go_0(-1.0, 1.0);\n    result += mat4(0.0948676, -0.040305693, -0.005591629, -0.048048403, -0.07547777, 0.056606572, 0.021390207, 0.32600567, -0.20805131, -0.099587254, 0.029613169, 0.0092129605, -0.29429698, -0.09898621, 0.44470885, -0.89487344) * go_0(0.0, -1.0);\n    result += mat4(-0.122259885, 0.11445877, 0.06666907, 0.1869428, -0.1553992, -0.1658741, 0.2988138, -0.57746625, -0.34609964, 0.11169158, -0.41877756, 0.38075635, 0.21293911, 0.09640372, -0.12754214, -0.08026104) * go_0(0.0, 0.0);\n    result += mat4(0.15128808, 0.050087795, 0.09219755, -0.18080945, 0.0044571217, -0.046019405, -0.1289922, 0.20305426, 0.19601224, 0.04667917, 0.17465587, 0.027672665, 0.18441725, 0.06845396, 0.11288585, -0.23283863) * go_0(0.0, 1.0);\n    result += mat4(-0.072962, -0.06639447, 0.049347494, -0.1386401, 0.10396071, 0.08187777, -0.04280746, 0.07390891, 0.06628344, 0.037797406, 0.021885803, -0.013147403, 0.22376558, 0.36243078, 0.12874891, -0.0023783944) * go_0(1.0, -1.0);\n    result += mat4(0.074945286, 0.16045591, -0.11798349, 0.12910712, 0.054760084, -0.095626175, -0.047832094, 0.03493912, 0.11817307, 0.037452437, -0.14301221, -0.027356789, -0.052390423, 0.11373512, 0.07686775, 0.010008694) * go_0(1.0, 0.0);\n    result += mat4(-0.023999173, -0.091900624, 0.02388157, 0.03173873, 0.0065633506, -0.033716757, -0.1198324, 0.12057766, 0.026465805, -0.07517131, -0.07760598, 0.060463097, 0.07345541, 0.046037503, 0.21101558, -0.26785463) * go_0(1.0, 1.0);\n    result += mat4(0.15544604, -0.03902825, 0.04630384, -0.25173616, -0.0691359, 0.07476507, 0.009071253, 0.089964196, -0.26539803, -0.3958477, -0.22155671, 0.20735882, -0.105860494, -0.003996804, -0.044815883, 0.39544627) * go_1(-1.0, -1.0);\n    result += mat4(0.6169709, 0.23717614, -0.37884676, -0.7484867, 0.020169826, -0.30718836, 1.0965588, -0.20711036, -0.39149985, -0.06843563, -0.06522909, 0.103805855, 0.03265825, -0.15137726, 0.12837899, -0.01294922) * go_1(-1.0, 0.0);\n    result += mat4(-0.23638196, -0.4560866, -0.11948684, -0.1464144, 0.10690008, 0.007835961, 0.11864342, -0.13101323, -0.16509797, 0.075027354, 0.08122998, 0.13451207, 0.0011890623, 0.052157886, 0.08372405, -0.07085038) * go_1(-1.0, 1.0);\n    result += mat4(-0.21997726, -0.16488647, -0.0291317, 0.17997476, 0.1493211, 0.027494298, 0.0034613227, -0.3207727, 0.18699001, 0.14728633, -0.042895135, -0.07612043, 0.125076, -0.14714554, -0.03480009, -0.22753975) * go_1(0.0, -1.0);\n    result += mat4(-0.5342686, -0.7426105, -0.38294584, 0.42549992, 0.46053204, 0.7867879, 0.106234804, -0.041163098, 0.5198579, -0.5219404, 0.14809476, -0.41802374, 0.06810794, -0.15122683, -0.047409, 0.13178343) * go_1(0.0, 0.0);\n    result += mat4(-0.50428164, 0.18220626, 0.35510704, -0.081787474, 0.03155813, 0.019284263, 0.0032388573, -0.20513348, -0.05385551, 0.17803182, -0.26206362, 0.2870375, 0.008557827, 0.08401449, -0.027598893, -0.010791235) * go_1(0.0, 1.0);\n    result += mat4(0.16657415, 0.067647465, 0.093076974, -0.14438486, -0.10017002, 0.0022367141, 0.03250936, -0.052794546, -0.009178676, -0.019673595, -0.0016697067, -0.15424626, -0.112123474, -0.11079971, 0.011987111, -0.11747758) * go_1(1.0, -1.0);\n    result += mat4(-0.023021797, -0.058703423, -0.037978355, -0.062433913, -0.13130441, 0.048656322, 0.056839373, 0.109036915, -0.07823158, 0.14785293, 0.058555078, -0.11679035, -0.14002073, 0.07395252, 0.098268874, -0.06710464) * go_1(1.0, 0.0);\n    result += mat4(0.14906375, 0.030001195, -0.10338215, 0.0662968, -0.161953, -0.13682815, 0.09563142, 0.009514228, -0.009491218, 0.06737101, -0.1393389, 0.15231515, -0.073147796, 0.00767062, 0.028675212, 0.014213088) * go_1(1.0, 1.0);\n    result += vec4(0.018736731, -0.0026039074, 0.050130025, -0.055364225);\n    return result;\n}\n","#define go_0(x_off, y_off) (max((sampleAt(vec2(x_off, y_off))), 0.0))\n#define go_1(x_off, y_off) (max(-(sampleAt(vec2(x_off, y_off))), 0.0))\nvec4 hook() {\n    vec4 result = mat4(0.019100675, -0.014241565, 0.004667036, -0.03865062, 0.106731094, 0.026099661, 0.014594411, -0.011881356, 0.0040967264, -0.004626336, 0.006469508, 0.010875305, -0.033909045, -0.085905954, 0.07861378, 0.019452631) * go_0(-1.0, -1.0);\n    result += mat4(0.20777655, -0.060354974, 0.0023840065, -0.064121604, -0.17397617, 0.019293457, -0.09707183, 0.080641985, 0.01025124, -0.017382381, 0.008661793, -0.010995665, 0.21943407, -0.115574986, 0.14471593, -0.068836235) * go_0(-1.0, 0.0);\n    result += mat4(0.057942886, -0.06311754, 0.2253396, -0.04159292, -0.020731755, 0.007877151, 0.041525815, 0.025278691, 0.03041967, -0.025137542, 0.024364179, -0.024543528, 0.029438615, -0.015506873, 0.081686, -0.07812221) * go_0(-1.0, 1.0);\n    result += mat4(0.054237515, 0.0676094, -0.0047708177, 0.0043467237, -0.10032304, -0.020498628, 0.04240586, 0.07272254, 0.0784221, 0.017945962, -0.022310399, -0.013134622, 0.015638694, -0.10001543, 0.1043031, 0.05898838) * go_0(0.0, -1.0);\n    result += mat4(-0.021652509, 0.35796642, 0.059497777, 0.23948468, 0.15454951, -0.10017235, -0.19072174, -0.44812536, -0.03974552, 0.04529369, 0.22207436, 0.026222564, -0.09705454, 0.5623026, -0.3354105, -0.017278556) * go_0(0.0, 0.0);\n    result += mat4(-0.053682446, -0.03411237, -0.09399936, 0.15128824, -0.07463, -0.042020727, 0.0031783928, 0.13481957, -0.07731454, 0.044114403, -0.23085599, 0.060444202, -0.15015422, 0.0018040676, -0.18684982, 0.2812511) * go_0(0.0, 1.0);\n    result += mat4(0.0029329916, 0.001596018, 0.0007512241, 0.016544111, -0.04876942, -0.05272409, 0.037884697, 0.049948208, 0.015518177, 0.11368592, -0.03815777, -0.013149978, -0.027638039, 0.107719295, -0.04115787, 0.02745414) * go_0(1.0, -1.0);\n    result += mat4(0.016691081, 0.010204119, 0.04078854, 0.01613337, 0.03325829, 0.0114824055, -0.017286912, -0.07284126, -0.110984206, -0.21041764, 0.0089543555, 0.18986733, 0.01537506, -0.2059135, 0.029074017, 0.013117443) * go_0(1.0, 0.0);\n    result += mat4(0.013965926, 0.029871881, 0.0034499036, -0.011343668, 0.022120327, -0.0068748263, 0.009324342, -0.039081004, 0.08032371, 0.050809264, 0.035050742, -0.2032847, 0.06305391, -0.021958945, 0.038569167, -0.22465245) * go_0(1.0, 1.0);\n    result += mat4(0.046307724, -0.012419472, 0.007673863, -0.042344846, 0.011042414, 0.016994251, -0.018166406, -0.016955731, -0.13240299, 0.01768431, -0.027607648, 0.0699927, -0.02840628, 0.004414203, 0.0049618417, 0.011084679) * go_1(-1.0, -1.0);\n    result += mat4(-0.119954154, -0.007455482, -0.031108133, -0.009946449, 0.0077065965, 0.01660345, 0.032943666, 0.016376585, 0.10273124, 0.1556573, -0.24643841, 0.107307844, -0.068235755, 0.0561896, -0.0104672015, 0.042693343) * go_1(-1.0, 0.0);\n    result += mat4(-0.01634601, 0.04195375, -0.10401894, 0.047641944, -0.034602515, -0.0034419263, -0.010457858, 0.015194475, -0.03962551, -0.030031368, 0.16036317, 0.019283568, -0.05877721, 0.016504882, -0.15523468, 0.018161612) * go_1(-1.0, 1.0);\n    result += mat4(-0.08083991, 0.0024665035, -0.049373373, 0.030371357, 0.0113322195, -0.014676956, 0.011646689, -0.01142667, 0.124930486, 0.06625774, -0.045840867, -0.009693036, -0.012649251, -0.07388084, 0.008790075, 0.0013844534) * go_1(0.0, -1.0);\n    result += mat4(-0.33941835, -0.2763476, -0.118311435, -0.063535266, 0.20936015, 0.13731301, 0.13443594, 0.07464433, 0.059650812, -0.36973104, 0.16444235, -0.37082872, 0.06432777, -0.18283032, -0.044489607, -0.13895285) * go_1(0.0, 0.0);\n    result += mat4(0.13533665, 0.08268915, -0.03675727, -0.14348659, 0.0186255, -0.05051692, 0.056702953, 0.0061717895, 0.047663026, -0.088188455, 0.23254345, -0.014015464, 0.08400204, -0.0073777726, 0.2202068, -0.12366078) * go_1(0.0, 1.0);\n    result += mat4(0.04361004, 0.046543695, 0.0064863074, -0.03358146, -0.022602187, 0.018138997, -0.011071864, 0.010244091, -0.019814799, -0.17250171, 0.040823266, -0.040131986, 0.010125854, 0.020660749, 0.0020435036, -0.010819304) * go_1(1.0, -1.0);\n    result += mat4(-0.004810193, -0.11286074, 0.051985834, 0.04788631, -0.023950428, 0.036145125, -0.038203828, 0.052401308, 0.022986965, 0.26420745, -0.06076917, -0.09252999, 0.03164547, 0.15652153, -0.037934, -0.0035418556) * go_1(1.0, 0.0);\n    result += mat4(0.03358366, -0.005219482, 0.007060882, -0.06569114, -0.02941682, 0.00966056, -0.0153679885, 0.019905418, -0.107232265, -0.03405676, -0.044340115, 0.26892832, -0.04723829, -0.02589829, 0.004563232, 0.19318114) * go_1(1.0, 1.0);\n    result += vec4(-0.00346731, -0.0046263863, -0.004627155, -0.0057769152);\n    return result;\n}\n"];
+  const AI_CNN_MODEL_FINAL = "vec4 hook() {\n    vec2 f0 = fract(uv * inputSize);\n    ivec2 i0 = ivec2(f0 * vec2(2.0));\n    float c0 = sampleDetail((vec2(0.5) - f0) * invSize + uv)[i0.y * 2 + i0.x];\n    float c1 = c0;\n    float c2 = c1;\n    float c3 = c2;\n    return vec4(c0, c1, c2, c3) + texture(baseTexture,uv);\n}\n";
+  const AI_CNN_MAX_INPUT_PIXELS = 640_000;
+  const AI_CNN_MAX_OUTPUT_PIXELS = 2_560_000;
+
+  function aiCnnCanUseSource(image) {
+    // Internal decoded image tiles are canvases. A tainted Canvas still fails
+    // browser-enforced WebGL tex upload; no cross-origin bypass is attempted.
+    if(image?.tagName==='CANVAS')return image.width>0&&image.height>0;
+    const url=String(image?.currentSrc||image?.src||'');
+    if(!image?.complete||!image.naturalWidth||!image.naturalHeight)return false;
+    if(/^blob:|^data:/i.test(url))return true;
+    try {
+      if(new URL(url,location.href).origin===location.origin)return true;
+    }catch(_){}
+    return !!image.crossOrigin; // Cross-origin image must already have passed CORS.
+  }
+
+  function aiCnnShader(gl,kind,source) {
+    const shader=gl.createShader(kind);
+    if(!shader)throw new Error('GPUシェーダーを確保できません');
+    gl.shaderSource(shader,source);
+    gl.compileShader(shader);
+    if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS)){
+      const error=gl.getShaderInfoLog(shader)||'コンパイルできません';
+      gl.deleteShader(shader);
+      throw new Error('AIシェーダー: '+error.slice(0,180));
+    }
+    return shader;
+  }
+
+  function aiCnnProgram(gl,vertex,fragment) {
+    const v=aiCnnShader(gl,gl.VERTEX_SHADER,vertex);
+    const f=aiCnnShader(gl,gl.FRAGMENT_SHADER,fragment);
+    const program=gl.createProgram();
+    gl.attachShader(program,v);gl.attachShader(program,f);
+    gl.linkProgram(program);
+    gl.deleteShader(v);gl.deleteShader(f);
+    if(!gl.getProgramParameter(program,gl.LINK_STATUS)){
+      const reason=gl.getProgramInfoLog(program)||'リンクできません';
+      gl.deleteProgram(program);
+      throw new Error('AIプログラム: '+reason.slice(0,180));
+    }
+    return program;
+  }
+
+  function anime4kCnnConvolutionShader(body) {
+    return '#version 300 es\nprecision highp float;\n'+
+      'in vec2 uv;out vec4 color;\n'+
+      'uniform sampler2D inputTexture;uniform vec2 invSize;\n'+
+      'vec4 sampleAt(vec2 offset){return texture(inputTexture,uv+offset*invSize);}\n'+
+      body+'\nvoid main(){color=hook();}\n';
+  }
+
+  function anime4kCnnFinalShader(body) {
+    return '#version 300 es\nprecision highp float;\n'+
+      'in vec2 uv;out vec4 color;\n'+
+      'uniform sampler2D baseTexture, detailTexture;\n'+
+      'uniform vec2 inputSize,invSize;\n'+
+      'vec4 sampleDetail(vec2 coord){return texture(detailTexture,coord);}\n'+
+      body+'\nvoid main(){vec4 c=hook();color=vec4(clamp(c.rgb,0.0,1.0),1.0);}\n';
+  }
+
+  function anime4kCnnProcessImage(image) {
+    const width=image.naturalWidth||image.width, height=image.naturalHeight||image.height;
+    if(!aiCnnCanUseSource(image))throw new Error('IMAGE_CORS_OR_UNAVAILABLE');
+    if(!Number.isSafeInteger(width)||!Number.isSafeInteger(height)||width<1||height<1||
+       width*height>AI_CNN_MAX_INPUT_PIXELS||
+       width*height*4>AI_CNN_MAX_OUTPUT_PIXELS){
+      throw new Error('AI超解像の画素上限を超えています');
+    }
+    const work=document.createElement('canvas');
+    work.width=width*2;work.height=height*2;
+    const gl=work.getContext('webgl2',{alpha:false,depth:false,stencil:false,
+      antialias:false,preserveDrawingBuffer:true,powerPreference:'low-power'});
+    if(!gl)throw new Error('WebGL2が利用できません');
+    if(!gl.getExtension('EXT_color_buffer_float'))
+      throw new Error('浮動小数点テクスチャが使えません');
+    const textures=[], programs=[];
+    let fbo=null,vao=null;
+    const tex=(unit,texObj)=>{gl.activeTexture(gl.TEXTURE0+unit);
+      gl.bindTexture(gl.TEXTURE_2D,texObj);};
+    const newTexture=(type,sourceImage)=>{
+      const texture=gl.createTexture();
+      textures.push(texture);
+      tex(0,texture);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,type==='input'?gl.LINEAR:gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,type==='input'?gl.LINEAR:gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+      if(type==='input'){
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,sourceImage);
+      }else{
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,width,height,0,gl.RGBA,gl.HALF_FLOAT,null);
+      }
+      return texture;
+    };
+    try{
+      const vertex='#version 300 es\nprecision highp float;out vec2 uv;\n'+
+        'void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));'+
+        'uv=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n';
+      vao=gl.createVertexArray();gl.bindVertexArray(vao);
+      fbo=gl.createFramebuffer();
+      const original=newTexture('input',image);
+      let incoming=original;
+      for(const fragmentBody of AI_CNN_MODEL_PASSES){
+        const output=newTexture('float',null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,output,0);
+        if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)
+          throw new Error('AI処理バッファを作成できません');
+        gl.viewport(0,0,width,height);
+        const program=aiCnnProgram(gl,vertex,anime4kCnnConvolutionShader(fragmentBody));
+        programs.push(program);
+        gl.useProgram(program);
+        gl.uniform1i(gl.getUniformLocation(program,'inputTexture'),0);
+        gl.uniform2f(gl.getUniformLocation(program,'invSize'),1/width,1/height);
+        tex(0,incoming);
+        gl.drawArrays(gl.TRIANGLES,0,3);
+        incoming=output;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+      gl.viewport(0,0,width*2,height*2);
+      const last=aiCnnProgram(gl,vertex,anime4kCnnFinalShader(AI_CNN_MODEL_FINAL));
+      programs.push(last);
+      gl.useProgram(last);
+      gl.uniform1i(gl.getUniformLocation(last,'baseTexture'),0);
+      gl.uniform1i(gl.getUniformLocation(last,'detailTexture'),1);
+      gl.uniform2f(gl.getUniformLocation(last,'inputSize'),width,height);
+      gl.uniform2f(gl.getUniformLocation(last,'invSize'),1/width,1/height);
+      tex(0,original);tex(1,incoming);
+      gl.drawArrays(gl.TRIANGLES,0,3);
+      gl.finish();
+      // 2D Canvasへ保存してGPUの一時テクスチャを速やかに破棄。
+      const output=document.createElement('canvas');
+      output.width=width*2;output.height=height*2;
+      const ctx=output.getContext('2d',{alpha:false});
+      if(!ctx)throw new Error('AI出力Canvasを準備できません');
+      ctx.drawImage(work,0,0);
+      output.className='pts-ai-cnn-canvas';
+      return output;
+    }finally{
+      for(const program of programs)gl.deleteProgram(program);
+      for(const texture of textures)gl.deleteTexture(texture);
+      if(fbo)gl.deleteFramebuffer(fbo);
+      if(vao)gl.deleteVertexArray(vao);
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      work.width=0;work.height=0;
     }
   }
 
 
-  /* ---------- うごイラ（ZIP展開してアニメーション） ---------- */
 
-  // raw deflate 解凍（SafariのDecompressionStreamがdeflate-raw非対応のため自前実装。検証済み）
-  function inflateRaw(bytes) {
+  // Each tile runs the real trained four-convolution Anime4K CNN. A 12px
+  // margin is larger than the model's receptive field, avoiding tile seams.
+  // This keeps GPU intermediates bounded even for a multi-megapixel image.
+  async function anime4kCnnProcessLarge(image, isCurrent=()=>true, onProgress=()=>{}) {
+    if(!aiCnnCanUseSource(image))throw new Error('画像をGPU処理できません（CORS等）');
+    const width=image.naturalWidth||image.width,height=image.naturalHeight||image.height;
+    if(!Number.isSafeInteger(width)||!Number.isSafeInteger(height) ||
+       width<1||height<1||width*height>AI_CNN_LARGE_MAX_PIXELS){
+      throw new Error('AI超解像の安全上限は元画像200万画素（出力800万画素）です');
+    }
+    if(width*height<=AI_CNN_MAX_INPUT_PIXELS) {
+      if(!isCurrent())throw new DOMException('中断','AbortError');
+      const output=anime4kCnnProcessImage(image);
+      onProgress(1,1);
+      return output;
+    }
+    const full=document.createElement('canvas');
+    full.width=width*2;full.height=height*2;
+    const context=full.getContext('2d',{alpha:false});
+    if(!context)throw new Error('画像の合成用Canvasを使えません');
+    context.imageSmoothingEnabled=false;
+    const nX=Math.ceil(width/AI_CNN_TILE_SIDE),nY=Math.ceil(height/AI_CNN_TILE_SIDE);
+    const total=nX*nY;
+    let done=0;
+    try{
+      for(let row=0;row<nY;row++)for(let col=0;col<nX;col++){
+        if(!isCurrent())throw new DOMException('中断','AbortError');
+        const x=col*AI_CNN_TILE_SIDE,y=row*AI_CNN_TILE_SIDE;
+        const coreWidth=Math.min(AI_CNN_TILE_SIDE,width-x);
+        const coreHeight=Math.min(AI_CNN_TILE_SIDE,height-y);
+        const fromX=Math.max(0,x-AI_CNN_TILE_PAD);
+        const fromY=Math.max(0,y-AI_CNN_TILE_PAD);
+        const toX=Math.min(width,x+coreWidth+AI_CNN_TILE_PAD);
+        const toY=Math.min(height,y+coreHeight+AI_CNN_TILE_PAD);
+        const tile=document.createElement('canvas');
+        tile.width=toX-fromX;tile.height=toY-fromY;
+        let predicted;
+        try{
+          const input=tile.getContext('2d',{alpha:false});
+          if(!input)throw new Error('タイルの入力Canvasを使えません');
+          input.drawImage(image,fromX,fromY,tile.width,tile.height,
+            0,0,tile.width,tile.height);
+          predicted=anime4kCnnProcessImage(tile);
+          // Extract only the tile's unpadded center.
+          context.drawImage(predicted,
+            (x-fromX)*2,(y-fromY)*2,coreWidth*2,coreHeight*2,
+            x*2,y*2,coreWidth*2,coreHeight*2);
+        }finally{
+          if(predicted){predicted.width=0;predicted.height=0;}
+          tile.width=0;tile.height=0;
+        }
+        done++;
+        onProgress(done,total);
+        // Yield to Safari between tiles and honor close/new image immediately.
+        await new Promise(resolve=>requestAnimationFrame(resolve));
+      }
+      if(!isCurrent())throw new DOMException('中断','AbortError');
+      full.className='pts-ai-cnn-canvas';
+      return full;
+    }catch(error){
+      full.width=0;full.height=0;
+      throw error;
+    }
+  }
+
+  function inflateRaw(bytes, maxSize = 8 * 1024 * 1024) {
     let pos = 0;
     const bit = () => {
       if (pos >= bytes.length * 8) throw new Error('deflate: unexpected end');
@@ -414,7 +685,16 @@
     const LEN_EXT = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
     const DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
     const DIST_EXT = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
-    const out = [];
+    let out = new Uint8Array(Math.min(65536,maxSize));
+    let written = 0;
+    const push = byte => {
+      if(written>=maxSize) throw new Error('ZIP展開上限（1フレーム8MB）');
+      if(written>=out.length) {
+        const next=new Uint8Array(Math.min(maxSize,out.length*2));
+        next.set(out);out=next;
+      }
+      out[written++]=byte;
+    };
     let last = 0;
     while (!last) {
       last = bits(1);
@@ -424,7 +704,7 @@
         const len = bytes[pos >> 3] | (bytes[(pos >> 3) + 1] << 8);
         pos += 32;
         const start = pos >> 3;
-        for (let i = 0; i < len; i++) out.push(bytes[start + i]);
+        for (let i = 0; i < len; i++) push(bytes[start + i]);
         pos += len * 8;
       } else {
         let litHuff, distHuff;
@@ -456,7 +736,7 @@
         }
         for (;;) {
           const sym = decode(litHuff);
-          if (sym < 256) out.push(sym);
+          if (sym < 256) push(sym);
           else if (sym === 256) break;
           else {
             const li = sym - 257;
@@ -465,17 +745,18 @@
             const dsym = decode(distHuff);
             if (dsym < 0 || dsym >= DIST_BASE.length) throw new Error('deflate: bad distance symbol');
             const dist = DIST_BASE[dsym] + bits(DIST_EXT[dsym]);
-            if (dist < 1 || dist > out.length) throw new Error('deflate: bad back-reference');
-            const start = out.length - dist;
-            for (let i = 0; i < len; i++) out.push(out[start + i]);
+            if (dist < 1 || dist > written) throw new Error('deflate: bad back-reference');
+            const start = written - dist;
+            for (let i = 0; i < len; i++) push(out[start + i]);
           }
         }
       }
     }
-    return new Uint8Array(out);
+    return out.subarray(0,written);
   }
 
   async function unzipFrames(zipUrl, frames, signal) {
+    if (!Array.isArray(frames) || frames.length < 2 || frames.length > 120) throw new Error('フレーム数は2〜120に制限しています');
     let res;
     try {
       res = await fetch(zipUrl, { signal });
@@ -483,8 +764,12 @@
       if (e && e.name === 'AbortError') throw e;
       throw new Error('ZIP取得失敗(通信/CORS): ' + (e && e.message ? e.message : e));
     }
+    if(res.status===429)sessionBlocked=true;
     if (!res.ok) throw new Error('ZIP取得失敗: HTTP ' + res.status);
+    const declaredSize = Number(res.headers.get('content-length') || 0);
+    if (declaredSize > 64 * 1024 * 1024) throw new Error('ZIPは64MB以下にしてください');
     const buf = await res.arrayBuffer();
+    if (buf.byteLength > 64 * 1024 * 1024 || buf.byteLength < 22) throw new Error('ZIPの容量が不正です');
     const view = new DataView(buf);
     // End of Central Directory を後ろから探す
     let eocd = -1;
@@ -496,55 +781,55 @@
     let off = view.getUint32(eocd + 16, true);
     const byName = new Map();
     for (let n = 0; n < count; n++) {
-      if (view.getUint32(off, true) !== 0x02014b50) break;
+      if (off + 46 > buf.byteLength || view.getUint32(off, true) !== 0x02014b50) break;
       const method = view.getUint16(off + 10, true);
       const compSize = view.getUint32(off + 20, true);
+      const uncompSize = view.getUint32(off + 24, true);
+      if (uncompSize > 8 * 1024 * 1024) throw new Error('1フレーム8MB超過');
       const nameLen = view.getUint16(off + 28, true);
       const extraLen = view.getUint16(off + 30, true);
       const commentLen = view.getUint16(off + 32, true);
       const localOff = view.getUint32(off + 42, true);
+      if (off + 46 + nameLen + extraLen + commentLen > buf.byteLength ||
+          localOff + 30 > buf.byteLength) throw new Error('ZIPヘッダー不正');
       const name = new TextDecoder().decode(new Uint8Array(buf, off + 46, nameLen));
       const lNameLen = view.getUint16(localOff + 26, true);
       const lExtraLen = view.getUint16(localOff + 28, true);
       const dataOff = localOff + 30 + lNameLen + lExtraLen;
-      byName.set(name, { method, compSize, dataOff });
+      if (dataOff + compSize > buf.byteLength) throw new Error('ZIPデータ範囲不正');
+      byName.set(name, { method, compSize, uncompSize, dataOff });
       off += 46 + nameLen + extraLen + commentLen;
     }
     const urls = [];
+    try {
+    let totalUncompressed = 0;
     for (let fi = 0; fi < frames.length; fi++) {
+      if (signal?.aborted) throw new DOMException('中断しました','AbortError');
       const f = frames[fi];
       const ent = byName.get(f.file);
       if (!ent) { urls.push(null); continue; }
+      totalUncompressed += ent.uncompSize;
+      if(totalUncompressed > 128 * 1024 * 1024) throw new Error('ZIP展開合計128MB超過');
+      if(ent.method !== 0 && ent.method !== 8) throw new Error('未対応のZIP圧縮方式');
       const raw = new Uint8Array(buf, ent.dataOff, ent.compSize);
       let bytes = raw;
       if (ent.method === 8) {
-        bytes = inflateRaw(raw);
+        bytes = inflateRaw(raw, 8 * 1024 * 1024);
       }
+      if (bytes.length !== ent.uncompSize) throw new Error('ZIP展開後のサイズ不一致');
       const mime = /\.png$/i.test(f.file) ? 'image/png' : 'image/jpeg';
       urls.push(URL.createObjectURL(new Blob([bytes], { type: mime })));
       // 同期解凍が続くとSafariが固まるので、数フレームごとに描画の機会を返す
       if (fi % 4 === 3) await new Promise((r) => setTimeout(r, 0));
     }
     return urls;
-  }
-
-  function setUgoiraStatus(s, state, message = '') {
-    const el = s?.ugoiraStatusEl;
-    if (!el) return;
-    if (state === 'none' || state === 'playing') {
-      el.hidden = true;
-      el.textContent = '';
-      return;
+    } catch (e) {
+      for (const url of urls) if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+      throw e;
     }
-    el.hidden = false;
-    el.classList.toggle('pts-ugoira-error', state === 'error');
-    el.textContent = state === 'error'
-      ? `⚠ うごイラ読み込み失敗: ${message || '不明なエラー'}`
-      : '↻ うごイラ読み込み中…';
   }
 
-  // v3.13.19: 画面表示は1枚のcanvas。時刻を基準にrAFで表示コマを決める。
-  // エンコードされたフレームURLは維持し、デコード済み画像のみ最大4枚に制限。
+
   const UGOIRA_DECODE_AHEAD = 2;
   const UGOIRA_DECODE_LIMIT = 4;
 
@@ -587,6 +872,7 @@
     player.ready.clear();
     player.loading.clear();
     player.displayed = -1;
+    releaseUgoiraMotion(s);
     player.urls = s.frameUrls;
   }
 
@@ -653,6 +939,284 @@
     return true;
   }
 
+
+  /* ---------- うごイラ: 動き推定を用いた端末内フレーム補間（実験的） ---------- */
+  // これはRIFEなどのAI推論ではない。隣接ZIPフレーム間の局所ブロックマッチングで
+  // 動きベクトルを推定し、WebGL2で前後の画像を位置補正して描画する。
+  // クロスフェードのみの処理とは異なるが、激しい動きには破綻があり得る。
+  // ソースは既に展開したblobフレームのみ。pixivへの追加GETを行わない。
+  const MOTION_ANALYSIS_SIZE = 160;
+  const MOTION_BLOCK_SIZE = 12;
+  const MOTION_SEARCH_RADIUS = 4;
+  const MOTION_MAX_FRAME_PIXELS = 2_500_000;
+  const MOTION_MAX_OUTPUT_PIXELS = 1_250_000;
+  let motionInterpolationEnabled = false;
+  let motionInterpolationAvailable = true;
+
+  function disableMotionInterpolation() {
+    motionInterpolationAvailable = false;
+    motionInterpolationEnabled = false;
+    syncMotionButton();
+  }
+
+  function motionGrayFromImage(image, width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    if (!ctx) return null;
+    ctx.drawImage(image, 0, 0, width, height);
+    // うごイラZIPを展開して生成したsame-origin blob: のみを対象にする。
+    const data = ctx.getImageData(0,0,width,height).data;
+    const gray = new Uint8Array(width * height);
+    for (let k=0, i=0; i<gray.length; i++, k+=4) {
+      gray[i]=(data[k]*77+data[k+1]*150+data[k+2]*29)>>8;
+    }
+    canvas.width=0;canvas.height=0;
+    return gray;
+  }
+
+  function estimateUgoiraMotion(grayA, grayB, width, height,
+    blockSize = MOTION_BLOCK_SIZE, radius = MOTION_SEARCH_RADIUS) {
+    if (!grayA || !grayB || width<24 || height<24 ||
+        grayA.length!==width*height || grayB.length!==width*height) return null;
+    const columns=Math.ceil(width/blockSize), rows=Math.ceil(height/blockSize);
+    const pixels=new Uint8Array(columns*rows*4);
+    let totalDifference=0;
+    for(let i=0;i<grayA.length;i+=3) totalDifference+=Math.abs(grayA[i]-grayB[i]);
+    const meanDifference=totalDifference/Math.ceil(grayA.length/3);
+    // カット切り替えを誤って補間すると残像が出る。
+    if(meanDifference>65)return null;
+    for(let by=0;by<rows;by++)for(let bx=0;bx<columns;bx++){
+      const centerX=bx*blockSize+Math.floor(blockSize/2);
+      const centerY=by*blockSize+Math.floor(blockSize/2);
+      const x0=Math.max(0,centerX-4),x1=Math.min(width-1,centerX+4);
+      const y0=Math.max(0,centerY-4),y1=Math.min(height-1,centerY+4);
+      let bestDx=0,bestDy=0,bestScore=Infinity;
+      for(let dy=-radius;dy<=radius;dy++)for(let dx=-radius;dx<=radius;dx++){
+        let score=0,samples=0;
+        for(let y=y0;y<=y1;y+=2)for(let x=x0;x<=x1;x+=2){
+          const tx=x+dx,ty=y+dy;
+          if(tx<0||ty<0||tx>=width||ty>=height)continue;
+          score+=Math.abs(grayA[y*width+x]-grayB[ty*width+tx]);
+          samples++;
+        }
+        if(samples<8)continue;
+        // 均一色の領域で意味のない大きな移動を推定しない。
+        const normalized=score/samples+0.5*(dx*dx+dy*dy);
+        if(normalized<bestScore){
+          bestScore=normalized;bestDx=dx;bestDy=dy;
+        }
+      }
+      // WebGLテクスチャの行は下から並ぶので順序を反転。
+      const dest=((rows-1-by)*columns+bx)*4;
+      pixels[dest]=Math.max(0,Math.min(255,128+bestDx*12));
+      pixels[dest+1]=Math.max(0,Math.min(255,128-bestDy*12));
+      pixels[dest+2]=0;pixels[dest+3]=255;
+    }
+    return {pixels,columns,rows,width,height,meanDifference};
+  }
+
+  function releaseUgoiraMotion(s) {
+    const m=s?.motionRenderer;
+    if(m){
+      try{
+        const gl=m.gl;
+        for(const tex of [m.a,m.b,m.flow]) if(tex)gl.deleteTexture(tex);
+        if(m.program)gl.deleteProgram(m.program);
+        if(m.vao)gl.deleteVertexArray(m.vao);
+      }catch(_){}
+      m.canvas?.remove();
+      if(m.canvas){m.canvas.width=0;m.canvas.height=0;}
+    }
+    if(s) {s.motionRenderer=null;s.motionPair=null;}
+  }
+
+  function motionShader(gl,type,code) {
+    const shader=gl.createShader(type);
+    if(!shader)return null;
+    gl.shaderSource(shader,code);gl.compileShader(shader);
+    if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS)){
+      gl.deleteShader(shader);return null;
+    }
+    return shader;
+  }
+
+  function createUgoiraMotionRenderer(s,width,height) {
+    const holder=s.sectionEl?.querySelector('.pts-holder');
+    if(!holder||!motionInterpolationAvailable)return null;
+    const canvas=document.createElement('canvas');
+    canvas.className='pts-ugoira-motion-canvas';
+    const scale=Math.min(1,Math.sqrt(MOTION_MAX_OUTPUT_PIXELS/(width*height)));
+    canvas.width=Math.max(1,Math.floor(width*scale));
+    canvas.height=Math.max(1,Math.floor(height*scale));
+    const gl=canvas.getContext('webgl2',{
+      alpha:false,depth:false,stencil:false,antialias:false,
+      preserveDrawingBuffer:false,powerPreference:'low-power'
+    });
+    if(!gl){disableMotionInterpolation();return null;}
+    const vertex=motionShader(gl,gl.VERTEX_SHADER,`#version 300 es
+      out vec2 uv;
+      void main(){
+        vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));
+        uv=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);
+      }`);
+    const fragment=motionShader(gl,gl.FRAGMENT_SHADER,`#version 300 es
+      precision highp float;
+      in vec2 uv;out vec4 color;
+      uniform sampler2D frameA,frameB,motionField;
+      uniform vec2 invAnalysis;uniform float mixTime;
+      void main(){
+        vec2 flow=(texture(motionField,uv).rg*255.0-vec2(128.0))
+          /12.0*invAnalysis;
+        vec2 a=clamp(uv-flow*mixTime,0.0,1.0);
+        vec2 b=clamp(uv+flow*(1.0-mixTime),0.0,1.0);
+        color=mix(texture(frameA,a),texture(frameB,b),mixTime);
+      }`);
+    if(!vertex||!fragment){
+      if(vertex)gl.deleteShader(vertex);if(fragment)gl.deleteShader(fragment);
+      canvas.width=0;canvas.height=0;disableMotionInterpolation();return null;
+    }
+    const program=gl.createProgram();
+    gl.attachShader(program,vertex);gl.attachShader(program,fragment);
+    gl.linkProgram(program);gl.deleteShader(vertex);gl.deleteShader(fragment);
+    if(!gl.getProgramParameter(program,gl.LINK_STATUS)){
+      gl.deleteProgram(program);canvas.width=0;canvas.height=0;
+      disableMotionInterpolation();return null;
+    }
+    const vao=gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.useProgram(program);
+    gl.uniform1i(gl.getUniformLocation(program,'frameA'),0);
+    gl.uniform1i(gl.getUniformLocation(program,'frameB'),1);
+    gl.uniform1i(gl.getUniformLocation(program,'motionField'),2);
+    const m={gl,canvas,program,vao,a:null,b:null,flow:null,pair:null,
+      alpha:gl.getUniformLocation(program,'mixTime'),
+      inv:gl.getUniformLocation(program,'invAnalysis')};
+    canvas.style.display='none';
+    canvas.addEventListener('webglcontextlost',event=>{
+      event.preventDefault();disableMotionInterpolation();
+      releaseUgoiraMotion(s);
+    },{once:true});
+    holder.appendChild(canvas);
+    s.motionRenderer=m;
+    return m;
+  }
+
+  function motionTexture(gl,unit,image,field) {
+    const texture=gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0+unit);
+    gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    if(field){
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,field.columns,field.rows,0,
+        gl.RGBA,gl.UNSIGNED_BYTE,field.pixels);
+    }else{
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,image);
+    }
+    return texture;
+  }
+
+  function drawUgoiraMotion(s,index,fraction,duration){
+    if(!motionInterpolationEnabled||!motionInterpolationAvailable||
+       !s.isCurrent||document.hidden||searchGrid.open||
+       !(fraction>0.03&&fraction<0.97)||duration>300||duration<25){
+      if(s.motionRenderer)s.motionRenderer.canvas.style.display='none';
+      return false;
+    }
+    const player=s.ugoiraPlayer;
+    const a=player?.ready.get(index);
+    const next=(index+1)%s.frameUrls.length;
+    const b=player?.ready.get(next);
+    if(!a||!b||!a.src.startsWith('blob:')||!b.src.startsWith('blob:')||
+      a.naturalWidth!==b.naturalWidth||a.naturalHeight!==b.naturalHeight||
+      !a.naturalWidth||a.naturalWidth*a.naturalHeight>MOTION_MAX_FRAME_PIXELS){
+      if(s.motionRenderer)s.motionRenderer.canvas.style.display='none';
+      return false;
+    }
+    try{
+      let m=s.motionRenderer;
+      if(m&&(m.imageWidth!==a.naturalWidth||m.imageHeight!==a.naturalHeight)){
+        releaseUgoiraMotion(s);m=null;
+      }
+      if(!m){
+        m=createUgoiraMotionRenderer(s,a.naturalWidth,a.naturalHeight);
+        if(!m)return false;
+        m.imageWidth=a.naturalWidth;m.imageHeight=a.naturalHeight;
+      }
+      if(m.skipped?.index===index && m.skipped.a===a && m.skipped.b===b){
+        m.canvas.style.display='none';return false;
+      }
+      if(m.pair?.index!==index||m.pair.a!==a||m.pair.b!==b){
+        const scale=Math.min(1,MOTION_ANALYSIS_SIZE/a.naturalWidth,
+          MOTION_ANALYSIS_SIZE/a.naturalHeight);
+        const w=Math.max(24,Math.round(a.naturalWidth*scale));
+        const h=Math.max(24,Math.round(a.naturalHeight*scale));
+        const grayA=motionGrayFromImage(a,w,h);
+        const grayB=motionGrayFromImage(b,w,h);
+        const field=estimateUgoiraMotion(grayA,grayB,w,h);
+        if(!field){
+          m.skipped={index,a,b};m.canvas.style.display='none';return false;
+        }
+        m.skipped=null;
+        const gl=m.gl;
+        for(const tex of [m.a,m.b,m.flow])if(tex)gl.deleteTexture(tex);
+        m.a=motionTexture(gl,0,a,null);
+        m.b=motionTexture(gl,1,b,null);
+        m.flow=motionTexture(gl,2,null,field);
+        m.pair={index,a,b,field};
+      }
+      const gl=m.gl;
+      gl.viewport(0,0,m.canvas.width,m.canvas.height);
+      gl.useProgram(m.program);gl.bindVertexArray(m.vao);
+      gl.uniform1f(m.alpha,fraction);
+      gl.uniform2f(m.inv,1/m.pair.field.width,1/m.pair.field.height);
+      for(const [unit,tex] of [[0,m.a],[1,m.b],[2,m.flow]]){
+        gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,tex);
+      }
+      gl.drawArrays(gl.TRIANGLES,0,3);
+      m.canvas.style.display='block';
+      return true;
+    }catch(e){
+      releaseUgoiraMotion(s);
+      disableMotionInterpolation();
+      return false;
+    }
+  }
+
+
+  function syncUgoiraQualityButton() {
+    const button=overlay?.querySelector('.pts-ugoira-quality');
+    if(!button)return;
+    button.textContent=preferOriginalUgoira?'うご原寸優先: ON':'うご原寸優先: OFF';
+    button.title='次に読み込むうごイラから元サイズZIPを直接取得。小さいZIPと両方取得するのを避けます。';
+    button.setAttribute('aria-pressed',preferOriginalUgoira?'true':'false');
+  }
+
+  function toggleUgoiraQuality() {
+    preferOriginalUgoira=!preferOriginalUgoira;
+    syncUgoiraQualityButton();
+  }
+
+  function syncMotionButton(){
+    const button=overlay?.querySelector('.pts-motion');
+    if(!button)return;
+    button.textContent=motionInterpolationEnabled?'動き補間: ON':'動き補間: OFF';
+    button.setAttribute('aria-pressed',motionInterpolationEnabled?'true':'false');
+    button.disabled=!motionInterpolationAvailable;
+    button.title='うごイラの前後フレームを動き推定で補間。AI RIFEではありません。';
+  }
+
+  function toggleMotionInterpolation(){
+    motionInterpolationEnabled=!motionInterpolationEnabled;
+    if(!motionInterpolationEnabled)slides.forEach(releaseUgoiraMotion);
+    syncMotionButton();
+  }
+
   function startUgoira(s) {
     if (s.animTimer != null || !s.frameUrls?.length ||
         !s.frames?.length || !s.isCurrent) return;
@@ -706,6 +1270,8 @@
       queueUgoiraFrame(s,index);
       for(let n=1;n<=UGOIRA_DECODE_AHEAD;n++) queueUgoiraFrame(s,index+n);
       if(player.ready.has(index)&&player.displayed!==index)renderUgoiraFrame(s,index);
+      const frameMs=timeline[index+1]-timeline[index];
+      drawUgoiraMotion(s,index,(player.elapsed-timeline[index])/frameMs,frameMs);
       const pct=timeline[index]/total*100;
       if(s.seekFill)s.seekFill.style.width=pct+'%';
       if(s.seekKnob)s.seekKnob.style.left=pct+'%';
@@ -735,6 +1301,7 @@
   }
 
   function stopUgoira(s) {
+    releaseUgoiraMotion(s);
     if(s.animTimer!=null){
       cancelAnimationFrame(s.animTimer);
       s.animTimer=null;
@@ -750,6 +1317,7 @@
   // シーク中のstopUgoiraとは分離し、ドラッグ中に表示が消えるのを防ぐ。
   function releaseUgoiraCanvas(s) {
     if (s.kind !== 'ugoira') return;
+    releaseUgoiraMotion(s);
     s.ugoiraCanvas?.remove();
     s.ugoiraCanvas = null;
     s.sectionEl?.querySelector('.pts-holder')
@@ -763,7718 +1331,14 @@
     s.pageChip.textContent = text;
   }
 
-  async function prepareUgoira(s) {
-    if (s.frameUrls || s.preparingUgoira) return;
 
-    if (s.ugoiraError || !s.frames?.length) {
-      setUgoiraStatus(
-        s, 'error', s.ugoiraError || 'フレーム情報なし'
-      );
-      return;
-    }
 
-    s.preparingUgoira = true;
-    s.ugoiraAbort = new AbortController();
-    setUgoiraStatus(s, 'loading');
-
-    try {
-      if (s.zipUrl) {
-        s.frameUrls = await unzipFrames(
-          s.zipUrl, s.frames, s.ugoiraAbort.signal
-        );
-
-        if (!s.frameUrls.some(Boolean)) {
-          throw new Error('フレーム0枚');
-        }
-
-        if (s.isCurrent) startUgoira(s);
-        upgradeUgoiraHiRes(s);
-        return;
-      }
-
-      if (s.frameBase && s.frameExt) {
-        const urls = s.frames.map(
-          (f, i) => `${s.frameBase}${i}${s.frameExt}`
-        );
-
-        const available = await new Promise(done => {
-          const probe = new Image();
-          probe.onload = () => done(true);
-          probe.onerror = () => done(false);
-          probe.src = urls[Math.min(1, urls.length - 1)];
-        });
-
-        if (!available) {
-          throw new Error('個別フレーム取得不可');
-        }
-
-        s.frameUrls = urls;
-
-        if (s.isCurrent) startUgoira(s);
-        return;
-      }
-
-      throw new Error('再生手段なし');
-
-    } catch (e) {
-      if (e?.name !== 'AbortError') {
-        s.ugoiraError = e?.message || String(e);
-        setUgoiraStatus(s, 'error', s.ugoiraError);
-      }
-
-    } finally {
-      s.preparingUgoira = false;
-      s.ugoiraAbort = null;
-    }
-  }
-
-  // うごイラ：小さいZIPで先に再生を始め、裏で元サイズのZIPに差し替えて綺麗にする
-  async function upgradeUgoiraHiRes(s) {
-    // 高画質化は表示中の作品だけ（画面外まで展開するとiPhoneのメモリを圧迫する）
-    if (!s.isCurrent) return;
-    if (!s.zipFull || s.zipFull === s.zipUrl || s.hiDone || s.hiRunning) return;
-    s.hiRunning = true;
-    try {
-      const urls = await unzipFrames(s.zipFull, s.frames, undefined);
-      if (urls.filter(Boolean).length > 0) {
-        const old = s.frameUrls;
-        s.frameUrls = urls;
-        s.hiDone = true;
-        clearUgoiraDecodeCache(s);
-        // 旧フレームは表示中imgがまだ参照していることがある。即解放すると画像が消えるので遅らせて解放
-        if (old) setTimeout(() => {
-          old.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
-        }, 5000);
-      }
-    } catch (e) { /* 小さいまま続行 */ }
-    s.hiRunning = false;
-  }
-
-  /* ---------- 閲覧中の読み込み優先（滞り検知つき） ---------- */
-
-  // 表示中のスライドを最優先にする：他のうごイラ準備を止め、未解決なら即解決し、画像の優先度を上げる
-  function prioritize(s) {
-    slides.forEach((o) => {
-      if (o !== s && o.ugoiraAbort) o.ugoiraAbort.abort();
-      if (o.mainImg) { try { o.mainImg.fetchPriority = (o === s) ? 'high' : 'low'; } catch (e) {} }
-    });
-    if (!s.resolved) resolveSlide(s);
-    if (s.kind === 'ugoira' && !s.frameUrls && s.resolved) prepareUgoira(s);
-  }
-
-  // 画像の読み込みを強制的にやり直す（壊れて終わっているときだけ。読み込み途中では呼ばない）
-  function forceReloadImage(s) {
-    const img = s.mainImg;
-    const pair = s.pairs?.[s.pageIdx || 0] || s.pairs?.[0];
-
-    if (!img || !pair) return;
-
-    const url = pair.o || pair.r;
-    if (!url) return;
-
-    img.removeAttribute('src');
-    img.src = url;
-  }
-
-  // 表示中になってから一定時間たっても読み込めていなければ、優先化→強制再読み込みの順で助ける
-  function armWatchdog(s) {
-    if (s.loadWatch) clearTimeout(s.loadWatch);
-    s.loadWatch = setTimeout(() => {
-      if (!s.isCurrent) return;
-      const img = s.mainImg;
-      const imgOk = s.kind === 'ugoira' ? !!s.frameUrls : (img && img.complete && img.naturalWidth > 0);
-      if (s.resolved && imgOk) return;
-      prioritize(s);
-      s.loadWatch = setTimeout(() => {
-        if (!s.isCurrent) return;
-        const im2 = s.mainImg;
-        const ok2 = s.kind === 'ugoira' ? !!s.frameUrls : (im2 && im2.complete && im2.naturalWidth > 0);
-        if (!ok2) {
-          if (!s.resolved && s.resolvePromise && s.resolveAbort) {
-            // 本当に固まった取得だけを中断して、終わってから1回だけやり直す（二重実行はしない）
-            const p = s.resolvePromise;
-            s.resolveAbort.abort();
-            p.then(() => { if (s.isCurrent && !s.resolved) resolveSlide(s); });
-          }
-          else if (!s.resolved) resolveSlide(s);
-          else if (s.kind === 'ugoira') prepareUgoira(s);
-          else if (im2 && im2.complete && im2.naturalWidth === 0) forceReloadImage(s);
-          // 読み込みが続いているだけなら、やり直すとかえって遅くなるので触らない
-        }
-      }, 4000);
-    }, 2600);
-  }
-
-  /* ---------- 表示 ---------- */
-
-  function checkMangaComplete(s, idx) {
-    if (!s || s.kind !== 'multi' || !s.isCurrent || activeView?.slide !== s) return;
-    const img = s.sectionEl?.querySelectorAll('.pts-page img')[idx];
-    if (img?.complete && img.naturalWidth > 0) {
-      activeView.maxPage = Math.max(activeView.maxPage, idx);
-      learnViewing(activeView);
-    }
-  }
-
-  function applyResolved(s) {
-    if (!s.sectionEl) return;
-
-    const multi = s.kind === 'multi' &&
-      Array.isArray(s.pairs) && s.pairs.length > 1;
-
-    s.sectionEl.classList.toggle('pts-multi', multi);
-
-    const holder = s.sectionEl.querySelector('.pts-holder');
-    if (!holder) return;
-
-    if (multi) {
-      holder.innerHTML = '';
-
-      const pager = document.createElement('div');
-      pager.className = 'pts-pager';
-
-      s.pairs.forEach((pair, i) => {
-        const pg = document.createElement('div');
-        pg.className = 'pts-page';
-        const im = document.createElement('img');
-        im.className = 'pts-img';
-        im.decoding = 'async';
-
-        if (i <= 1) im.src = pair.r || pair.o;
-        else im.dataset.src = pair.r || pair.o;
-
-        im.loading = i === 0 ? 'eager' : 'lazy';
-        im.alt = s.title || '';
-        pg.appendChild(im);
-        pager.appendChild(pg);
-      });
-
-      pager.addEventListener('scroll', () => {
-        const idx = Math.max(
-          0,
-          Math.min(
-            s.pairs.length - 1,
-            Math.round(
-              pager.scrollLeft /
-              Math.max(1, pager.clientWidth)
-            )
-          )
-        );
-
-        s.pageIdx = idx;
-
-        if (s.pageChip) {
-          s.pageChip.textContent =
-            `${idx + 1} / ${s.pairs.length}`;
-        }
-
-        loadHorizontalNeighbors(s, idx);
-        upgradeSlide(s);
-        checkMangaComplete(s, idx);
-      }, { passive: true });
-
-      holder.appendChild(pager);
-
-      if (s.pageChip) {
-        s.pageChip.style.display = 'block';
-        s.pageChip.textContent = `1 / ${s.pairs.length}`;
-      }
-
-      s.mainImg = pager.querySelector('img');
-
-    } else {
-      const pair = s.pairs && s.pairs[0];
-      const target = (pair && (pair.r || pair.o)) || s.thumb;
-      const im = s.mainImg;
-
-      if (im && holder.contains(im)) {
-        if (im.dataset) delete im.dataset.ptsPh;
-        if (target &&
-            !(im.getAttribute('src') || '').includes(target)) {
-          im.src = target;
-        }
-        im.alt = s.title || im.alt || '';
-
-      } else {
-        holder.innerHTML = '';
-        const nim = document.createElement('img');
-        nim.className = 'pts-img';
-        nim.decoding = 'async';
-        nim.src = target;
-        nim.alt = s.title || '';
-
-        nim.addEventListener('error', () => {
-          if (s.thumb && !nim.src.includes(s.thumb)) {
-            nim.src = s.thumb;
-          }
-        });
-
-        holder.appendChild(nim);
-        s.mainImg = nim;
-      }
-    }
-  }
-
-  function renderSlide(s, idx) {
-    const sec = document.createElement('section');
-    sec.className = 'pts-slide';
-    s.sectionEl = sec;
-
-    const holder = document.createElement('div');
-    holder.className = 'pts-holder';
-
-    const ph = document.createElement('img');
-    ph.className = 'pts-img';
-    ph.decoding = 'async';
-    ph.loading = idx < 2 ? 'eager' : 'lazy';
-
-    if (idx < 3) {
-      ph.src = upgradeUrl(s.thumb) || s.thumb;
-      ph.onerror = () => {
-        if (s.thumb && ph.src !== s.thumb) {
-          ph.src = s.thumb;
-        }
-      };
-    } else {
-      ph.dataset.ptsPh = '1';
-    }
-
-    ph.alt = s.title || '';
-    holder.appendChild(ph);
-    sec.appendChild(holder);
-    s.mainImg = ph;
-
-    const chip = document.createElement('div');
-    chip.className = 'pts-pagechip';
-    chip.style.display = 'none';
-    sec.appendChild(chip);
-    s.pageChip = chip;
-
-    const status = document.createElement('div');
-    status.className = 'pts-ugoira-status';
-    status.hidden = true;
-    status.setAttribute('role', 'status');
-    sec.appendChild(status);
-    s.ugoiraStatusEl = status;
-
-    if (Number(s.rawType) === 2) {
-      setUgoiraStatus(s, 'loading');
-    }
-
-    const seek = document.createElement('div');
-    seek.className = 'pts-seek';
-    seek.style.display = 'none';
-
-    const fill = document.createElement('div');
-    fill.className = 'pts-seek-fill';
-    seek.appendChild(fill);
-
-    const knob = document.createElement('div');
-    knob.className = 'pts-seek-knob';
-    seek.appendChild(knob);
-
-    s.seekEl = seek;
-    s.seekFill = fill;
-    s.seekKnob = knob;
-
-    const dragTo = clientX => {
-      const r = seek.getBoundingClientRect();
-      const ratio = Math.min(1, Math.max(
-        0, (clientX - r.left) / Math.max(1, r.width)
-      ));
-      dragUgoira(s, ratio);
-    };
-
-    seek.addEventListener('pointerdown', e => {
-      seek.setPointerCapture(e.pointerId);
-      s.seekDragging = true;
-      stopUgoira(s);
-      dragTo(e.clientX);
-      e.stopPropagation();
-      e.preventDefault();
-    });
-
-    seek.addEventListener('pointermove', e => {
-      if (s.seekDragging) dragTo(e.clientX);
-    });
-
-    const endDrag = () => {
-      if (!s.seekDragging) return;
-      s.seekDragging = false;
-
-      if (s.isCurrent && s.frameUrls) {
-        startUgoira(s);
-      }
-    };
-
-    seek.addEventListener('pointerup', endDrag);
-    seek.addEventListener('pointercancel', endDrag);
-    sec.appendChild(seek);
-
-    feedEl.appendChild(sec);
-    if (nearObs) nearObs.observe(sec);
-  }
-
-  /* ---------- 関連作品への切り替え ---------- */
-
-
-
-  // 関連モードの続き読み込み（候補IDが残っている間は末尾に足していく）
-
-  /* ---------- フィード管理 ---------- */
-
-  function updateCounter() {
-    const c = overlay?.querySelector('.pts-counter');
-    if (!c) return;
-
-    if (!slides.length) {
-      c.textContent = mode === 'search'
-        ? '検索結果を取得中…'
-        : '自前フィード準備中…';
-    } else {
-      c.textContent =
-        `${slides.length}件（${mode === 'search' ? '検索' : '自前'}）`;
-    }
-
-    syncDock();
-  }
-
-  function addItems(items) {
-    items = items.filter(s => contentMatches(s) && s.contentFilterEpoch === contentFilterEpoch);
-    if (items.length === 0) { updateCounter(); return; }
-    feedEl.querySelector('.pts-content-empty')?.remove();
-    items.forEach((s) => {
-      slides.push(s);
-      renderSlide(s, slides.length - 1);
-    });
-    updateCounter();
-  }
-
-  // スクロール位置から「表示中スライド」を決める（IntersectionObserverが効かない環境向けの本命判定）
-  let curTimer = null;
-  function markCurrentFromScroll() {
-    if (!feedEl || !slides.length) return;
-
-    const idx = Math.max(
-      0, Math.min(slides.length - 1, currentIndex())
-    );
-
-    slides.forEach((s, i) => {
-      const current = i === idx;
-      s.sectionEl?.classList.toggle('pts-current', current);
-
-      if (current && !s.isCurrent) {
-        s.isCurrent = true;
-
-        if (s.resolved) upgradeSlide(s);
-        else void resolveSlide(s);
-
-        if (s.kind === 'ugoira') {
-          if (s.frameUrls?.length) startUgoira(s);
-          else if (s.resolved) void prepareUgoira(s);
-        }
-
-        armWatchdog(s);
-
-      } else if (!current && s.isCurrent) {
-        s.isCurrent = false;
-        stopUgoira(s);
-        releaseUgoiraCanvas(s);
-        if (s.resolved) upgradeSlide(s);
-      }
-    });
-
-    const s = slides[idx];
-    if (mode === 'search') s.searchFixed = true; // 一度表示した作品は固定
-    onCurrentSlideChanged(s);
-
-    for (
-      let i = Math.max(0, idx - 3);
-      i <= Math.min(slides.length - 1, idx + 3);
-      i++
-    ) {
-      const x = slides[i];
-
-      if (x.mainImg?.dataset?.ptsPh &&
-          !x.mainImg.getAttribute('src') && x.thumb) {
-        x.mainImg.src = x.thumb;
-      }
-    }
-
-    for (const [step, field, urlKey] of [
-      [1, 'preloadedO', 'o'],
-      [2, 'preloadedR', 'r']
-    ]) {
-      const n = slides[idx + step];
-
-      if (n?.resolved &&
-          n.kind !== 'ugoira' &&
-          n.pairs?.[0]?.[urlKey] &&
-          !n[field]) {
-        n[field] = true;
-        const pre = new Image();
-        pre.decoding = 'async';
-        pre.src = n.pairs[0][urlKey];
-      }
-    }
-
-    syncDock();
-  }
-
-  /* ---------- 自前レコメンド v2（履歴500件＋永続化） ---------- */
-  /* ---------- v3.12 配布対応：アカウント識別 ---------- */
-
-  const LOGIN_ID_KEY = 'PTS_LOGIN_USER_ID';
-  const loginIdDetection = { source: '', saved: false, saveError: false };
-
-  async function detectLoggedInPixivId() {
-    const valid = value => {
-      const id = String(value ?? '');
-      return /^[1-9]\d*$/.test(id) ? id : '';
-    };
-    const parse = text => {
-      try { return JSON.parse(text || 'null'); }
-      catch (e) { return null; }
-    };
-    let saved = '';
-    try { saved = valid(localStorage.getItem(LOGIN_ID_KEY)); }
-    catch (e) { /* 保存不可でもページからの検出を続ける。 */ }
-    loginIdDetection.saved = !!saved;
-
-    const detect = (doc, prefix) => {
-      const globalData = parse(
-        doc.querySelector('meta[name="global-data"]')?.content
-      );
-      const next = parse(doc.getElementById('__NEXT_DATA__')?.textContent);
-      const props = next?.props?.pageProps;
-      const state = props?.serverSerializedPreloadedState;
-      const parsedState = typeof state === 'string' ? parse(state) : state;
-      const candidates = [
-        ['global-data.userData.id', globalData?.userData?.id],
-        ['global-data.userData.userId', globalData?.userData?.userId],
-        ['__NEXT_DATA__.gaUserData', props?.gaUserData?.userId],
-        ['__NEXT_DATA__.props.gaUserData', next?.props?.gaUserData?.userId],
-        ['__NEXT_DATA__.gaUserData.root', next?.gaUserData?.userId],
-        ['__NEXT_DATA__.userData.self.id', props?.userData?.self?.id],
-        ['__NEXT_DATA__.userData.self.userId', props?.userData?.self?.userId],
-        ['__NEXT_DATA__.self.id', parsedState?.userData?.self?.id],
-        ['__NEXT_DATA__.self.userId', parsedState?.userData?.self?.userId]
-      ];
-      for (const [source, value] of candidates) {
-        const id = valid(value);
-        if (id) return { id, source: prefix + '.' + source };
-      }
-
-      // 一覧の作者リンクは使わず、本人のプロフィールと明示されたリンクのみ。
-      for (const link of doc.querySelectorAll('a[href*="/users/"]')) {
-        const labels = [link.textContent, link.getAttribute('aria-label'),
-          link.getAttribute('title')];
-        if (!labels.some(label => /^(?:マイページ|自分のプロフィール|プロフィールを見る|my (?:page|profile)|your profile)$/i.test((label || '').trim()))) continue;
-        const url = new URL(link.getAttribute('href'), 'https://www.pixiv.net/');
-        const id = url.origin === 'https://www.pixiv.net'
-          ? valid(url.pathname.match(/^\/users\/(\d+)(?:\/|$)/)?.[1]) : '';
-        if (id) return { id, source: prefix + '.self-profile-link' };
-      }
-
-      // 任意のuserIdは作品作者にも現れるため、ログイン情報の範囲に限定。
-      const html = (doc.documentElement?.innerHTML || '')
-        .replace(/&quot;/g, '"').replace(/\\"/g, '"');
-      const patterns = [
-        /"gaUserData"\s*:\s*\{[^{}]*?"userId"\s*:\s*"?([1-9]\d*)"?/,
-        /"(?:loggedInUserId|loginUserId|currentUserId|myUserId)"\s*:\s*"?([1-9]\d*)"?/,
-        /"userData"\s*:\s*\{\s*"self"\s*:\s*\{[^{}]*?"(?:id|userId)"\s*:\s*"?([1-9]\d*)"?/
-      ];
-      for (let i = 0; i < patterns.length; i++) {
-        const id = valid(html.match(patterns[i])?.[1]);
-        if (id) return { id, source: prefix + '.login-regex-' + (i + 1) };
-      }
-      return null;
-    };
-
-    let result = detect(document, 'page');
-    if (!result) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      try {
-        const response = await fetch('https://www.pixiv.net/', {
-          credentials: 'include', signal: controller.signal
-        });
-        if (response.ok) {
-          const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-          result = detect(doc, 'home-fetch');
-        }
-      } catch (e) { /* 通信失敗時も保存値にフォールバックする。 */ }
-      finally { clearTimeout(timer); }
-    }
-
-    if (result) {
-      loginIdDetection.source = result.source;
-      try {
-        localStorage.setItem(LOGIN_ID_KEY, result.id);
-        loginIdDetection.saved = true;
-      } catch (e) { loginIdDetection.saveError = true; }
-      return result.id;
-    }
-    loginIdDetection.source = saved ? 'localStorage' : '識別情報なし';
-    return saved;
-  }
-
-  // プロフィール読み込み・履歴初期化より先にアカウントを確定する。
-  const ACTIVE_PIXIV_USER_ID = await detectLoggedInPixivId();
-
-  function accountStorageKey(base) {
-    if (!ACTIVE_PIXIV_USER_ID) return '';
-    return `${base}:user:${ACTIVE_PIXIV_USER_ID}`;
-  }
-
-  function legacyProfileOwnerMatches() {
-    if (!ACTIVE_PIXIV_USER_ID) return false;
-
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem('PTS_PROFILE_V2') || 'null'
-      );
-
-      return saved?.version === 2 &&
-        String(saved?.history?.userId || '') ===
-          ACTIVE_PIXIV_USER_ID;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function readAccountStorage(base) {
-    const key = accountStorageKey(base);
-    if (!key) return null;
-
-    try {
-      const current = localStorage.getItem(key);
-      if (current !== null) return current;
-
-      const legacy = localStorage.getItem(base);
-      if (legacy === null) return null;
-
-      if (!legacyProfileOwnerMatches()) return null;
-
-      // コピーのみ。旧キーは変更しない。
-      try {
-        localStorage.setItem(key, legacy);
-      } catch (e) {
-        console.warn('[PTS] 旧データの移行保存失敗', e);
-      }
-
-      return legacy;
-
-    } catch (e) {
-      console.warn('[PTS] アカウント別データ読み込み失敗', e);
-      return null;
-    }
-  }
-
-  /* ---------- v3.13.16: 連続学習・短期意図・明示フィードバック ---------- */
-  const LEARN_LIKE_WEIGHT = 3;
-  const LEARN_BOOKMARK_WEIGHT = 3;
-  const LEARN_OPEN_WEIGHT = 1.5;
-  const LEARN_DWELL_WEIGHT = 0.6;
-  const LEARN_PAGE_WEIGHT = 1;
-  const LEARN_LOOP_WEIGHT = 0.4;
-  const LEARN_REWATCH_WEIGHT = 1.5;
-  const LEARN_REWATCH_LIMIT = 2;
-  const LEARN_VIEW_BUDGET = 3;
-  const LEARN_RATIO_CAP = 1.5;
-  const LEARN_LOOP_CAP = 3;
-  const LEARN_SINGLE_MS = 8000;
-  const LEARN_PAGE_MS = 6000;
-  const LEARN_MULTI_MAX_MS = 120000;
-  const LEARN_ANIMATION_MIN_MS = 2000;
-  const LEARN_ANIMATION_CYCLES = 2;
-  const LEARN_READY_MS = 1000;
-  const LEARN_TICK_MAX_MS = 250;
-  const LEARN_SAVE_INTERVAL_MS = 1500;
-  let viewSaveTimer = null;
-  const LEARN_PROFILE_LIMIT = 2000;
-  const LEARN_PROFILE_CAP = 1000;
-  const LEARN_SESSION_LIMIT = 1000;
-  const LEARN_SESSION_VALUE_CAP = 100;
-  const LEARN_SESSION_HALF_LIFE_MS = 10 * 60 * 1000;
-  const LEARN_SESSION_TAG_WEIGHT = 7;
-  const LEARN_SESSION_AUTHOR_WEIGHT = 9;
-  const LEARN_SESSION_SCORE_CAP = 35;
-  const LEARN_EVENT_LIMIT = 40;
-  const LEARN_EXPLORE_BASE = 0.2;
-  const LEARN_EXPLORE_MIN = 0.1;
-  const LEARN_EXPLORE_MAX = 0.4;
-  const LEARN_EXPLORE_ENGAGE_GAIN = 0.15;
-  const LEARN_ENGAGE_RATIO = 0.6;
-  const LEARN_FRESH_WEIGHT = 8;
-  const LEARN_FRESH_HALF_LIFE_MS = 7 * 86400000;
-  const sessionProfile = {
-    tags: {}, authors: {},
-    works: new Map(), events: []
-  };
-  let sessionProfileOwner = '';
-
-  function trimLearningMap(values, limit = LEARN_PROFILE_LIMIT) {
-    return Object.fromEntries(Object.entries(values)
-      .filter(([, value]) => Number.isFinite(Number(value)) && Number(value) > 0)
-      .sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, limit)
-      .map(([key, value]) => [key, Math.min(LEARN_PROFILE_CAP, Number(value))]));
-  }
-
-  function addProfileWeight(values, key, weight) {
-    // 上限に達していても新しい興味を受け入れ、最も弱い既存項目を置き換える。
-    if (!Object.prototype.hasOwnProperty.call(values, key) &&
-        Object.keys(values).length >= LEARN_PROFILE_LIMIT) {
-      const weakest = Object.keys(values).reduce((a, b) =>
-        Number(values[a]) <= Number(values[b]) ? a : b);
-      delete values[weakest];
-    }
-    values[key] = Math.min(LEARN_PROFILE_CAP, (Number(values[key]) || 0) + weight);
-  }
-
-  function resetSessionLearning() {
-    for (const key of ['tags', 'authors']) {
-      sessionProfile[key] = {};
-    }
-    sessionProfile.works.clear();
-    sessionProfile.events = [];
-    sessionProfileOwner = getMyUserId();
-  }
-
-  function sessionLearning() {
-    if (sessionProfileOwner !== getMyUserId()) resetSessionLearning();
-    return sessionProfile;
-  }
-
-  function sessionValue(values, key, now = Date.now()) {
-    const entry = values[key];
-    return entry ? entry.value * Math.pow(0.5,
-      Math.max(0, now - entry.time) / LEARN_SESSION_HALF_LIFE_MS) : 0;
-  }
-
-  function addSessionValue(values, key, amount) {
-    values[key] = {value: Math.min(LEARN_SESSION_VALUE_CAP, Math.max(0, sessionValue(values, key) + amount)), time: Date.now()};
-    const keys = Object.keys(values);
-    if (keys.length > LEARN_SESSION_LIMIT) {
-      keys.sort((a, b) => values[a].time - values[b].time)
-        .slice(0, keys.length - LEARN_SESSION_LIMIT).forEach(k => delete values[k]);
-    }
-  }
-
-  function learnSessionWork(tags, userId, weight) {
-    const p = sessionLearning();
-    for (const tag of normTags(tags)) {
-      addSessionValue(p.tags, tag, weight);
-    }
-    if (userId) {
-      addSessionValue(p.authors, String(userId), weight);
-    }
-  }
-
-  function sessionWork(id) {
-    const works = sessionLearning().works;
-    id = String(id);
-    if (!works.has(id)) {
-      if (works.size >= LEARN_SESSION_LIMIT) works.delete(works.keys().next().value);
-      works.set(id, {viewed: false, rewatched: 0, learned: 0, opened: false});
-    }
-    return works.get(id);
-  }
-
-  function customSessionScore(it) {
-    const p = sessionLearning();
-    const tags = normTags(it.tags);
-    const positive = tags.reduce((sum, tag) => sum + Math.log1p(sessionValue(p.tags, tag)), 0) *
-      LEARN_SESSION_TAG_WEIGHT + Math.log1p(sessionValue(p.authors, String(it.userId || ''))) *
-      LEARN_SESSION_AUTHOR_WEIGHT;
-    return Math.min(LEARN_SESSION_SCORE_CAP, positive);
-  }
-
-  function customFreshnessScore(it, now = Date.now()) {
-    const time = Date.parse(it.createDate || '');
-    return Number.isFinite(time) && time > 0 && time <= now
-      ? LEARN_FRESH_WEIGHT * Math.pow(0.5, (now - time) / LEARN_FRESH_HALF_LIFE_MS) : 0;
-  }
-
-  function customExplorationRate() {
-    const events = sessionLearning().events;
-    if (!events.length) return LEARN_EXPLORE_BASE;
-    const engaged = events.filter(e => e.engaged).length / events.length;
-    return Math.max(LEARN_EXPLORE_MIN, Math.min(LEARN_EXPLORE_MAX,
-      LEARN_EXPLORE_BASE - engaged * LEARN_EXPLORE_ENGAGE_GAIN));
-  }
-
-  async function learnOpenWork(s) {
-    const generation = feedGeneration;
-    const userId = getMyUserId();
-    if (sessionWork(s.id).opened) return;
-    try {
-      if (!s.tags?.length && !s.userId) await resolveSlide(s);
-      if (generation !== feedGeneration || userId !== getMyUserId() ||
-          (!s.tags?.length && !s.userId) ) return;
-      const record = sessionWork(s.id);
-      if (record.opened) return;
-      record.opened = true;
-      learnFromWork(s.tags, s.userId, s.rawType, LEARN_OPEN_WEIGHT);
-    } catch (e) {
-      console.warn('[PTS] 開く操作の学習失敗', e);
-    }
-  }
-
-  const PROFILE_KEY = 'PTS_PROFILE_V2';
-  const HISTORY_LIMIT = 500;
-  const HISTORY_PAGE_SIZE = 48;
-  const HISTORY_REFRESH_MS = 6 * 60 * 60 * 1000;
-  const HISTORY_HALF_LIFE = 100;
-
-  const profile = { tags: {}, authors: {}, ugoira: 0 };
-  let bookmarkHistory = { userId: '', works: [], initialized: false, updatedAt: 0 };
-  let historyProfile = { tags: {}, authors: {}, ugoira: 0 };
-  let historyInitPromise = null;
-
-  function normTags(tags) {
-    if (!tags) return [];
-    const arr = Array.isArray(tags) ? tags : (Array.isArray(tags.tags) ? tags.tags : []);
-    return [...new Set(arr.map(t => typeof t === 'string' ? t : (t && t.tag) || '').filter(Boolean))];
-  }
-
-  function readProfile() {
-    // 未ログイン・ID不明なら旧データを使用しない。
-    if (!getMyUserId()) return;
-
-    let saved = null;
-
-    try {
-      saved = JSON.parse(
-        readAccountStorage(PROFILE_KEY) || 'null'
-      );
-    } catch (e) {
-      console.warn('[PTS] プロフィール解析失敗', e);
-    }
-
-    if (!saved || saved.version !== 2) return;
-
-    if (saved.live &&
-        typeof saved.live === 'object') {
-      const p = saved.live;
-
-      if (p.tags && typeof p.tags === 'object' &&
-          !Array.isArray(p.tags)) {
-        profile.tags = p.tags;
-      }
-
-      if (p.authors && typeof p.authors === 'object' &&
-          !Array.isArray(p.authors)) {
-        profile.authors = p.authors;
-      }
-
-      profile.ugoira = Number(p.ugoira) || 0;
-    }
-
-    const h = saved.history;
-
-    if (h && Array.isArray(h.works) &&
-        String(h.userId || '') === getMyUserId()) {
-      bookmarkHistory = {
-        userId: getMyUserId(),
-        works: h.works.slice(0, HISTORY_LIMIT),
-        initialized: h.initialized === true,
-        updatedAt: Number(h.updatedAt) || 0,
-        dateMigrationChecked: h.dateMigrationChecked === true
-      };
-    }
-  }
-
-  function saveProfile() {
-    const key = accountStorageKey(PROFILE_KEY);
-
-    if (!key) return;
-
-    profile.tags = trimLearningMap(profile.tags);
-    profile.authors = trimLearningMap(profile.authors);
-    profile.ugoira = Math.min(LEARN_PROFILE_CAP, Math.max(0, Number(profile.ugoira) || 0));
-    try {
-      localStorage.setItem(key, JSON.stringify({
-        version: 2,
-        live: profile,
-        history: bookmarkHistory
-      }));
-    } catch (e) {
-      console.warn('[PTS] profile保存失敗', e);
-    }
-  }
-
-  // ビューア内での保存操作・既存の表示解決時の学習に使う
-  function learnFromWork(tags, userId, illustType, weight = 1, shortTerm = true, persist = true) {
-    const w = Number(weight) || 0;
-    if (w <= 0) return;
-    if (shortTerm) learnSessionWork(tags, userId, w);
-    for (const tag of normTags(tags)) addProfileWeight(profile.tags, tag, w);
-    if (userId != null && userId !== '') {
-      const id = String(userId);
-      addProfileWeight(profile.authors, id, w);
-    }
-    if (Number(illustType) === 2) profile.ugoira += w;
-    if (persist) saveProfile();
-  }
-
-  // 手動ナビゲーション識別は再閲覧学習で使用する。
-  const viewedThisSession = new Set();
-  let navIntent = {reason:'other',until:0};
-  let navigationBound = false;
-  function bindUserNavigationIntent() {
-    if (navigationBound || !feedEl) return;
-    navigationBound = true;
-    const note = () => {navIntent={reason:'user',until:performance.now()+2500};};
-    feedEl.addEventListener('touchstart', e => {
-      if (e.touches.length===1) note();
-    }, {passive:true,capture:true});
-    feedEl.addEventListener('pointerdown', e => {
-      if (e.isPrimary) note();
-    }, {passive:true,capture:true});
-    feedEl.addEventListener('wheel', note, {passive:true});
-  }
-
-  function getMyUserId() {
-    // ページ読み込み時に確認したログインユーザーのみ。
-    // 他人のプロフィールURLや作品の作者IDは使わない。
-    return ACTIVE_PIXIV_USER_ID;
-  }
-
-  function parseBookmarkPage(body) {
-    if (!body || !Array.isArray(body.works)) {
-      throw new Error('bookmarks API: body.worksがありません');
-    }
-
-    return body.works.map(w => {
-      const id = w && (w.id ?? w.illustId);
-      if (id == null) return null;
-
-      return {
-        id: String(id),
-        userId: w.userId == null ? '' : String(w.userId),
-        tags: normTags(w.tags),
-        illustType: contentEnum(w.illustType),
-        xRestrict: contentEnum(w.xRestrict),
-        pageCount: Number(w.pageCount) || 1,
-        createDate: typeof w.createDate === 'string'
-          ? w.createDate : null
-      };
-    }).filter(Boolean);
-  }
-
-  function learnFromBookmarks(works) {
-    const next = { tags: {}, authors: {}, ugoira: 0 };
-    const now = Date.now();
-
-    (works || []).slice(0, HISTORY_LIMIT)
-      .forEach((work, index) => {
-        const ts = Date.parse(work.createDate || '');
-        const valid = Number.isFinite(ts) &&
-          ts > 0 && ts <= now + 86400000;
-
-        const weight = valid
-          ? Math.pow(
-              0.5,
-              Math.max(0, now - ts) / (180 * 86400000)
-            )
-          : Math.pow(0.5, index / HISTORY_HALF_LIFE);
-
-        for (const tag of normTags(work.tags)) {
-          next.tags[tag] = (next.tags[tag] || 0) + weight;
-        }
-
-        if (work.userId) {
-          const id = String(work.userId);
-          next.authors[id] =
-            (next.authors[id] || 0) + weight;
-        }
-
-        if (Number(work.illustType) === 2) {
-          next.ugoira += weight;
-        }
-      });
-
-    historyProfile = next;
-  }
-
-  function applyBookmarkHistory() {
-    learnFromBookmarks(bookmarkHistory.works);
-    for (const work of bookmarkHistory.works) knownBookmarkedIds.add(String(work.id));
-  }
-
-  /* ---------- ブックマークAPI取得 v3.10.2 ---------- */
-
-  // 履歴学習で最後に成功した取得方式。
-  // 診断モードからは変更しない。
-  let bookmarkApiMethod = '';
-
-  // 通常の履歴取得でもHTTPステータスを確認する。
-  // 既存のfetchJson()には変更を加えない。
-  async function getBookmarkApiBody(url) {
-    const res = await fetch(url, {
-      method: 'GET',
-      credentials: 'same-origin'
-    });
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
-    let json;
-
-    try {
-      json = await res.json();
-    } catch (e) {
-      throw new Error(
-        `HTTP ${res.status} / JSON解釈失敗`
-      );
-    }
-
-    if (
-      !json ||
-      typeof json !== 'object' ||
-      Array.isArray(json)
-    ) {
-      throw new Error('JSON形式が想定外');
-    }
-
-    if (json.error) {
-      throw new Error(
-        `API error: ${String(json.message || '詳細なし')}`
-      );
-    }
-
-    if (
-      !json.body ||
-      typeof json.body !== 'object' ||
-      Array.isArray(json.body)
-    ) {
-      throw new Error(
-        'bodyがオブジェクトではない'
-      );
-    }
-
-    return json.body;
-  }
-
-  // 履歴学習と診断で共有するAPIフォールバック。
-  //
-  // A: /ajax/user/{id}/illusts/bookmarks
-  // B: /ajax/user/{id}/bookmarks/artworks
-  //
-  // AがHTTPエラー・形式不正ならBを試す。
-  // 両方失敗した場合は、両方の理由を返す。
-  //
-  // getBody:
-  //   履歴学習 → getBookmarkApiBody
-  //   診断     → diagGetを呼ぶ関数
-  async function fetchBookmarkBodyWithFallback(
-    userId,
-    offset,
-    limit,
-    getBody
-  ) {
-    const id = String(userId || '');
-
-    if (!/^\d+$/.test(id)) {
-      throw new Error(
-        'ユーザーIDが不正または不明'
-      );
-    }
-
-    if (
-      !Number.isInteger(offset) ||
-      offset < 0 ||
-      !Number.isInteger(limit) ||
-      limit < 1 ||
-      limit > 100
-    ) {
-      throw new Error(
-        'offsetまたはlimitが不正'
-      );
-    }
-
-    const params =
-      `?tag=&offset=${offset}` +
-      `&limit=${limit}&rest=show`;
-
-    const sources = [
-      {
-        method: 'illusts/bookmarks',
-        url:
-          `/ajax/user/${id}/illusts/bookmarks${params}`
-      },
-      {
-        method: 'bookmarks/artworks',
-        url:
-          `/ajax/user/${id}/bookmarks/artworks${params}`
-      }
-    ];
-
-    const failures = [];
-
-    for (const source of sources) {
-      try {
-        const body = await getBody(source.url);
-
-        if (
-          !body ||
-          !Array.isArray(body.works)
-        ) {
-          const keys =
-            body && typeof body === 'object'
-              ? Object.keys(body)
-                  .slice(0, 20)
-                  .join(', ')
-              : 'なし';
-
-          throw new Error(
-            `body.worksが配列でない` +
-            `（bodyキー: ${keys}）`
-          );
-        }
-
-        return {
-          body,
-          method: source.method,
-          fallbackReason:
-            failures.length
-              ? failures.join(' / ')
-              : ''
-        };
-
-      } catch (e) {
-        failures.push(
-          `${source.method}: ` +
-          (e && e.message
-            ? e.message
-            : String(e))
-        );
-      }
-    }
-
-    throw new Error(
-      `両方式失敗 / ${failures.join(' / ')}`
-    );
-  }
-
-  // 既存のinitProfileFromBookmarks()から呼ばれる関数。
-  // 返り値は従来どおり作品配列なので
-  // 既存のページング処理を変更する必要はない。
-  async function fetchBookmarkPage(userId, offset) {
-    const result =
-      await fetchBookmarkBodyWithFallback(
-        userId,
-        offset,
-        HISTORY_PAGE_SIZE,
-        getBookmarkApiBody
-      );
-
-    const works = parseBookmarkPage(
-      result.body
-    );
-
-    // パースまで成功した場合のみ記録。
-    bookmarkApiMethod = result.method;
-
-    return works;
-  }
-
-  async function initProfileFromBookmarks(force = false) {
-    if (historyInitPromise) return historyInitPromise;
-
-    const userId = getMyUserId();
-    if (!userId) {
-      console.warn('[PTS] 自分のIDが不明');
-      return;
-    }
-
-    if (bookmarkHistory.userId &&
-        bookmarkHistory.userId !== userId) {
-      bookmarkHistory = {
-        userId, works: [], initialized: false,
-        updatedAt: 0, dateMigrationChecked: false
-      };
-      historyProfile = { tags: {}, authors: {}, ugoira: 0 };
-    }
-
-    bookmarkHistory.userId = userId;
-    applyBookmarkHistory();
-
-    const fresh =
-      Date.now() - bookmarkHistory.updatedAt < HISTORY_REFRESH_MS;
-
-    if (!force && bookmarkHistory.initialized && fresh &&
-        bookmarkHistory.dateMigrationChecked) return;
-
-    historyInitPromise = (async () => {
-      const previous = bookmarkHistory.initialized
-        ? bookmarkHistory.works : [];
-      const oldIds = new Set(previous.map(w => String(w.id)));
-      const incoming = [], seen = new Set();
-      let overlap = false, exhausted = false;
-
-      for (let offset = 0; offset < HISTORY_LIMIT;
-           offset += HISTORY_PAGE_SIZE) {
-        const page = await fetchBookmarkPage(userId, offset);
-        if (!page.length) { exhausted = true; break; }
-
-        for (const work of page) {
-          if (seen.has(work.id)) continue;
-          seen.add(work.id);
-          incoming.push(work);
-          if (oldIds.has(work.id)) overlap = true;
-        }
-
-        if (page.length < HISTORY_PAGE_SIZE) {
-          exhausted = true; break;
-        }
-        if (previous.length && overlap) break;
-      }
-
-      const freshIds = new Set(incoming.map(w => w.id));
-      const merged = previous.length && overlap && !exhausted
-        ? [...incoming, ...previous.filter(w => !freshIds.has(w.id))]
-        : incoming;
-
-      if (!(incoming.length >= HISTORY_LIMIT ||
-            exhausted || (previous.length > 0 && overlap))) {
-        throw new Error('履歴取得が未完了');
-      }
-
-      bookmarkHistory = {
-        userId,
-        works: merged.slice(0, HISTORY_LIMIT),
-        initialized: true,
-        updatedAt: Date.now(),
-        dateMigrationChecked: true
-      };
-
-      applyBookmarkHistory();
-      saveProfile();
-      console.info('[PTS] 履歴学習完了',
-        bookmarkHistory.works.length);
-    })().catch(e =>
-      console.warn('[PTS] 履歴学習失敗', e)
-    ).finally(() => { historyInitPromise = null; });
-
-    return historyInitPromise;
-  }
-
-  // 数値を返す完成版。タグ×3、作者×9、うごイラ、R-18を評価。
-  function tasteScore(it, breakdown = null) {
-    const tags = normTags(it.tags);
-    let tagScore = 0;
-
-    for (const tag of tags) {
-      const count = Math.max(0,
-        (Number(historyProfile.tags[tag]) || 0) +
-        (Number(profile.tags[tag]) || 0) * 1.5
-      );
-
-      tagScore += Math.log1p(count);
-    }
-
-    const tagRaw = tagScore * 3;
-    let authorRaw = 0;
-    let score = Math.min(30, tagRaw);
-
-    const authorId =
-      it.userId == null ? '' : String(it.userId);
-
-    if (authorId) {
-      const count = Math.max(0,
-        (Number(historyProfile.authors[authorId]) || 0) +
-        (Number(profile.authors[authorId]) || 0) * 1.5
-      );
-
-      authorRaw = Math.log1p(count) * 9;
-      score += Math.min(27, authorRaw);
-    }
-
-    if (Number(it.illustType) === 2 &&
-        historyProfile.ugoira + profile.ugoira > 0) {
-      score += 4;
-    }
-
-    if (tags.includes('R-18')) score += 3;
-
-    const total = Number.isFinite(score) ? Math.max(0, score) : 0;
-    if (breakdown && typeof breakdown === 'object') Object.assign(breakdown, {
-      total, tagRaw, tagCapped: Math.min(30, tagRaw),
-      authorRaw, authorCapped: Math.min(27, authorRaw),
-      ugoira: Number(it.illustType) === 2 &&
-        historyProfile.ugoira + profile.ugoira > 0 ? 4 : 0,
-      r18: tags.includes('R-18') ? 3 : 0,
-      other: 0,
-      tagSaturated: tagRaw > 30, authorSaturated: authorRaw > 27,
-      scoreRuleVersion: '3.13.16'
-    });
-    return total;
-  }
-
-  function sortByTaste(items) {
-    return items.map((it, i) => ({ it, i, sc: tasteScore(it) }))
-      .sort((a, b) => (b.sc - a.sc) || (a.i - b.i))
-      .map(x => x.it);
-  }
-
-  readProfile();
-
-  /* ---------- 候補の共通処理（ChatGPT実装案を検証・調整して採用） ---------- */
-
-  const knownBookmarkedIds = new Set();
-  applyBookmarkHistory();
-  initProfileFromBookmarks();
-  let feedGeneration = 0;
-
-  /* ---------- v3.13.22: 表示モードとは独立したコンテンツ条件 ---------- */
-  let viewMode = 'feed'; // 将来の本棚モード用。検索/推薦(mode)とも独立。
-  let contentFilter = { type: 'all', age: 'all' };
-  let contentFilterEpoch = 0;
-  let contentFilterConfirmed = false;
-  let contentFilterDialog = null;
-  const contentMetadata = new Map();
-  const CONTENT_DETAIL_LIMIT = 24;
-
-  function contentEnum(value) {
-    if (typeof value !== 'number' && typeof value !== 'string') return null;
-    if (!/^[012]$/.test(String(value))) return null;
-    return Number(value);
-  }
-  function contentType(it) {
-    return contentEnum(it?.illustType ?? it?.rawType);
-  }
-  function contentKnown(it) {
-    return contentType(it) !== null && contentEnum(it?.xRestrict) !== null;
-  }
-  function contentMatches(it, filter = contentFilter) {
-    const type = contentType(it), age = contentEnum(it?.xRestrict);
-    // 「すべて」でも未知の種別/区分は表示しない。
-    return type !== null && age !== null &&
-      (filter.type === 'all' || (filter.type === 'manga' ? type === 1 : type === 0 || type === 2)) &&
-      (filter.age === 'all' || age === (filter.age === 'safe' ? 0 : 1));
-  }
-  function contentCouldMatch(it, filter) {
-    const type = contentType(it), age = contentEnum(it?.xRestrict);
-    return (type === null || filter.type === 'all' ||
-      (filter.type === 'manga' ? type === 1 : type === 0 || type === 2)) &&
-      (age === null || filter.age === 'all' || age === (filter.age === 'safe' ? 0 : 1));
-  }
-  async function filterContentCandidates(items, isCurrent = () => true) {
-    const epoch = contentFilterEpoch, filter = {...contentFilter};
-    const valid = () => epoch === contentFilterEpoch && isCurrent();
-    let requests = 0;
-    const result = await mapLimited(items, 4, async item => {
-      if (!valid() || !contentCouldMatch(item, filter)) return null;
-      let it = item;
-      if (!contentKnown(it)) {
-        const id = candidateId(it);
-        if (!/^[1-9]\d*$/.test(id)) return null;
-        let pending = contentMetadata.get(id);
-        if (!pending) {
-          if (requests++ >= CONTENT_DETAIL_LIMIT) return null;
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 5000);
-          pending = fetchJson('/ajax/illust/' + encodeURIComponent(id), controller.signal)
-            .then(body => ({illustType: contentEnum(body.illustType),
-              xRestrict: contentEnum(body.xRestrict)})).catch(() => null)
-            .finally(() => clearTimeout(timeout));
-          contentMetadata.set(id, pending);
-          if (contentMetadata.size > 500) contentMetadata.delete(contentMetadata.keys().next().value);
-        }
-        const metadata = await pending;
-        if (!valid() || !metadata) return null;
-        it = {...it, ...metadata};
-      }
-      return valid() && contentMatches(it, filter) ? it : null;
-    });
-    return valid() ? result.filter(Boolean) : [];
-  }
-  function contentFilterKey() {
-    return 'PTS_CONTENT_FILTER_V1:' + (getMyUserId() || 'guest');
-  }
-  function readContentFilter() {
-    try {
-      const saved = JSON.parse(localStorage.getItem(contentFilterKey()) || 'null');
-      contentFilter = {
-        type: ['all','manga','illust'].includes(saved?.type) ? saved.type : 'all',
-        age: ['all','safe','r18'].includes(saved?.age) ? saved.age : 'all'
-      };
-    } catch { contentFilter = {type:'all', age:'all'}; }
-  }
-  function contentFilterLabel() {
-    return ({all:'すべて',manga:'マンガ',illust:'イラスト・うごイラ'})[contentFilter.type] +
-      '・' + ({all:'すべて',safe:'全年齢',r18:'R-18'})[contentFilter.age];
-  }
-  function contentEmptyMessage() {
-    return '現在の条件で表示できる作品がありません。取得範囲や作品情報、pixiv側の閲覧設定などにより結果が得られない場合があります。条件を変更するか、続きを取得してください。';
-  }
-  function showContentEmpty() {
-    if (!feedEl || slides.length || contentFilterDialog?.open) return;
-    let box = feedEl.querySelector('.pts-content-empty');
-    if (!box) {
-      box = document.createElement('div'); box.className = 'pts-content-empty';
-      box.style.cssText = 'padding:100px 24px 160px;color:white;max-width:520px;margin:auto;line-height:1.8';
-      const message = document.createElement('p'); message.textContent = contentEmptyMessage();
-      const change = document.createElement('button'); change.textContent = '条件を変更';
-      change.onclick = () => showContentFilterDialog(false);
-      const more = document.createElement('button'); more.textContent = '続きを取得';
-      more.onclick = async () => {
-        more.disabled = true;
-        try {
-          if (mode === 'search') await searchLoadMore();
-          else { customExhausted = false; customEmptyBatches = 0; await customLoadMore(); }
-        }
-        finally { more.disabled = false; }
-      };
-      box.append(message, change, more); feedEl.appendChild(box);
-    }
-  }
-  function contentSourceMode(filter = contentFilter, fallback = 'all') {
-    // URL側がsafeなら、ビューア選択でその制限を広げない。
-    return fallback === 'safe' ? 'safe' : filter.age === 'all' ? fallback : filter.age;
-  }
-  function contentSourceType(filter = contentFilter) {
-    return filter.type === 'manga' ? 'manga' : filter.type === 'illust' ? 'illust_and_ugoira' : 'all';
-  }
-  function contentDiscoveryUrl(filter = contentFilter) {
-    return '/ajax/discovery/artworks?' + new URLSearchParams({
-      mode: contentSourceMode(filter), type: contentSourceType(filter), limit: '60'
-    });
-  }
-  function showContentFilterDialog(startup) {
-    if (contentFilterDialog?.open) return;
-    const dialog = document.createElement('dialog'); contentFilterDialog = dialog;
-    dialog.id = 'pts-content-filter';
-    dialog.style.cssText = 'position:fixed;top:auto;bottom:12px;width:min(92vw,480px);box-sizing:border-box;max-height:88dvh;overflow:auto;border:0;border-radius:18px;padding:20px;background:#20232b;color:white;z-index:100010';
-    const title = document.createElement('h2'); title.textContent = startup ? '表示する作品を選択' : '表示条件を変更';
-    const form = document.createElement('form'); form.method = 'dialog';
-    for (const [name,label,options] of [
-      ['type','種別',[['all','すべて'],['manga','マンガのみ'],['illust','イラスト・うごイラ']]],
-      ['age','年齢',[['all','すべて'],['safe','全年齢のみ'],['r18','R-18のみ']]]
-    ]) {
-      const field = document.createElement('fieldset'), legend = document.createElement('legend');
-      legend.textContent = label; field.appendChild(legend);
-      for (const [value,text] of options) {
-        const row = document.createElement('label'); row.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer';
-        const input = document.createElement('input'); input.type='radio'; input.name=name; input.value=value;
-        input.checked=contentFilter[name]===value; row.append(input,document.createTextNode(text)); field.appendChild(row);
-      }
-      form.appendChild(field);
-    }
-    const note = document.createElement('p'); note.textContent = 'pixiv側の閲覧設定を尊重します。R-18Gは「R-18のみ」には含みません。';
-    const reset = document.createElement('button'); reset.type='button'; reset.textContent='すべてに戻す';
-    reset.onclick=()=>{for(const name of ['type','age'])form.elements[name].value='all';};
-    const cancel = document.createElement('button'); cancel.type='button'; cancel.textContent='キャンセル';
-    const start = document.createElement('button'); start.type='submit'; start.textContent=startup?'この条件で開始':'確定して先頭から開始';
-    for(const b of [reset,cancel,start])b.style.cssText='min-height:48px;margin:6px 4px;padding:8px 12px';
-    const dismiss = () => {
-      dialog.close(); dialog.remove(); contentFilterDialog=null;
-      if(activeView)activeView.last=performance.now();
-      if(seriesUI.reading)seriesUI.reading.last=performance.now();
-    };
-    const cancelSelection = () => { dismiss(); if(startup)routeAutoStartSuppressed=true; };
-    cancel.onclick=cancelSelection;
-    dialog.addEventListener('cancel',e=>{e.preventDefault();cancelSelection();});
-    form.addEventListener('submit',e=>{
-      e.preventDefault();
-      const next={type:form.elements.type.value,age:form.elements.age.value};
-      const changed=JSON.stringify(next)!==JSON.stringify(contentFilter);
-      contentFilter=next; contentFilterConfirmed=true;
-      try{localStorage.setItem(contentFilterKey(),JSON.stringify(next));}catch{}
-      dismiss();
-      if(startup){openViewer();return;}
-      if(!changed)return;
-      // 再生成は閲覧終了/スキップ学習を呼ばず、全非同期経路を失効させる。
-      activeView=null; navIntent={reason:'other',until:0};
-      contentFilterEpoch++; feedGeneration++;
-      cancelSearchDiagnostic('filter changed'); searchRankPools.clear(); seriesCache.clear();
-      const gridWord=searchGrid.open?searchGrid.config?.word:null;
-      closeSearchGrid(false); gridReturnState=null;
-      seriesCloseLayer(); seriesHideList(); sessionTrail.length=0;
-      overlay.querySelector('.pts-history-panel')?.setAttribute('hidden','');
-      syncContentFilterButton();
-      if(mode==='search')void startSearchFeed(); else void startCustomFeed();
-      if(gridWord)openSearchGrid(gridWord);
-    });
-    form.append(note,reset,cancel,start); dialog.append(title,form); document.body.appendChild(dialog); dialog.showModal();
-    start.focus();
-  }
-  function syncContentFilterButton() {
-    const button=overlay?.querySelector('.pts-content-filter');
-    if(button)button.textContent=contentFilterLabel();
-  }
-
-  readContentFilter();
-
-  function candidateId(it) {
-    const id = it && (it.id != null ? it.id : it.illustId);
-    return id == null ? '' : String(id);
-  }
-
-  function normalizeCandidate(it) {
-    return {
-      ...it,
-      id: candidateId(it),
-      tags: normTags(it.tags),
-      userId: it.userId == null ? null : String(it.userId),
-      illustType: contentType(it),
-      xRestrict: contentEnum(it.xRestrict),
-      bookmarked: !!(it.bookmarkData || it.bookmarked || it.isBookmarked),
-      bookmarkStateKnown:
-        Object.prototype.hasOwnProperty.call(it, 'bookmarkData') ||
-        Object.prototype.hasOwnProperty.call(it, 'bookmarked') ||
-        Object.prototype.hasOwnProperty.call(it, 'isBookmarked'),
-    };
-  }
-
-  async function mapLimited(items, limit, fn) {
-    const result = new Array(items.length);
-    let cursor = 0;
-    await Promise.all(
-      Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (cursor < items.length) {
-          const i = cursor++;
-          result[i] = await fn(items[i], i);
-        }
-      })
-    );
-    return result;
-  }
-
-  // リスト側に無い情報（タグ・作者・保存状態）だけを個別取得で補う
-  async function enrichCandidate(it) {
-    if (!it.id) return null;
-    if (it.tags.length > 0 && it.userId && it.bookmarkStateKnown) return it;
-    try {
-      const body = await fetchJson(`/ajax/illust/${encodeURIComponent(it.id)}`);
-      return {
-        ...it,
-        tags: normTags(body.tags),
-        userId: body.userId == null ? it.userId : String(body.userId),
-        illustType: contentEnum(body.illustType),
-        xRestrict: contentEnum(body.xRestrict),
-        bookmarked: !!body.bookmarkData,
-        bookmarkData: body.bookmarkData,
-      };
-    } catch (e) {
-      return null; // 保存状態が不明な候補は安全側で除外
-    }
-  }
-
-  // 候補を「重複・表示済み・保存済み」を除いて好み順に並べる。
-  // 個別取得での補完は上位 enrichTop 件だけに絞る（全件補完は遅すぎるため。ChatGPT案からの調整点）
-  async function prepareCandidates(rawItems, options = {}) {
-    const excludeIds = new Set((options.excludeIds || []).map(String));
-    slides.forEach((s) => excludeIds.add(String(s.id)));
-    knownBookmarkedIds.forEach((id) => excludeIds.add(id));
-    const seen = new Set();
-    const unique = [];
-    for (const raw of rawItems || []) {
-      if (!raw) continue;
-      const it = normalizeCandidate(raw);
-      if (!it.id || excludeIds.has(it.id) || seen.has(it.id)) continue;
-      if (it.bookmarked) { knownBookmarkedIds.add(it.id); continue; }
-      seen.add(it.id);
-      unique.push(it);
-    }
-    // 通常モードは従来の好みスコア。customではシード票を含むスコアを options.rank で注入できる
-    const rank = typeof options.rank === 'function' ? options.rank : tasteScore;
-    function ranked(items) {
-      return items
-        .map((it, index) => ({ it, index, score: Number(rank(it)) || 0 }))
-        .sort((a, b) => (b.score - a.score) || (a.index - b.index))
-        .map((x) => x.it);
-    }
-    const eligible = await filterContentCandidates(unique, options.isCurrent);
-    const prelim = ranked(eligible);
-    const enrichTop = Math.max(0, Math.floor(options.enrichTop != null ? options.enrichTop : 24));
-    const head = prelim.slice(0, enrichTop);
-    const tail = prelim.slice(enrichTop);
-    const enriched = await mapLimited(head, Math.min(4, Math.max(1, enrichTop)), enrichCandidate);
-    const headOk = enriched.filter((it) => {
-      if (!it) return false;
-      if (it.bookmarked) { knownBookmarkedIds.add(it.id); return false; }
-      return true;
-    });
-    // 補完後も同じランキング関数で並べ直す（票の加点が途中で消えない）
-    return ranked([...headOk, ...tail].filter(it => contentMatches(it)));
-  }
-
-  function candidatesToSlides(items) {
-    return items.filter(it => contentMatches(it)).map(it => {
-      const s = newSlide(
-        it.id,
-        it.url || '',
-        it.title || '',
-        it.userName || ''
-      );
-
-      s.tags = normTags(it.tags);
-      s.userId = it.userId == null
-        ? null : String(it.userId);
-
-      if (Number.isFinite(Number(it.illustType))) {
-        s.rawType = Number(it.illustType);
-      }
-
-      s.xRestrict = contentEnum(it.xRestrict);
-      s.contentFilterEpoch = contentFilterEpoch;
-      s.bookmarked = false;
-      s.customSources = Array.isArray(it._customSources)
-        ? it._customSources.slice()
-        : [];
-      s.createDate = it.createDate || null;
-
-      return s;
-    });
-  }
-
-  /* ---------- 自前フィード v1（ChatGPT実装） ---------- */
-
-  const CUSTOM_TARGET = 80;
-  const CUSTOM_MAX_REQUESTS = 8;
-  const CUSTOM_VOTE_BONUS = 8;
-  const CUSTOM_DISCOVERY_BONUS = 2;
-
-  let customBusy = false;
-  let customSeedOffset = 0;
-  let customNextIds = [];
-  let customQueuedIds = new Set();
-  let customSeenIds = new Set();
-  let customExhausted = false;
-  let customBatchNumber = 0;
-  let customEmptyBatches = 0;
-
-  // 既存フィードの表示済み作品も記録する（同一ページ内では再表示しない）
-
-  function customPageArtworkId() {
-    const match = location.pathname.match(/^\/artworks\/(\d+)(?:\/|$)/);
-    return match ? match[1] : '';
-  }
-
-  function customPickSeeds() {
-    const result = [];
-    const seen = new Set();
-    const add = (id) => {
-      const value = String(id || '');
-      if (!/^\d+$/.test(value) || seen.has(value)) return;
-      seen.add(value);
-      result.push(value);
-    };
-    // 初回のみ作品ページの作品をシードにする
-    // 作品ページのシードは customFetchBatch で詳細を確認してから追加する。
-    // 履歴から3件。次バッチでは3件ずつ先へ進める
-    const works = bookmarkHistory.works || [];
-    let added = 0;
-    while (customSeedOffset < works.length && added < 3) {
-      const work = works[customSeedOffset++];
-      if (!contentMatches(work)) continue;
-      const before = result.length;
-      add(work && work.id);
-      if (result.length > before) added++;
-    }
-    return result.slice(0, 4);
-  }
-
-  function customMergeNextIds(ids) {
-    for (const value of ids || []) {
-      const id = String(value);
-      if (!/^\d+$/.test(id)) continue;
-      if (customQueuedIds.has(id)) continue;
-      if (customSeenIds.has(id)) continue;
-      if (knownBookmarkedIds.has(id)) continue;
-      if (slides.some((s) => String(s.id) === id)) continue;
-      customQueuedIds.add(id);
-      customNextIds.push(id);
-    }
-    if (customNextIds.length > 500) {
-      customNextIds = customNextIds.slice(0, 500);
-      customQueuedIds = new Set(customNextIds);
-    }
-  }
-
-  // 候補をIDで統合し、複数シードから推薦された回数を票として記録する
-  function customCollect(results) {
-    const merged = new Map();
-    let order = 0;
-    for (const result of results) {
-      const perSource = new Set();
-      for (const raw of (Array.isArray(result.items) ? result.items : [])) {
-        const id = candidateId(raw);
-        if (!/^\d+$/.test(id)) continue;
-        let it = merged.get(id);
-        if (!it) {
-          it = { ...raw, id, url: raw.url || raw.urls?.regular || raw.urls?.small ||
-            raw.urls?.original || '', _customVotes: 0, _customDiscovery: false,
-            _customSources: [], _customOrder: order++ };
-          merged.set(id, it);
-        } else {
-          for (const key of ['tags','userId','illustType','xRestrict','pageCount','url','title','userName']) {
-            const old = it[key], newer = raw[key];
-            if ((old == null || old === '' || (Array.isArray(old) && !old.length)) &&
-                newer != null) it[key] = newer;
-          }
-          if (!it.bookmarkData && raw.bookmarkData) it.bookmarkData = raw.bookmarkData;
-        }
-        if (perSource.has(id)) continue;
-        perSource.add(id);
-        if (!it._customSources.includes(result.type)) it._customSources.push(result.type);
-        if (result.type === 'seed') it._customVotes++;
-        if (result.type === 'discovery') it._customDiscovery = true;
-      }
-    }
-    return [...merged.values()];
-  }
-
-  function customBaseScore(it) {
-    const sources = Array.isArray(it._customSources) ? it._customSources : [];
-    return tasteScore(it) + customSessionScore(it) + customFreshnessScore(it) +
-      (Number(it._customVotes) || 0) * CUSTOM_VOTE_BONUS +
-      (sources.includes('discovery') ? 2 : 0) +
-      (sources.includes('tag') ? 5 : 0) +
-      (sources.includes('follow') ? 4 : 0) +
-      (sources.includes('author') ? 3 : 0) +
-      (Number(it.illustType) === 2 ? 5 : 0);
-  }
-
-  // 最終順位を1件ずつ決め、作者の連続だけを緩く抑える
-  function customArrangeBatch(items) {
-    const ranked = customDiversify(items).filter(it =>
-      !isSeen(it.id) &&
-      !knownBookmarkedIds.has(String(it.id))
-    );
-
-    const total = Math.min(CUSTOM_TARGET, ranked.length);
-
-    const topAuthors = new Set(
-      Object.entries(historyProfile.authors)
-        .sort((a, b) => Number(b[1]) - Number(a[1]))
-        .slice(0, 12)
-        .map(([id]) => String(id))
-    );
-
-    const now = Date.now();
-
-    const recentFavorite = it => {
-      if (customBatchNumber !== 0 ||
-          !it._customSources?.includes('follow') ||
-          !topAuthors.has(String(it.userId || ''))) {
-        return false;
-      }
-
-      const ts = Date.parse(it.createDate || '');
-      return Number.isFinite(ts) &&
-        ts <= now && now - ts <= 14 * 86400000;
-    };
-
-    const fav = ranked.filter(recentFavorite).slice(0, 3);
-    const favIds = new Set(fav.map(it => it.id));
-    const rest = ranked.filter(it => !favIds.has(it.id));
-
-    const tastes = rest.map(tasteScore).sort((a, b) => a - b);
-    const median = tastes[Math.floor(tastes.length / 2)] ?? 0;
-
-    const eligible = it =>
-      it._customSources?.some(x =>
-        x === 'discovery' || x === 'tag'
-      ) &&
-      !topAuthors.has(String(it.userId || '')) &&
-      tasteScore(it) <= median &&
-      true;
-
-    const explorationRate = customExplorationRate();
-    const explorers = rest.filter(eligible)
-      .slice(0, Math.floor(total * explorationRate));
-
-    const explorerIds = new Set(explorers.map(it => it.id));
-    const ordinary = rest.filter(it => !explorerIds.has(it.id));
-
-    const output = [], used = new Set();
-
-    for (let i = 0; i < total; i++) {
-      let it = i < fav.length ? fav[i] : null;
-
-      if (!it && Math.floor((i + 1) * explorationRate) > Math.floor(i * explorationRate)) {
-        it = explorers.shift();
-      }
-      if (!it) it = ordinary.shift() || explorers.shift();
-      if (!it || used.has(it.id)) break;
-
-      used.add(it.id);
-      output.push(it);
-    }
-
-    return output;
-  }
-
-  function reorderUnviewedAfterLike(liked) {
-    if (mode !== 'custom' ||
-      !slides.includes(liked) || !feedEl) return;
-
-    const idx = currentIndex();
-    if (slides[idx] !== liked) return;
-
-    const slots = [];
-
-    for (let i = idx + 1; i < slides.length; i++) {
-      if (slides[i].seriesParentId !== String(liked.id) &&
-        !viewedThisSession.has(String(slides[i].id))) {
-        slots.push(i);
-      }
-    }
-
-    if (!slots.length) return;
-
-    const candidates = slots.map(i => slides[i]);
-    const sorted = diversifyBookmarkRecommendations(
-      candidates, liked, [liked]
-    );
-
-    slots.forEach((i, n) => {
-      slides[i] = sorted[n];
-    });
-
-    const top = feedEl.scrollTop;
-
-    for (let i = slides.length - 1; i > idx; i--) {
-      const el = slides[i].sectionEl;
-      const following = slides[i + 1]?.sectionEl || null;
-
-      if (el && el.nextElementSibling !== following) {
-        feedEl.insertBefore(el, following);
-      }
-    }
-
-    feedEl.scrollTop = top;
-  }
-
-  /* ---------- v3.13.9: 関連差し込みのタグ分散 ---------- */
-  const INSERT_IDENTITY_CAP = 2;
-  const INSERT_RECOMMENDATION_LIMIT = 12;
-
-  const REC_GENERIC_TAGS = new Set([
-    'r-18', 'r-18g', 'オリジナル', '創作',
-    '一次創作', '二次創作', 'イラスト', '漫画',
-    'マンガ', 'うごイラ', 'アニメ', 'ゲーム',
-    '女の子', '男の子', '少女', '少年',
-    '女性', '男性', '美少女', 'かわいい',
-    '可愛い', '制服', '水着', '百合',
-    'bl', 'nl', '背景', '風景',
-    '落書き', 'らくがき', 'ファンアート', 'fanart'
-  ]);
-
-  function identityTagSet(tags) {
-    const out = new Set();
-    for (const tag of normTags(tags)) {
-      const t = String(tag).normalize('NFKC')
-        .trim().toLowerCase();
-      if (t.length < 2 || REC_GENERIC_TAGS.has(t) ||
-        /^[\d,]*users?入り$/.test(t)) continue;
-      out.add(t);
-    }
-    return out;
-  }
-
-  function commonIdentityTags(a, b) {
-    if (!a || !b) return 0;
-    const x = identityTagSet(a.tags);
-    const y = identityTagSet(b.tags);
-    let count = 0;
-    for (const tag of x) {
-      if (y.has(tag)) count++;
-    }
-    return count;
-  }
-
-  function identityDiversityPenalty(
-    it, source, last, second, repeated = 0
-  ) {
-    if (!source) return 0;
-
-    const anchor = commonIdentityTags(it, source);
-    const one = last &&
-      String(last.id) !== String(source.id)
-      ? commonIdentityTags(it, last) : 0;
-    const two = second &&
-      String(second.id) !== String(source.id)
-      ? commonIdentityTags(it, second) : 0;
-
-    return Math.min(
-      18,
-      Math.min(12, anchor * 5) +
-      Math.min(8, one * 4) +
-      Math.min(4, two * 2) +
-      (anchor ? Math.min(6, repeated * 1.5) : 0)
-    );
-  }
-
-  function diversifyBookmarkRecommendations(
-    items, source, previous = [source], limit = Infinity
-  ) {
-    const pool = items.slice();
-    const output = [];
-    let repeated = 0;
-
-    while (pool.length && output.length < limit) {
-      const tail = [...previous, ...output];
-      const last = tail.at(-1);
-      const second = tail.at(-2);
-      const a = String(last?.userId || '');
-      const b = String(second?.userId || '');
-
-      let best = -1;
-      let bestScore = -Infinity;
-
-      for (let i = 0; i < pool.length; i++) {
-        const it = pool[i];
-        if (output.length < INSERT_RECOMMENDATION_LIMIT &&
-          repeated >= INSERT_IDENTITY_CAP &&
-          commonIdentityTags(it, source)) continue;
-        const author = String(it.userId || '');
-
-        let score = customBaseScore(it);
-        if (contentType(it) === contentType(source)) score += 12;
-        if (contentEnum(it.xRestrict) === contentEnum(source?.xRestrict)) score += 12;
-
-        if (author && author === a) score -= 12;
-        if (author && author === b) score -= 5;
-
-        score -= identityDiversityPenalty(
-          it, source, last, second, repeated
-        );
-
-        if (score > bestScore) {
-          bestScore = score;
-          best = i;
-        }
-      }
-
-      if (best < 0) break;
-      const chosen = pool.splice(best, 1)[0];
-      output.push(chosen);
-
-      if (commonIdentityTags(chosen, source)) repeated++;
-
-    }
-
-    // 差し込みは不足時も上限厳守。並べ替えは非共有候補を先に使い、
-    // 12件に満たない場合も既存作品を失わないよう残りを末尾へ退避する。
-    return Number.isFinite(limit) ? output : [...output, ...pool];
-  }
-
-  function customDiversify(items) {
-    const pool = items.slice();
-    const output = [];
-    const previousAuthors = slides.slice(-2).map((s) => (s.userId ? String(s.userId) : ''));
-    while (pool.length > 0) {
-      let bestIndex = 0;
-      let bestScore = -Infinity;
-      let bestVotes = -Infinity;
-      let bestOrder = Infinity;
-      const last = output.length ? output[output.length - 1] : null;
-      const secondLast = output.length >= 2 ? output[output.length - 2] : null;
-      const lastAuthor = last ? String(last.userId || '') : (previousAuthors.at(-1) || '');
-      const secondAuthor = secondLast ? String(secondLast.userId || '')
-        : (output.length === 1 ? (previousAuthors.at(-1) || '') : (previousAuthors.at(-2) || ''));
-      for (let i = 0; i < pool.length; i++) {
-        const it = pool[i];
-        const author = String(it.userId || '');
-        let score = customBaseScore(it);
-        if (author && author === lastAuthor) score -= 12;
-        if (author && author === secondAuthor) score -= 5;
-        const votes = Number(it._customVotes) || 0;
-        const ord = Number(it._customOrder) || 0;
-        if (score > bestScore
-          || (score === bestScore && votes > bestVotes)
-          || (score === bestScore && votes === bestVotes && ord < bestOrder)) {
-          bestIndex = i;
-          bestScore = score;
-          bestVotes = votes;
-          bestOrder = ord;
-        }
-      }
-      output.push(pool.splice(bestIndex, 1)[0]);
-    }
-    return output;
-  }
-
-  // 単一バッチの取得（初回：シード最大4＋discovery＋補完枠／追加：nextIds＋新シード＋discovery）
-  async function customFetchBatch() {
-    const generation = feedGeneration, epoch = contentFilterEpoch;
-    const valid = () => generation === feedGeneration && epoch === contentFilterEpoch;
-    const filter = {...contentFilter};
-    const first = customBatchNumber === 0;
-    const jobs = [];
-    const seeds = customPickSeeds();
-    const pageId = first ? customPageArtworkId() : null;
-    if (pageId) {
-      const pageSeed = await filterContentCandidates([{id:pageId}], valid);
-      if (!valid()) return [];
-      if (pageSeed.length) seeds.unshift(pageId);
-    }
-
-    if (!first && customNextIds.length) {
-      const ids = customNextIds.slice(0, 60);
-      jobs.push({
-        type: 'next', ids,
-        run: () => fetchJson(
-          '/ajax/illust/recommend/illusts?illustIds=' +
-          encodeURIComponent(ids.join(',')) + '&lang=ja'
-        )
-      });
-    }
-
-    for (const id of seeds) {
-      jobs.push({
-        type: 'seed',
-        run: () => fetchJson(
-          `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
-        )
-      });
-    }
-
-    jobs.push({
-      type: 'discovery',
-      run: () => fetchJson(
-        contentDiscoveryUrl(filter)
-      )
-    });
-
-    const tags = Object.entries(historyProfile.tags)
-      .map(([k, v]) => [
-        k, Number(v || 0) + Number(profile.tags[k] || 0) * 1.5
-      ])
-      .filter(([k, v]) => k && Number.isFinite(v) && v > 0)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 12)
-      .map(([k]) => k);
-
-    if (!tags.length) tags.push(filter.age === 'safe' ? 'オリジナル' : filter.type === 'manga' ? '漫画' : 'R-18');
-
-    const tagOffset = customTagOffset++;
-    const tag = tags[tagOffset % tags.length];
-
-    jobs.push({
-      type: 'tag',
-      run: () => fetchJson(
-        '/ajax/search/artworks/' + encodeURIComponent(tag) +
-        '?' + new URLSearchParams({
-          word: tag, order: 'popular_d',
-          mode: contentSourceMode(filter), type: contentSourceType(filter),
-          s_mode: 's_tag', p: String(Math.min(1000, Math.floor(tagOffset / tags.length) + 1))
-        })
-      )
-    });
-
-    if (!customFollowFinished) {
-      const page = customFollowPage;
-      jobs.push({
-        type: 'follow', page,
-        run: () => fetchJson(
-          `/ajax/follow_latest/illust?mode=${contentSourceMode(filter)}&p=${page}`
-        )
-      });
-    }
-
-    const authors = Object.entries(historyProfile.authors)
-      .filter(([k, v]) => /^\d+$/.test(k) && Number(v) > 0)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 12);
-
-    // この既存作者APIはイラスト用。マンガ選択では推薦/検索プールを優先する。
-    if (authors.length && filter.type !== 'manga') {
-      const authorId =
-        authors[customAuthorOffset++ % authors.length][0];
-
-      jobs.push({
-        type: 'author',
-        run: () => fetchJson(
-          `/ajax/user/${encodeURIComponent(authorId)}/illusts?limit=30&tag=&lang=ja`
-        )
-      });
-    }
-
-    const chosen = jobs.slice(0, CUSTOM_MAX_REQUESTS);
-
-    const settled = await mapLimited(chosen, 3, async job => {
-      try {
-        return { ok: true, body: await job.run() };
-      } catch (e) {
-        return { ok: false, error: e };
-      }
-    });
-
-    if (!valid()) return [];
-    const results = [], nextIds = [];
-    let successful = 0;
-
-    settled.forEach((r, i) => {
-      const job = chosen[i];
-
-      if (!r?.ok) {
-        if (job.type !== 'author') {
-          console.warn('[PTS custom]', job.type, r?.error);
-        }
-        return;
-      }
-
-      const body = r.body || {};
-      let items = customCandidateArray(body);
-
-      if (job.type === 'author') {
-        items = items.filter(x =>
-          x && typeof x.url === 'string' && x.url.length > 0
-        );
-      }
-
-      if (job.type === 'author' && !items.length) return;
-
-      successful++;
-      results.push({ type: job.type, items });
-
-      if (Array.isArray(body.nextIds)) {
-        nextIds.push(...body.nextIds);
-      }
-
-      if (job.type === 'follow') {
-        if (items.length) customFollowPage = job.page + 1;
-        else customFollowFinished = true;
-      }
-
-      if (job.type === 'next') {
-        const consumed = new Set(job.ids);
-        customNextIds = customNextIds.filter(
-          x => !consumed.has(x)
-        );
-        customQueuedIds = new Set(customNextIds);
-      }
-    });
-
-    if (!successful) {
-      throw new Error('全候補ソースの取得に失敗');
-    }
-
-    customMergeNextIds(nextIds);
-
-    const prepared = await prepareCandidates(
-      customCollect(results),
-      {
-        excludeIds: [...customSeenIds, ...seenTimes.keys()],
-        enrichTop: 0,
-        rank: customBaseScore, isCurrent: valid
-      }
-    );
-
-    return valid() ? customArrangeBatch(prepared) : [];
-  }
-
-  function customResetState() {
-    customBusy = false;
-    customSeedOffset = 0;
-    customNextIds = [];
-    customQueuedIds = new Set();
-    customExhausted = false;
-    customBatchNumber = 0;
-    customEmptyBatches = 0;
-    customTagOffset = 0;
-    customFollowPage = 1;
-    customFollowFinished = false;
-    customAuthorOffset = 0;
-  }
-
-  async function startCustomFeed() {
-    if (!overlay || !feedEl) return;
-
-    feedGeneration++;
-    const generation = feedGeneration;
-
-    slides.forEach(cleanupSlide);
-    slides = [];
-
-    feedEl.replaceChildren();
-    feedEl.scrollTop = 0;
-
-    mode = 'custom';
-    activeView = null;
-
-    customResetState();
-    customSeenIds = new Set();
-    customBusy = true;
-    updateCounter();
-
-    try {
-      let items = [];
-      for (let attempt = 0; attempt < 3 && !items.length; attempt++) {
-        items = await customFetchBatch();
-        if (generation !== feedGeneration) return;
-        if (!items.length) customBatchNumber++;
-      }
-
-      if (
-        generation !== feedGeneration ||
-        mode !== 'custom' ||
-        overlay.style.display === 'none'
-      ) return;
-
-      if (!items.length) {
-        customExhausted = true; showContentEmpty(); return;
-      }
-
-      addItems(candidatesToSlides(items));
-
-      for (const item of items) {
-        customSeenIds.add(String(item.id));
-      }
-
-      customBatchNumber++;
-
-      if (slides[0]) {
-        void resolveSlide(slides[0]);
-      }
-
-      markCurrentFromScroll();
-
-    } catch (e) {
-      if (generation === feedGeneration) {
-        console.warn('[PTS custom]', e);
-
-        const c = overlay.querySelector('.pts-counter');
-        if (c) {
-          c.textContent =
-            '自前フィード失敗: ' + (e?.message || e);
-        }
-      }
-
-    } finally {
-      if (generation === feedGeneration) {
-        customBusy = false;
-        showContentEmpty();
-      }
-    }
-  }
-
-  async function customLoadMore() {
-    if (mode !== 'custom' || customBusy || customExhausted ||
-        !overlay || overlay.style.display === 'none') return;
-    customBusy = true;
-    const generation = feedGeneration;
-    try {
-      const items = await customFetchBatch();
-      if (generation !== feedGeneration || mode !== 'custom') return;
-      const existing = new Set(slides.map(s => String(s.id)));
-      const selected = items.filter(it => !existing.has(String(it.id)) &&
-        !customSeenIds.has(String(it.id)) && !isSeen(it.id) &&
-        !knownBookmarkedIds.has(String(it.id)));
-      if (selected.length) {
-        addItems(candidatesToSlides(selected));
-        for (const it of selected) customSeenIds.add(String(it.id));
-      }
-      customBatchNumber++;
-      customEmptyBatches = selected.length ? 0 : customEmptyBatches + 1;
-      if (customEmptyBatches >= 3) customExhausted = true;
-      if (!selected.length && customSeedOffset >= (bookmarkHistory.works || []).length &&
-          !customNextIds.length && customFollowFinished) customExhausted = true;
-    } catch (e) {
-      console.warn('[PTS custom] 続き取得失敗', e);
-    } finally {
-      if (generation === feedGeneration) { customBusy = false; showContentEmpty(); }
-    }
-  }
-
-
-  // スライド群を指定位置の直後に差し込む（ブックマーク時のおすすめ差し込み用）
-  function insertSlidesAfter(posIdx, newSlides) {
-    newSlides = newSlides.filter(s => contentMatches(s) && s.contentFilterEpoch === contentFilterEpoch);
-    if (newSlides.length === 0) return;
-    newSlides.forEach((s) => renderSlide(s, 99));
-    slides.splice(posIdx + 1, 0, ...newSlides);
-    let anchor = slides[posIdx] ? slides[posIdx].sectionEl : null;
-    newSlides.forEach((s) => {
-      if (anchor && anchor.nextSibling) feedEl.insertBefore(s.sectionEl, anchor.nextSibling);
-      else if (anchor) feedEl.appendChild(s.sectionEl);
-      anchor = s.sectionEl;
-    });
-    updateCounter();
-  }
-
-  /* ---------- v3.11: 既読・セッション・体験制御 ---------- */
-  const SEEN_KEY = 'PTS_SEEN_V1';
-  const SEEN_LIFE = 90 * 86400000;
-  const SEEN_MAX = 5000;
-  const seenTimes = new Map();
-  const sessionTrail = [];
-  let sessionBackTarget = '';
-  let activeView = null;
-  let activeTick = null;
-  let closeConfirmTimer = null;
-  let experienceInstalled = false;
-  let touchStart = null;
-  let lastTap = null;
-
-  function loadSeenTimes() {
-    if (!getMyUserId()) return;
-
-    try {
-      const raw = JSON.parse(
-        readAccountStorage(SEEN_KEY) || '{}'
-      );
-
-      if (!raw || typeof raw !== 'object' ||
-          Array.isArray(raw)) return;
-
-      const now = Date.now();
-
-      for (const [id, value] of Object.entries(raw)) {
-        const time = Number(value);
-
-        if (/^\d+$/.test(id) &&
-            Number.isFinite(time) &&
-            time > now - SEEN_LIFE &&
-            time <= now) {
-          seenTimes.set(id, time);
-        }
-      }
-
-      trimSeenTimes();
-
-    } catch (e) {
-      console.warn('[PTS] 既読読み込み失敗', e);
-    }
-  }
-  function trimSeenTimes() {
-    if (seenTimes.size <= SEEN_MAX) return;
-    const sorted = [...seenTimes].sort((a, b) => a[1] - b[1]);
-    for (const [id] of sorted.slice(0, seenTimes.size - SEEN_MAX)) seenTimes.delete(id);
-  }
-  let seenSaveTimer = null;
-  function saveSeenTimes() {
-    clearTimeout(seenSaveTimer);
-    seenSaveTimer = null;
-
-    const key = accountStorageKey(SEEN_KEY);
-    if (!key) return;
-
-    trimSeenTimes();
-
-    try {
-      localStorage.setItem(
-        key,
-        JSON.stringify(Object.fromEntries(seenTimes))
-      );
-    } catch (e) {
-      console.warn('[PTS] 既読保存失敗', e);
-    }
-  }
-  function markSeen(id) {
-    if (!/^\d+$/.test(String(id))) return;
-    seenTimes.set(String(id), Date.now());
-    trimSeenTimes();
-    clearTimeout(seenSaveTimer);
-    seenSaveTimer = setTimeout(saveSeenTimes, 1500);
-  }
-  function isSeen(id) { return seenTimes.has(String(id)); }
-  loadSeenTimes();
-  window.addEventListener('pagehide', () => {
-    tickViewing();
-    saveProfile();
-    saveSeenTimes();
-  });
-
-  function visibleReady(s) {
-    if (!s || !contentMatches(s) || !s.resolved) return false;
-    if (s.kind === 'ugoira') return !!(s.frameUrls && s.frameUrls.length);
-    const img = s.mainImg;
-    return !!(img && img.complete && img.naturalWidth > 0);
-  }
-
-
-  const SERIES_PAGE_SIZE=12, SERIES_ROW_H=70, SERIES_TTL=1800000;
-  const seriesCache=new Map();
-  const seriesUI={bar:null,sheet:null,list:null,rows:null,status:null,retry:null,
-    label:null,activeId:null,sheetOpen:false,layerOpen:false,
-    episode:null,layer:null,backdrop:null,reading:null,clock:null,
-    initializing:false,requestToken:0,layerToken:0};
-  let seriesActiveRequests=0;
-  const seriesRequestQueue=[];
-  function parseArtworkSeries(body){
-    const nav=body?.seriesNavData;
-    if(Number(body?.illustType)!==1||!nav||nav.seriesType!=='manga')return null;
-    const id=String(nav.seriesId??''),order=Number(nav.order);
-    if(!/^[1-9]\d*$/.test(id)||!Number.isFinite(order)||order<=0)return null;
-    return {id,order,title:String(nav.title||'')};
-  }
-  function seriesCacheFor(id){
-    const now=Date.now();
-    for(const [key,v] of seriesCache)if(now-v.updated>SERIES_TTL)seriesCache.delete(key);
-    id=String(id);
-    let cache=seriesCache.get(id);
-    if(!cache)cache={id,total:null,pages:new Set(),rows:new Map(),
-      pending:new Map(),error:'',updated:now};
-    else seriesCache.delete(id);
-    cache.updated=now;
-    seriesCache.set(id,cache);
-    while(seriesCache.size>3)seriesCache.delete(seriesCache.keys().next().value);
-    return cache;
-  }
-  function seriesPageForIndex(cache,index){
-    return cache.total==null?1:Math.floor((cache.total-1-index)/12)+1;
-  }
-  async function seriesFetchPage(cache,page){
-    page=Number(page);
-    if(!Number.isSafeInteger(page)||page<1||
-      (cache.total!=null&&page>Math.ceil(cache.total/12)))return false;
-    if(cache.pages.has(page))return true;
-    if(cache.pending.has(page))return cache.pending.get(page);
-    const task=(async()=>{
-      if(seriesActiveRequests>=2)await new Promise(r=>seriesRequestQueue.push(r));
-      seriesActiveRequests++;
-      try{
-        const body=await fetchJson('/ajax/series/'+encodeURIComponent(cache.id)+'?p='+page);
-        const total=Number(body?.page?.total),list=body?.page?.series,
-          thumbs=body?.thumbnails?.illust;
-        if(!Number.isSafeInteger(total)||total<1||!Array.isArray(list)||
-          !Array.isArray(thumbs))throw Error('シリーズAPIの応答形式が不正です');
-        if(cache.total!=null&&cache.total!==total){
-          cache.pages.clear();cache.rows.clear();
-        }
-        cache.total=total;
-        const epoch=contentFilterEpoch;
-        const rows=thumbs.map((t,i)=>({...t,id:t?.id??t?.illustId??
-          (thumbs.length===list.length?list[i]?.workId:null)}));
-        const eligible=await filterContentCandidates(rows);
-        if(epoch!==contentFilterEpoch)return false;
-        const allowedIds=new Set(eligible.map(candidateId));
-        const thumbMap=new Map(thumbs.map(t=>[String(t?.id??t?.illustId??''),t]));
-        list.forEach((item,offset)=>{
-          const id=String(item?.workId??''),order=Number(item?.order);
-          const index=total-1-((page-1)*12+offset);
-          if(index<0||!/^[1-9]\d*$/.test(id)||!Number.isFinite(order))return;
-          const aligned=thumbs.length===list.length &&
-            String(thumbs[offset]?.id??thumbs[offset]?.illustId??'')==='';
-          const thumb=thumbMap.get(id)||(aligned?thumbs[offset]:null);
-          cache.rows.set(index,{id,index,order,allowed:allowedIds.has(id),
-            title:allowedIds.has(id)?thumb?.title||'':'表示条件に合わないか情報を確認できません',
-            thumbnail:allowedIds.has(id)?thumb?.url||'':'',pageCount:Number(thumb?.pageCount)||null});
-        });
-        cache.pages.add(page);cache.error='';cache.updated=Date.now();
-        return true;
-      }catch(e){cache.error=String(e?.message||e);return false;}
-      finally{
-        seriesActiveRequests--;
-        seriesRequestQueue.shift()?.();
-        cache.pending.delete(page);
-        if(seriesUI.sheetOpen&&seriesUI.activeId===cache.id)seriesRenderList();
-        syncSeriesBar();
-      }
-    })();
-    cache.pending.set(page,task);
-    return task;
-  }
-  async function seriesFindOrder(cache,order){
-    if(!cache.pages.has(1))await seriesFetchPage(cache,1);
-    if(!cache.total)return null;
-    const lookup=()=>[...cache.rows.values()].find(r=>r.order===order);
-    const known=lookup();if(known)return known;
-    const guess=Math.max(1,Math.min(Math.ceil(cache.total/12),
-      Math.ceil((cache.total-order+1)/12)));
-    await seriesFetchPage(cache,guess);
-    return lookup()||null;
-  }
-  function seriesRenderList(){
-    if(!seriesUI.sheetOpen||!seriesUI.activeId||!seriesUI.list)return;
-    const cache=seriesCacheFor(seriesUI.activeId);
-    seriesUI.status.textContent=cache.error?'取得失敗: '+cache.error:
-      cache.total==null?'取得中…':
-        '取得済み '+cache.rows.size+' / 全'+cache.total+'作品';
-    seriesUI.retry.hidden=!cache.error;
-    if(cache.total==null){seriesUI.rows.replaceChildren();return;}
-    const top=seriesUI.list.scrollTop,first=Math.max(0,Math.floor(top/70)-8),
-      count=Math.min(56,Math.ceil(seriesUI.list.clientHeight/70)+16),
-      end=Math.min(cache.total,first+count),frag=document.createDocumentFragment();
-    for(let i=first;i<end;i++){
-      const item=cache.rows.get(i),button=document.createElement('button');
-      button.type='button';button.className='pts-series-row';
-      button.style.top=i*70+'px';
-      if(!item){button.disabled=true;button.textContent='読み込み中…';}
-      else{
-        const img=document.createElement('img');img.alt='';img.loading='lazy';
-        if(item.thumbnail)img.src=item.thumbnail;
-        const label=document.createElement('span');
-        label.textContent='第'+item.order+'話 '+(item.title||'タイトル未取得');
-        button.append(img,label);
-        const current=seriesUI.episode?.id||slides[currentIndex()]?.id;
-        if(String(current)===item.id)button.classList.add('pts-series-selected');
-        button.disabled=!item.allowed;
-        button.addEventListener('click',()=>void seriesOpenEpisode(item));
-      }
-      frag.appendChild(button);
-    }
-    seriesUI.rows.replaceChildren(frag);
-    seriesUI.rows.style.height=cache.total*70+'px';
-    if(cache.error||seriesUI.initializing)return;
-    const index=Math.max(0,Math.min(cache.total-1,Math.floor(
-      (top+seriesUI.list.clientHeight/2)/70)));
-    const page=seriesPageForIndex(cache,index);
-    if(!cache.pages.has(page)&&!cache.pending.has(page)){
-      void seriesFetchPage(cache,page).then(ok=>{
-        if(!ok||!seriesUI.sheetOpen||seriesUI.activeId!==cache.id)return;
-        const adjacent=index>cache.total/2?page+1:page-1;
-        if(adjacent>=1&&adjacent<=Math.ceil(cache.total/12)&&
-           !cache.pages.has(adjacent))void seriesFetchPage(cache,adjacent);
-      });
-    }
-  }
-  function syncSeriesBar(){
-    if(!seriesUI.bar||!overlay)return;
-    const info=slides[currentIndex()]?.series;
-    const shown=!!info&&!seriesUI.layerOpen&&!searchGrid.open&&
-      overlay.style.display!=='none';
-    seriesUI.bar.hidden=!shown;
-    if(!shown)return;
-    const total=seriesCache.get(info.id)?.total;
-    seriesUI.bar.textContent=(info.title||'漫画シリーズ')+' · '+
-      (total==null?'第'+info.order+'話':info.order+' / '+total);
-  }
-  async function seriesShowList(){
-    const info=seriesUI.episode?.series||slides[currentIndex()]?.series;
-    if(!info||!seriesUI.sheet)return;
-    seriesUI.activeId=info.id;seriesUI.sheetOpen=true;
-    seriesUI.initializing=true;
-    seriesUI.sheet.hidden=false;
-    if(seriesUI.backdrop)seriesUI.backdrop.hidden=false;
-    seriesUI.label.textContent=info.title||'漫画シリーズ';
-    const token=++seriesUI.requestToken,cache=seriesCacheFor(info.id);
-    seriesRenderList();
-    if(!cache.pages.has(1))await seriesFetchPage(cache,1);
-    if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
-    const row=await seriesFindOrder(cache,info.order);
-    if(token!==seriesUI.requestToken||!seriesUI.sheetOpen)return;
-    seriesUI.initializing=false;
-    if(row)seriesUI.list.scrollTop=Math.max(0,row.index*70-seriesUI.list.clientHeight/2);
-    seriesRenderList();
-    if(!row&&cache.total!=null)
-      seriesUI.status.textContent='現在話を特定できません。スクロールして探してください。';
-  }
-  function seriesHideList(){
-    seriesUI.sheetOpen=false;seriesUI.initializing=false;
-    seriesUI.requestToken++;
-    if(seriesUI.sheet)seriesUI.sheet.hidden=true;
-    if(seriesUI.backdrop)seriesUI.backdrop.hidden=true;
-    if(activeView)activeView.last=performance.now();
-    syncSeriesBar();
-  }
-  function installSeriesUI(){
-    if(!overlay||seriesUI.bar)return;
-    const bar=document.createElement('button');
-    bar.type='button';bar.className='pts-series-bar';bar.hidden=true;
-    bar.addEventListener('click',()=>void seriesShowList());
-    overlay.appendChild(bar);seriesUI.bar=bar;
-    const backdrop=document.createElement('div');
-    backdrop.className='pts-series-backdrop';backdrop.hidden=true;
-    backdrop.addEventListener('click',seriesHideList);
-    overlay.appendChild(backdrop);seriesUI.backdrop=backdrop;
-    const panel=document.createElement('section');
-    panel.className='pts-series-sheet';panel.hidden=true;
-    panel.innerHTML='<header><strong class="pts-series-name"></strong>'+
-      '<button type="button" class="pts-series-close">閉じる</button></header>'+
-      '<div class="pts-series-scroll"><div class="pts-series-rows"></div></div>'+
-      '<footer><span class="pts-series-status"></span>'+
-      '<button class="pts-series-retry" type="button" hidden>再試行</button></footer>';
-    overlay.appendChild(panel);seriesUI.sheet=panel;
-    seriesUI.label=panel.querySelector('.pts-series-name');
-    seriesUI.list=panel.querySelector('.pts-series-scroll');
-    seriesUI.rows=panel.querySelector('.pts-series-rows');
-    seriesUI.status=panel.querySelector('.pts-series-status');
-    seriesUI.retry=panel.querySelector('.pts-series-retry');
-    panel.querySelector('.pts-series-close').addEventListener('click',seriesHideList);
-    seriesUI.retry.addEventListener('click',()=>{
-      const c=seriesCacheFor(seriesUI.activeId);
-      c.error='';
-      const i=Math.floor(seriesUI.list.scrollTop/70);
-      void seriesFetchPage(c,c.total==null?1:seriesPageForIndex(c,i));
-    });
-    let pending=false;
-    seriesUI.list.addEventListener('scroll',()=>{
-      if(pending)return;
-      pending=true;requestAnimationFrame(()=>{pending=false;seriesRenderList();});
-    },{passive:true});
-    const st=document.createElement('style');
-    st.textContent=[
-      '#pts-overlay .pts-series-bar[hidden],#pts-overlay .pts-series-sheet[hidden],#pts-overlay .pts-series-retry[hidden],#pts-overlay .pts-series-backdrop[hidden]{display:none!important}',
-      '#pts-overlay .pts-series-backdrop{position:absolute;inset:0;z-index:75;background:#0009}',
-      '#pts-overlay .pts-series-bar{position:absolute;z-index:29;bottom:calc(67px + env(safe-area-inset-bottom));left:12px;right:12px;width:calc(100% - 24px);min-height:40px;padding:7px 14px;border:1px solid #ffffff40;border-radius:10px;background:#17171be8;color:#fff;text-align:left;font:13px system-ui;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-      '#pts-overlay .pts-series-sheet{position:absolute;z-index:76;bottom:0;left:0;right:0;height:73dvh;max-height:75vh;display:flex;flex-direction:column;background:#17171c;color:white;border-radius:18px 18px 0 0;border-top:1px solid #ffffff50;box-shadow:0 -18px 40px #000b}',
-      '#pts-overlay .pts-series-sheet header,#pts-overlay .pts-series-sheet footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;flex-shrink:0}',
-      '#pts-overlay .pts-series-sheet header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '#pts-overlay .pts-series-sheet button{color:white}',
-      '#pts-overlay .pts-series-close,#pts-overlay .pts-series-retry{border:1px solid #ffffff40;border-radius:9px;background:#383840;padding:9px 13px}',
-      '#pts-overlay .pts-series-scroll{flex:1;overflow-y:auto;position:relative;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}',
-      '#pts-overlay .pts-series-rows{position:relative}',
-      '#pts-overlay .pts-series-row{position:absolute;left:0;right:0;height:70px;display:flex;align-items:center;gap:13px;width:100%;background:#202027;color:white;border:0;border-bottom:1px solid #ffffff18;text-align:left;padding:5px 14px;box-sizing:border-box;font:13px system-ui}',
-      '#pts-overlay .pts-series-row[disabled]{opacity:.65}',
-      '#pts-overlay .pts-series-row img{width:56px;height:56px;object-fit:cover;background:#333;border-radius:5px;flex:none}',
-      '#pts-overlay .pts-series-row span{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
-      '#pts-overlay .pts-series-selected{background:#34445d}',
-      '#pts-overlay .pts-series-status{font-size:12px;color:#ccc}'
-    ].join('\n');
-    document.head.appendChild(st);
-  }
-
-
-  // 専用閲覧レイヤー。slides・feedEl・検索順位には一切挿入しない。
-  function seriesStopReading(){
-    if(seriesUI.clock){clearInterval(seriesUI.clock);seriesUI.clock=null;}
-    if(seriesUI.reading){
-      saveProfile();
-      seriesUI.reading=null;
-    }
-  }
-  function seriesTickReading(){
-    const r=seriesUI.reading;
-    if(!r)return;
-    const now=performance.now();
-    const dt=Math.min(250,Math.max(0,now-r.last));r.last=now;
-    if(contentFilterDialog?.open||!seriesUI.layerOpen||seriesUI.sheetOpen||document.hidden||
-       seriesUI.episode?.id!==r.id||!r.imageReady)return;
-    r.elapsed+=dt;
-    if(!r.recorded&&r.elapsed>=LEARN_READY_MS){
-      r.recorded=true;
-      markSeen(r.id);
-      sessionWork(r.id).viewed=true;
-    }
-    if(r.elapsed<LEARN_READY_MS)return;
-    const e=seriesUI.episode;
-    const target=Math.min(LEARN_VIEW_BUDGET,viewingMetrics({
-      slide:{kind:e.pairs.length>1?'multi':'single',pairs:e.pairs},
-      elapsed:r.elapsed,maxPage:r.maxPage||0,played:0,loops:0
-    }).score);
-    const delta=Math.max(0,target-r.score);
-    if(delta>0){
-      r.score=target;
-      learnFromWork(e.tags,e.userId,e.rawType,delta,true,false);
-      if(!viewSaveTimer)viewSaveTimer=setTimeout(()=>{
-        viewSaveTimer=null;saveProfile();
-      },LEARN_SAVE_INTERVAL_MS);
-    }
-  }
-  function seriesUpdateEpisodeUI(){
-    const e=seriesUI.episode,root=seriesUI.layer;
-    if(!root)return;
-    const title=root.querySelector('.pts-series-episode-title');
-    const page=root.querySelector('.pts-series-page-info');
-    const prev=root.querySelector('.pts-series-prev-page');
-    const next=root.querySelector('.pts-series-next-page');
-    const before=root.querySelector('.pts-series-prev-episode');
-    const after=root.querySelector('.pts-series-next-episode');
-    const save=root.querySelector('.pts-series-save');
-    title.textContent=e?(e.title||'漫画'):'読み込み中…';
-    page.textContent=e?(seriesUI.pageIndex+1)+' / '+e.pairs.length:'…';
-    prev.disabled=!e||seriesUI.pageIndex===0;
-    next.disabled=!e||seriesUI.pageIndex>=e.pairs.length-1;
-    if(e){
-      const cache=seriesCacheFor(e.series.id);
-      before.disabled=e.index<=0;
-      after.disabled=cache.total!=null&&e.index>=cache.total-1;
-      save.textContent=e.bookmarked?'✓ 保存済み':'♡ ブックマーク';
-      save.disabled=!!e.bookmarked;
-    }else{before.disabled=true;after.disabled=true;save.disabled=true;}
-  }
-  async function seriesShowPage(index){
-    const e=seriesUI.episode;
-    if(!e||index<0||index>=e.pairs.length||!seriesUI.layerOpen)return;
-    seriesUI.pageIndex=index;
-    if(seriesUI.reading){
-      seriesUI.reading.imageReady=false;
-      seriesUI.reading.maxPage=Math.max(seriesUI.reading.maxPage||0,index);
-    }
-    const imageRoot=seriesUI.layer.querySelector('.pts-series-image');
-    const token=++seriesUI.layerToken;
-    const url=e.pairs[index]?.o||e.pairs[index]?.r;
-    if(!url)return;
-    const img=new Image();
-    img.decoding='async';img.alt=e.title||'';
-    img.className='pts-series-artwork';
-    img.src=url;
-    try{
-      if(img.decode)await img.decode();
-      else await new Promise((resolve,reject)=>{
-        img.onload=resolve;img.onerror=()=>reject(new Error('画像読み込み失敗'));
-        if(img.complete&&img.naturalWidth)resolve();
-      });
-    }catch(err){
-      if(token===seriesUI.layerToken)
-        seriesUI.layer.querySelector('.pts-series-error').textContent=
-          String(err?.message||err);
-      return;
-    }
-    if(token!==seriesUI.layerToken||!seriesUI.layerOpen||
-       seriesUI.episode!==e)return;
-    imageRoot.replaceChildren(img);
-    seriesUI.layer.querySelector('.pts-series-error').textContent='';
-    if(seriesUI.reading)seriesUI.reading.imageReady=true;
-    seriesUpdateEpisodeUI();
-  }
-  async function seriesOpenEpisode(item){
-    if(!item||!seriesUI.layer)return;
-    const source=seriesUI.episode?.series||slides[currentIndex()]?.series;
-    if(!source||!seriesUI.sheetOpen)return;
-    seriesUI.layerOpen=true;
-    seriesUI.layer.hidden=false;
-    const loading=seriesUI.layer.querySelector('.pts-series-error');
-    loading.textContent='作品を読み込み中…';
-    const token=++seriesUI.layerToken;
-    seriesStopReading();seriesHideList();
-    seriesUI.episode=null;
-    seriesUI.layer.querySelector('.pts-series-image').replaceChildren();
-    seriesUpdateEpisodeUI();
-    try{
-      const body=await fetchJson('/ajax/illust/'+encodeURIComponent(item.id));
-      if(token!==seriesUI.layerToken||!seriesUI.layerOpen)return;
-      if(!contentMatches(body))throw new Error('現在の表示条件に合わないか、種別・年齢情報を確認できません');
-      const info=parseArtworkSeries(body);
-      if(!info||info.id!==source.id||String(body.id??item.id)!==item.id)
-        throw new Error('指定したシリーズの漫画を確認できません');
-      const count=Math.max(1,Number(body.pageCount)||1);
-      let pairs=[];
-      if(count>1){
-        const pages=await fetchJson('/ajax/illust/'+encodeURIComponent(item.id)+'/pages');
-        if(token!==seriesUI.layerToken||!seriesUI.layerOpen)return;
-        if(!Array.isArray(pages)||pages.length<1)
-          throw new Error('漫画のページ一覧を取得できません');
-        pairs=pages.map(p=>pickPair(p.urls)).filter(p=>p.r||p.o);
-      }else pairs=[pickPair(body.urls)];
-      if(!pairs.length)throw new Error('画像URLがありません');
-      const e={id:item.id,index:item.index,order:item.order,
-        title:body.title||item.title||'',series:info,pairs,
-        tags:normTags(body.tags),userId:body.userId==null?null:String(body.userId),
-        rawType:1,xRestrict:contentEnum(body.xRestrict),bookmarked:!!body.bookmarkData||
-          knownBookmarkedIds.has(String(item.id)),tasteLearned:false,
-        bookmarkBtn:seriesUI.layer.querySelector('.pts-series-save')};
-      seriesUI.episode=e;seriesUI.pageIndex=0;
-      seriesUI.reading={id:e.id,last:performance.now(),
-        elapsed:0,recorded:false,score:0,maxPage:0,imageReady:false};
-      seriesUI.clock=setInterval(seriesTickReading,250);
-      seriesUpdateEpisodeUI();
-      await seriesShowPage(0);
-    }catch(err){
-      if(token===seriesUI.layerToken)loading.textContent=
-        '作品を開けません: '+String(err?.message||err);
-    }
-  }
-  async function seriesStepEpisode(step){
-    const e=seriesUI.episode;
-    if(!e||!seriesUI.layerOpen||seriesUI.sheetOpen)return;
-    const cache=seriesCacheFor(e.series.id);
-    const index=e.index+step;
-    if(index<0||(cache.total!=null&&index>=cache.total))return;
-    let row=cache.rows.get(index);
-    if(!row){
-      const ok=await seriesFetchPage(cache,seriesPageForIndex(cache,index));
-      if(!ok)return;
-      row=cache.rows.get(index);
-    }
-    if(!row||seriesUI.episode!==e)return;
-    // 専用レイヤーからの話移動でも同じ処理を使用する。
-    seriesUI.sheetOpen=true;
-    await seriesOpenEpisode(row);
-  }
-  function seriesCloseLayer(){
-    if(!seriesUI.layerOpen)return;
-    seriesUI.layerOpen=false;
-    seriesUI.layerToken++;
-    seriesStopReading();
-    seriesHideList();
-    seriesUI.episode=null;
-    if(seriesUI.layer){
-      seriesUI.layer.hidden=true;
-      seriesUI.layer.querySelector('.pts-series-image').replaceChildren();
-    }
-    if(activeView)activeView.last=performance.now();
-    syncDock();
-  }
-  async function seriesBookmarkEpisode(byLike){
-    const e=seriesUI.episode;
-    if(!e||!seriesUI.layerOpen||seriesUI.sheetOpen)return;
-    const button=seriesUI.layer.querySelector('.pts-series-save');
-    if(e.bookmarkPromise)return;
-    if(byLike&&!e.likedThisSession){
-      e.likedThisSession=true;
-      learnFromWork(e.tags,e.userId,e.rawType,LEARN_LIKE_WEIGHT);
-      e.tasteLearned=true;
-    }
-    if(e.bookmarked)return; // いいねの学習のみ（重複ブックマークPOSTはしない）
-    button.disabled=true;
-    try{
-      await ensureBookmarked(e);
-      if(seriesUI.episode===e)seriesUpdateEpisodeUI();
-    }catch(err){
-      if(seriesUI.episode===e){
-        seriesUI.layer.querySelector('.pts-series-error').textContent=
-          '保存失敗: '+String(err?.message||err);
-        button.disabled=false;
-      }
-    }
-  }
-  function installSeriesLayer(){
-    if(!overlay||seriesUI.layer)return;
-    const root=document.createElement('section');
-    root.className='pts-series-layer';root.hidden=true;
-    root.innerHTML=
-      '<header><span class="pts-series-episode-title"></span></header>'+
-      '<div class="pts-series-image"></div>'+
-      '<div class="pts-series-error" role="status"></div>'+
-      '<div class="pts-series-controls">'+
-      '<button type="button" class="pts-series-to-list">一覧へ</button>'+
-      '<button type="button" class="pts-series-to-feed">フィードへ</button>'+
-      '<button type="button" class="pts-series-prev-episode">前話</button>'+
-      '<button type="button" class="pts-series-next-episode">次話</button>'+
-      '<button type="button" class="pts-series-prev-page">前ページ</button>'+
-      '<span class="pts-series-page-info">…</span>'+
-      '<button type="button" class="pts-series-next-page">次ページ</button>'+
-      '<button type="button" class="pts-series-save">♡ ブックマーク</button>'+
-      '<button type="button" class="pts-series-like">いいね</button>'+
-      '</div>';
-    overlay.appendChild(root);seriesUI.layer=root;
-    const sel=c=>root.querySelector('.'+c);
-    sel('pts-series-to-list').onclick=()=>void seriesShowList();
-    sel('pts-series-to-feed').onclick=seriesCloseLayer;
-    sel('pts-series-prev-episode').onclick=()=>void seriesStepEpisode(-1);
-    sel('pts-series-next-episode').onclick=()=>void seriesStepEpisode(1);
-    sel('pts-series-prev-page').onclick=()=>void seriesShowPage(seriesUI.pageIndex-1);
-    sel('pts-series-next-page').onclick=()=>void seriesShowPage(seriesUI.pageIndex+1);
-    sel('pts-series-save').onclick=()=>void seriesBookmarkEpisode(false);
-    sel('pts-series-like').onclick=()=>void seriesBookmarkEpisode(true);
-    let start=null;
-    root.addEventListener('touchstart',ev=>{
-      if(ev.touches.length!==1||ev.target.closest('button'))return;
-      start={x:ev.touches[0].clientX,y:ev.touches[0].clientY};
-    },{passive:true});
-    root.addEventListener('touchend',ev=>{
-      if(!start||ev.changedTouches.length!==1)return;
-      const dx=ev.changedTouches[0].clientX-start.x,
-        dy=ev.changedTouches[0].clientY-start.y;
-      start=null;
-      if(Math.abs(dx)>55&&Math.abs(dx)>Math.abs(dy)*1.3)
-        void seriesShowPage(seriesUI.pageIndex+(dx<0?1:-1));
-    },{passive:true});
-    document.addEventListener('keydown',ev=>{
-      if(contentFilterDialog?.open)return;
-      if(!seriesUI.layerOpen&&!seriesUI.sheetOpen)return;
-      if(ev.key==='Escape'){
-        if(seriesUI.sheetOpen)seriesHideList();else seriesCloseLayer();
-        ev.preventDefault();ev.stopImmediatePropagation();
-        return;
-      }
-      if(seriesUI.sheetOpen||!seriesUI.layerOpen||
-        ev.target?.closest?.('input,textarea,[contenteditable]'))return;
-      if(ev.key==='ArrowLeft'||ev.key==='ArrowRight'){
-        void seriesShowPage(seriesUI.pageIndex+(ev.key==='ArrowRight'?1:-1));
-        ev.preventDefault();ev.stopImmediatePropagation();
-      }
-    },true);
-    const style=document.createElement('style');
-    style.textContent=[
-      '#pts-overlay .pts-series-layer[hidden]{display:none!important}',
-      '#pts-overlay .pts-series-layer{position:absolute;inset:0;z-index:74;background:#050508;color:#fff;display:flex;flex-direction:column;overflow:hidden}',
-      '#pts-overlay .pts-series-layer header{flex:0 0 auto;padding:calc(12px + env(safe-area-inset-top)) 14px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-      '#pts-overlay .pts-series-image{flex:1;min-height:0;display:flex;justify-content:center;align-items:center;overflow:hidden}',
-      '#pts-overlay .pts-series-image img{display:block;max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain}',
-      '#pts-overlay .pts-series-error{font-size:12px;color:#ffb8b8;text-align:center;min-height:18px}',
-      '#pts-overlay .pts-series-controls{flex:0 0 auto;display:flex;overflow-x:auto;gap:8px;align-items:center;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:#17171b}',
-      '#pts-overlay .pts-series-controls button{white-space:nowrap;min-height:44px;color:white;background:#383840;border:1px solid #ffffff40;border-radius:9px;padding:8px 12px}',
-      '#pts-overlay .pts-series-controls button:disabled{opacity:.4}',
-      '#pts-overlay .pts-series-page-info{white-space:nowrap;font-size:12px}'
-    ].join('\n');
-    document.head.appendChild(style);
-  }
-
-  function syncDock() {
-    if (!overlay) return;
-    syncSeriesBar();
-    syncContentFilterButton();
-    const returnButton = overlay.querySelector('.pts-return-grid');
-    if (returnButton) returnButton.hidden = !gridReturnState ||
-      searchGrid.open || overlay.style.display === 'none';
-    syncFollowButton();
-  }
-  function noteSessionVisit(s) {
-    if (!s || !s.id) return;
-    const id = String(s.id);
-    if (sessionBackTarget === id) { sessionBackTarget = ''; return; }
-    if (sessionTrail.at(-1)?.id === id) return;
-    sessionTrail.push({ id, title: s.title || id, thumb: s.thumb || '' });
-    if (sessionTrail.length > 50) sessionTrail.shift();
-  }
-  function viewingMetrics(v) {
-    const s = v.slide;
-    const duration = Math.max(LEARN_ANIMATION_MIN_MS,
-      (s.frames || []).reduce((sum, f) => sum + (Number(f.delay) || 100), 0));
-    const pages = Math.max(1, s.pairs?.length || 1);
-    const expected = s.kind === 'multi'
-      ? Math.min(LEARN_MULTI_MAX_MS, pages * LEARN_PAGE_MS)
-      : s.kind === 'ugoira' ? duration * LEARN_ANIMATION_CYCLES : LEARN_SINGLE_MS;
-    const ratio = Math.min(LEARN_RATIO_CAP, v.elapsed / expected);
-    // ページ到達だけでは加点しない。実際に見た時間との積で評価する。
-    const progress = s.kind === 'multi' && pages > 1
-      ? Math.min(1, (v.maxPage || 0) / (pages - 1)) : 0;
-    const loops = s.kind === 'ugoira'
-      ? Math.min(LEARN_LOOP_CAP, v.played / duration, v.loops + 1) : 0;
-    return {ratio, score: ratio * LEARN_DWELL_WEIGHT +
-      progress * Math.min(1, ratio) * LEARN_PAGE_WEIGHT + loops * LEARN_LOOP_WEIGHT};
-  }
-
-  function learnViewing(v) {
-    if (!v?.readySeen) return;
-    const s = v.slide;
-    if (!s.tags?.length && !s.userId) return;
-    const metrics = viewingMetrics(v);
-    const record = sessionWork(s.id);
-    const delta = Math.min(LEARN_VIEW_BUDGET - record.learned,
-      Math.max(0, metrics.score - v.scored));
-    if (delta <= 0) return;
-    v.scored = metrics.score;
-    record.learned += delta;
-    learnFromWork(s.tags, s.userId, s.rawType, delta, true, false);
-    if (!viewSaveTimer) viewSaveTimer = setTimeout(() => {
-      viewSaveTimer = null;
-      saveProfile();
-    }, LEARN_SAVE_INTERVAL_MS);
-  }
-
-  function finishViewing(v, manual) {
-    if (!v || v.finished) return;
-    v.finished = true;
-    if (v.counting && !document.hidden && !searchGrid.open) {
-      const dt = Math.max(0, Math.min(LEARN_TICK_MAX_MS, performance.now() - v.last));
-      v.elapsed += dt;
-      if (v.slide.kind === 'ugoira' && v.slide.animTimer) v.played += dt;
-    }
-    learnViewing(v);
-    if (!v.readySeen || !manual) return;
-    const s = v.slide;
-    const events = sessionLearning().events;
-    events.push({engaged: !!(s.likedThisSession || s.bookmarked ||
-      sessionWork(s.id).opened || viewingMetrics(v).ratio >= LEARN_ENGAGE_RATIO)});
-    if (events.length > LEARN_EVENT_LIMIT) events.shift();
-  }
-
-  function onCurrentSlideChanged(s) {
-    if (!s || activeView?.slide === s) return;
-    const old = activeView;
-    const manual = navIntent.reason === 'user' && performance.now() <= navIntent.until;
-    if (old && old.mode === mode && old.generation === feedGeneration && slides.includes(old.slide)) {
-      finishViewing(old, manual);
-    }
-    viewedThisSession.add(String(s.id));
-    const ready = visibleReady(s) && !document.hidden && !searchGrid.open;
-    activeView = {
-      slide: s, mode, generation: feedGeneration,
-      elapsed: 0, played: 0, loops: 0, scored: 0, maxPage: s.pageIdx || 0,
-      last: performance.now(), counting: ready,
-      readySeen: ready, recorded: false, finished: false,
-      rewatch: !!(manual && sessionWork(s.id).viewed)
-    };
-    syncDock();
-  }
-  function tickViewing() {
-    if (!activeView) return;
-    const v = activeView, now = performance.now();
-    const dt = Math.max(0, Math.min(LEARN_TICK_MAX_MS, now - v.last));
-    v.last = now;
-    const s = v.slide;
-    const wasCounting = v.counting;
-    v.counting = !!(!contentFilterDialog?.open && overlay && overlay.style.display !== 'none' && !searchGrid.open &&
-      !document.hidden && !seriesUI.layerOpen && !seriesUI.sheetOpen && slides[currentIndex()] === s && s.isCurrent && visibleReady(s));
-    if (!v.counting) return;
-    v.readySeen = true;
-    const visibleTime = wasCounting ? dt : 0;
-    v.elapsed += visibleTime;
-    if (s.kind === 'ugoira' && s.animTimer) v.played += visibleTime;
-    if (s.kind === 'multi' && visibleReady(s)) v.maxPage = Math.max(v.maxPage, s.pageIdx || 0);
-    if (!v.recorded && v.elapsed >= LEARN_READY_MS) {
-      v.recorded = true;
-      markSeen(s.id);
-      noteSessionVisit(s);
-      const record = sessionWork(s.id);
-      if (v.rewatch && record.rewatched < LEARN_REWATCH_LIMIT) {
-        record.rewatched++;
-        learnFromWork(s.tags, s.userId, s.rawType, LEARN_REWATCH_WEIGHT);
-      }
-      record.viewed = true;
-    }
-    learnViewing(v);
-  }
-  function onUgoiraLoop(s) {
-    if (!contentFilterDialog?.open && !searchGrid.open && activeView?.slide === s && !document.hidden) {
-      activeView.loops++;
-    }
-  }
-
-
-  const LIKE_TAP_WINDOW = 240;
-
-  function showLikeHeart(s, x, y) {
-    const section = s?.sectionEl;
-    if (!section) return;
-
-    const r = section.getBoundingClientRect();
-    const heart = document.createElement('span');
-
-    heart.className = 'pts-like-heart';
-    heart.textContent = '❤️';
-    heart.setAttribute('aria-hidden', 'true');
-
-    heart.style.left =
-      `${Math.max(0, Math.min(r.width, x - r.left))}px`;
-    heart.style.top =
-      `${Math.max(0, Math.min(r.height, y - r.top))}px`;
-
-    section.appendChild(heart);
-
-    heart.addEventListener(
-      'animationend',
-      () => heart.remove(),
-      { once: true }
-    );
-
-    setTimeout(() => heart.remove(), 1200);
-  }
-
-  async function likeArtwork(s, x, y) {
-    showLikeHeart(s, x, y);
-    s.likedThisSession = true;
-
-    const generation = feedGeneration;
-
-    try {
-      if (!s.resolved && (!s.tags?.length || !s.userId)) {
-        await resolveSlide(s);
-      }
-
-      if (s.tags?.length ||
-          s.userId ||
-          Number(s.rawType) === 2) {
-        learnFromWork(s.tags, s.userId, s.rawType, LEARN_LIKE_WEIGHT);
-        s.tasteLearned = true;
-      }
-
-      if (generation === feedGeneration &&
-          mode === 'custom' &&
-          slides.includes(s)) {
-
-        reorderUnviewedAfterLike(s);
-        void insertSeriesAfter(s);
-        void insertRecommendationsAfterBookmark(s);
-      }
-
-      // 既に保存済みならensureBookmarkedは再POSTしない。
-      await ensureBookmarked(s);
-
-    } catch (e) {
-      console.warn('[PTS like]', e);
-    } finally {
-      syncDock();
-    }
-  }
-
-  // シングルタップは画面遷移しない。2回目のタップで即座にいいねする。
-  function handleImageTap(e) {
-    const holder = e.target.closest?.('.pts-holder');
-    if (!holder || e.isPrimary === false || !touchStart) return;
-    if (touchStart.pointerId !== e.pointerId ||
-        Math.hypot(e.clientX-touchStart.x,e.clientY-touchStart.y)>12) return;
-    const slide = slides[currentIndex()];
-    if (!slide || holder.closest('.pts-slide') !== slide.sectionEl) return;
-    const now=performance.now();
-    if (lastTap && lastTap.id===String(slide.id) &&
-        now-lastTap.time<=LIKE_TAP_WINDOW &&
-        Math.hypot(e.clientX-lastTap.x,e.clientY-lastTap.y)<=46) {
-      lastTap=null;
-      e.stopImmediatePropagation();
-      void likeArtwork(slide,e.clientX,e.clientY);
-      return;
-    }
-    lastTap={id:String(slide.id),time:now,x:e.clientX,y:e.clientY};
-  }
-
-  // キーボードによる移動はビューア表示中のみ。入力操作・修飾キーを優先。
-  function handleViewerKeyboard(e) {
-    if (contentFilterDialog?.open) return;
-    if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.altKey ||
-        e.metaKey || !overlay || overlay.style.display==='none' ||
-        searchGrid.open || seriesUI.sheetOpen || seriesUI.layerOpen) return;
-    const focused=document.activeElement;
-    const target=e.target?.nodeType===1 ? e.target : focused;
-    const editable='input,textarea,select,[contenteditable]:not([contenteditable="false"]),' +
-      '[role="textbox"],[role="combobox"]';
-    if (target?.closest?.(editable) || focused?.closest?.(editable) ||
-        focused?.isContentEditable) return;
-    if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) return;
-    const index=currentIndex(), slide=slides[index];
-    if (!slide) return;
-    let handled=false;
-    if (e.key==='ArrowUp'||e.key==='ArrowDown') {
-      const next=index+(e.key==='ArrowDown'?1:-1);
-      if (next>=0&&next<slides.length) gotoSlide(next,'user');
-      handled=true;
-    } else if (slide.kind==='multi'&&slide.pairs?.length>1) {
-      const pager=slide.sectionEl?.querySelector('.pts-pager');
-      if (!pager) return;
-      const width=Math.max(1,pager.clientWidth);
-      const page=Math.max(0,Math.min(slide.pairs.length-1,
-        Math.round(pager.scrollLeft/width)));
-      const next=page+(e.key==='ArrowRight'?1:-1);
-      if (next>=0&&next<slide.pairs.length) {
-        loadHorizontalNeighbors(slide,next);
-        pager.scrollTo({left:next*width,behavior:'smooth'});
-      }
-      handled=true;
-    }
-    if (handled) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
-  }
-
-  function bindExperienceGestures() {
-    feedEl.addEventListener('pointerdown', e => {
-      if (!e.target.closest?.('.pts-holder')) return;
-
-      if (!e.isPrimary) {
-        touchStart = null;
-        lastTap = null;
-        return;
-      }
-
-      touchStart = {
-        x: e.clientX,
-        y: e.clientY,
-        pointerId: e.pointerId
-      };
-    }, true);
-
-    feedEl.addEventListener(
-      'pointerup',
-      handleImageTap,
-      true
-    );
-
-    feedEl.addEventListener('pointercancel', () => {
-      touchStart = null;
-      lastTap = null;
-    }, true);
-  }
-
-
-  function showSessionHistory() {
-    const panel = overlay.querySelector('.pts-history-panel');
-    const list = panel.querySelector('.pts-history-list');
-    list.replaceChildren();
-    for (const item of [...sessionTrail].reverse()) {
-      const btn = document.createElement('button');
-      const available = slides.some(s => String(s.id) === item.id && contentMatches(s));
-      btn.textContent = `${available ? '▶' : '—'} ${item.title || item.id} (${item.id})`;
-      btn.disabled = !available;
-      btn.addEventListener('click', () => {
-        panel.hidden = true;
-        const idx = slides.findIndex(s => String(s.id) === item.id);
-        if (idx >= 0) { sessionBackTarget = item.id; gotoSlide(idx); }
-      });
-      list.appendChild(btn);
-    }
-    if (!list.childElementCount) list.textContent = '閲覧履歴はまだありません';
-    panel.hidden = false;
-  }
-
-  function confirmCloseViewer() {
-    const btn = overlay?.querySelector('.pts-close');
-    if (!btn) return;
-    if (btn.dataset.confirm === '1') {
-      clearTimeout(closeConfirmTimer);
-      routeAutoStartSuppressed = true;
-      btn.dataset.confirm = '0'; closeViewer(); return;
-    }
-    btn.dataset.confirm = '1'; btn.textContent = '本当に閉じる？';
-    clearTimeout(closeConfirmTimer);
-    closeConfirmTimer = setTimeout(() => {
-      btn.dataset.confirm = '0'; btn.textContent = '閉じる';
-    }, 2500);
-  }
-
-  function installExperienceCSS() {
-    const style = document.createElement('style');
-
-    style.textContent = `
-      #pts-overlay .pts-bar{
-        position:absolute;top:0;left:0;right:0;z-index:40;
-        display:flex;align-items:center;gap:8px;
-        box-sizing:border-box;
-        padding:calc(8px + env(safe-area-inset-top)) 10px 8px;
-        color:#fff;background:linear-gradient(#000d,#0007);
-        pointer-events:auto;overflow:visible;white-space:normal
-      }
-      #pts-overlay .pts-global-search{
-        display:flex;flex:1;min-width:0;gap:6px;height:38px
-      }
-      #pts-overlay .pts-global-search input{
-        flex:1;min-width:0;width:100%;box-sizing:border-box;
-        background:#25252d;color:#fff;
-        border:1px solid #ffffff35;border-radius:10px;
-        padding:0 12px;font-size:14px;outline:none
-      }
-      #pts-overlay .pts-global-search input:focus{
-        border-color:#ffffff8a
-      }
-      #pts-overlay .pts-global-search button{
-        flex:0 0 auto;min-width:56px;padding:0 10px;
-        border:1px solid #ffffff30;border-radius:10px;
-        background:#444c;color:white;font-size:13px
-      }
-      #pts-overlay .pts-counter{
-        flex:0 0 auto;max-width:29%;overflow:hidden;
-        text-overflow:ellipsis;white-space:nowrap;
-        font-size:11px;opacity:.72
-      }
-
-      #pts-overlay .pts-dock{
-        position:absolute;bottom:0;left:0;right:0;z-index:30;
-        display:flex;flex-wrap:nowrap;align-items:center;gap:7px;
-        overflow-x:auto;overflow-y:hidden;scrollbar-width:none;
-        -webkit-overflow-scrolling:touch;
-        overscroll-behavior-x:contain;touch-action:pan-x;
-        padding:8px 10px calc(8px + env(safe-area-inset-bottom));
-        box-sizing:border-box;
-        background:linear-gradient(transparent,#000e 18%,#000f);
-      }
-      #pts-overlay .pts-dock::-webkit-scrollbar{
-        display:none
-      }
-      #pts-overlay .pts-dock button{
-        flex:0 0 auto;min-height:48px;
-        padding:0 14px;white-space:nowrap;
-        border:1px solid #ffffff32;
-        background:#303030dd;color:#fff;
-        border-radius:11px;font-size:13px;
-        touch-action:manipulation
-      }
-      #pts-overlay .pts-dock .pts-close{
-        position:static;right:auto
-      }
-      #pts-overlay .pts-dock .pts-return-grid[hidden]{
-        display:none!important
-      }
-
-      #pts-overlay .pts-history-panel[hidden],
-      #pts-overlay .pts-search-tags[hidden]{
-        display:none!important
-      }
-      #pts-overlay .pts-history-panel{
-        position:absolute;inset:0;z-index:60;
-        background:#000d;display:flex;
-        align-items:center;justify-content:center;
-        padding:12px;box-sizing:border-box
-      }
-      #pts-overlay .pts-history-sheet{
-        width:100%;max-width:900px;height:80dvh;
-        background:#151515;color:#fff;
-        border:1px solid #555;border-radius:12px;
-        display:flex;flex-direction:column;padding:12px;
-        box-sizing:border-box
-      }
-
-      #pts-overlay .pts-history-head{
-        display:flex;align-items:center;
-        justify-content:space-between;padding-bottom:10px
-      }
-      #pts-overlay .pts-history-head button{
-        padding:10px;border:0;border-radius:8px;
-        background:#444;color:#fff
-      }
-      #pts-overlay .pts-history-list{
-        display:flex;flex-direction:column;gap:6px;
-        overflow:auto;min-height:0
-      }
-      #pts-overlay .pts-history-list button{
-        padding:11px;text-align:left;
-        background:#303030;color:#fff;
-        border:0;border-radius:7px
-      }
-      #pts-overlay .pts-history-list button:disabled{opacity:.4}
-
-      #pts-overlay .pts-seek{
-        position:absolute;left:12px;right:12px;
-        top:auto;bottom:calc(80px + env(safe-area-inset-bottom));
-        height:32px;z-index:27;background:none;
-        touch-action:none;pointer-events:auto
-      }
-      #pts-overlay .pts-seek::before{
-        content:"";position:absolute;left:0;right:0;top:50%;
-        height:4px;transform:translateY(-50%);
-        background:#ffffff55;border-radius:4px
-      }
-      #pts-overlay .pts-seek-fill{
-        position:absolute;left:0;top:50%;height:4px;
-        transform:translateY(-50%);background:#0096fa;
-        border-radius:4px
-      }
-      #pts-overlay .pts-seek-knob{
-        position:absolute;top:50%;left:0;
-        width:16px;height:16px;margin-left:0;
-        transform:translate(-50%,-50%);
-        border-radius:50%;background:#fff;
-        box-shadow:0 1px 5px #0009
-      }
-      #pts-overlay .pts-ugoira-status{
-        position:absolute;left:50%;top:43%;z-index:17;
-        transform:translate(-50%,-50%);
-        padding:10px 15px;border-radius:12px;
-        background:#000c;color:#fff;font-size:13px;
-        text-align:center;pointer-events:none;max-width:85vw
-      }
-      #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
-      #pts-overlay .pts-ugoira-error{color:#ffd6d6}
-
-      #pts-overlay .pts-search-tags{
-        position:absolute;left:0;right:0;z-index:22;
-        top:calc(65px + env(safe-area-inset-top));
-        display:flex;gap:6px;padding:4px 10px;
-        overflow-x:auto;scrollbar-width:none;
-        background:linear-gradient(#0009,#0002)
-      }
-      #pts-overlay .pts-search-tags::-webkit-scrollbar{display:none}
-      #pts-overlay .pts-search-tags button{
-        flex-shrink:0;white-space:nowrap;color:#fff;
-        background:#333c;border:1px solid #ffffff30;
-        border-radius:999px;padding:7px 11px;font-size:12px
-      }
-
-      #pts-overlay .pts-img{
-        display:block;width:100%;height:100%;
-        max-width:100%;max-height:100%;
-        object-fit:contain!important;animation:none!important
-      }
-      #pts-overlay .pts-holder .pts-ugoira-canvas{
-        display:block;position:absolute;inset:0;width:100%;height:100%;
-        object-fit:contain;pointer-events:none
-      }
-      #pts-overlay .pts-holder.pts-ugoira-active > .pts-img{
-        visibility:hidden
-      }
-      #pts-overlay .pts-holder{touch-action:pan-x pan-y}
-      #pts-overlay .pts-slide.pts-current .pts-holder{
-        animation:ptsIn .16s ease-out
-      }
-      @keyframes ptsIn{from{opacity:.83}to{opacity:1}}
-      #pts-overlay .pts-like-heart{
-        position:absolute;z-index:18;pointer-events:none;
-        font-size:clamp(70px,20vw,120px);
-        filter:drop-shadow(0 4px 16px #0009);
-        animation:ptsHeart .85s ease-out forwards
-      }
-      @keyframes ptsHeart{
-        0%{opacity:0;transform:translate(-50%,-40%) scale(.35)}
-        24%{opacity:1;transform:translate(-50%,-55%) scale(1.18)}
-        65%{opacity:.95;transform:translate(-50%,-65%) scale(1)}
-        100%{opacity:0;transform:translate(-50%,-100%) scale(1.14)}
-      }
-      @media(prefers-reduced-motion:reduce){
-        #pts-overlay .pts-holder{animation:none!important}
-        #pts-overlay .pts-like-heart{animation-duration:.2s}
-      }
-  `;
-
-    document.head.appendChild(style);
-  }
-
-  // 作者フォローはpixivの既存Web API。既フォロー状態は作者情報から検証する。
-  const followState = {
-    account: '', cache: new Map(), pending: new Map(), sending: new Set()
-  };
-
-  function followAccountSync() {
-    const account = getMyUserId();
-    if (followState.account !== account) {
-      followState.account = account;
-      followState.cache.clear();
-      followState.pending.clear();
-      followState.sending.clear();
-    }
-    return account;
-  }
-
-  function followButtonState(s) {
-    const account = followAccountSync();
-    const id = String(s?.userId || '');
-    if (!s || !/^[1-9]\d*$/.test(id)) return 'no-author';
-    if (!account) return 'login-required';
-    if (account === id) return 'self';
-    if (followState.sending.has(id)) return 'sending';
-    if (!followState.cache.has(id)) return 'unknown';
-    return followState.cache.get(id) === true ? 'following' :
-      followState.cache.get(id) === false ? 'not-following' : 'error';
-  }
-
-  function syncFollowButton() {
-    const button = overlay?.querySelector('.pts-follow-author');
-    if (!button) return;
-    const slide = slides[currentIndex()];
-    const id = String(slide?.userId || '');
-    const state = followButtonState(slide);
-    const labels = {
-      'no-author': '作者情報を取得中',
-      'login-required': 'フォロー（ログインが必要）',
-      self: '自分の作品',
-      sending: 'フォロー処理中…',
-      unknown: 'フォロー確認中…',
-      following: '✓ フォロー済み',
-      'not-following': '作者をフォロー',
-      error: 'フォロー状態を再確認'
-    };
-    button.textContent = labels[state];
-    button.disabled = searchGrid.open ||
-      !['not-following', 'error'].includes(state);
-    if (state === 'unknown') {
-      void checkFollowStatus(id);
-    }
-  }
-
-  async function readFollowStatus(authorId) {
-    const response = await fetch(
-      '/ajax/user/' + encodeURIComponent(authorId) + '?full=1',
-      {credentials:'same-origin',cache:'no-store'}
-    );
-    if (!response.ok) throw new Error('作者情報の取得失敗（HTTP '+response.status+'）');
-    const json = await response.json();
-    if (json?.error !== false || typeof json?.body?.isFollowed !== 'boolean') {
-      throw new Error('フォロー状態を確認できません');
-    }
-    return json.body.isFollowed;
-  }
-
-  async function checkFollowStatus(authorId, force = false) {
-    const account = followAccountSync();
-    if (!account || !/^[1-9]\d*$/.test(authorId) ||
-        account === authorId) return null;
-    if (!force && followState.cache.has(authorId))
-      return followState.cache.get(authorId);
-    if (followState.pending.has(authorId))
-      return followState.pending.get(authorId);
-    const promise = (async () => {
-      try {
-        const following = await readFollowStatus(authorId);
-        if (getMyUserId() === account) {
-          followState.cache.set(authorId, following);
-        }
-        return following;
-      } catch (e) {
-        if (getMyUserId() === account) {
-          followState.cache.set(authorId, null);
-          console.warn('[PTS follow]', e);
-        }
-        return null;
-      } finally {
-        if (getMyUserId() === account) {
-          followState.pending.delete(authorId);
-          // 描画更新に再照会を走らせない。失敗時はユーザー操作で再試行。
-          const shown = slides[currentIndex()];
-          if (String(shown?.userId || '') === authorId) syncFollowButton();
-        }
-      }
-    })();
-    followState.pending.set(authorId, promise);
-    return promise;
-  }
-
-  async function followCurrentAuthor() {
-    const slide = slides[currentIndex()];
-    if (!slide || searchGrid.open || !overlay ||
-        overlay.style.display === 'none') return;
-    if (!slide.userId && !slide.resolved) {
-      try { await resolveSlide(slide); } catch (_) {}
-    }
-    if (slides[currentIndex()] !== slide || searchGrid.open) return;
-    const id = String(slide.userId || '');
-    if (!/^[1-9]\d*$/.test(id)) {
-      window.alert('作者IDを取得できませんでした。');
-      return;
-    }
-    const account = followAccountSync();
-    if (!account) {
-      window.alert('作者をフォローするにはpixivへのログインが必要です。');
-      return;
-    }
-    if (account === id || followState.sending.has(id)) return;
-    const state = await checkFollowStatus(id, true);
-    if (state === true || state === null) {
-      syncFollowButton();
-      if (state === null) window.alert('フォロー状態を確認できません。再試行してください。');
-      return;
-    }
-    if (slides[currentIndex()] !== slide || searchGrid.open ||
-        getMyUserId() !== account) return;
-    followState.sending.add(id);
-    syncFollowButton();
-    try {
-      const token = await getCsrfToken();
-      if (!token) throw new Error('CSRFトークンを取得できません');
-      // pixiv Webの作者フォロー操作。成功とは限らないため必ずGETで検証する。
-      const body = new URLSearchParams({
-        mode:'add', type:'user', user_id:id,
-        tag:'', restrict:'0', format:'json'
-      });
-      const response = await fetch('/bookmark_add.php', {
-        method:'POST',credentials:'same-origin',
-        headers:{'x-csrf-token':token,'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
-        body:body.toString()
-      });
-      if (!response.ok) {
-        if ([401,403].includes(response.status)) {
-          csrfToken=null;csrfTokenSource='';csrfPreferHome=true;
-        }
-        throw new Error('フォローAPI HTTP '+response.status);
-      }
-      // 当該Web APIの応答形式には差異があるため、状態確認結果を唯一の成功根拠とする。
-      const verified = await readFollowStatus(id);
-      if (getMyUserId() !== account) return;
-      if (verified !== true) throw new Error(
-        'フォロー済み状態を確認できません。pixiv側の認証／追加認証を確認してください'
-      );
-      followState.cache.set(id, true);
-    } catch (e) {
-      followState.cache.delete(id);
-      console.warn('[PTS follow] フォロー失敗', e);
-      window.alert('作者をフォローできませんでした: ' +
-        String(e?.message || e).slice(0,160));
-    } finally {
-      if (getMyUserId() === account) followState.sending.delete(id);
-      syncFollowButton();
-    }
-  }
-
-  function installExperienceUI() {
-    if (experienceInstalled || !overlay) return;
-    experienceInstalled = true;
-
-    const dock = document.createElement('nav');
-    dock.className = 'pts-dock';
-    dock.setAttribute('aria-label', 'ビューア操作');
-    overlay.appendChild(dock);
-
-    const addButton = (className, label, handler) => {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = className;
-      button.textContent = label;
-      button.addEventListener('click', handler);
-      dock.appendChild(button);
-      return button;
-    };
-
-    addButton('pts-history-button', '履歴', showSessionHistory);
-
-    // 診断・更新の既存イベントを保持してDOM移動。
-    for (const selector of [
-      '.pts-diagnostic',
-      '.pts-rescan'
-    ]) {
-      const button = overlay.querySelector(
-        '.pts-bar ' + selector
-      );
-      if (button) dock.appendChild(button);
-    }
-
-    const oldClose = overlay.querySelector('.pts-close');
-    if (oldClose) {
-      const close = oldClose.cloneNode(true);
-      close.textContent = '閉じる';
-      oldClose.replaceWith(close);
-      close.addEventListener('click', confirmCloseViewer);
-      dock.appendChild(close);
-    }
-
-    dock.prepend(addButton('pts-content-filter', contentFilterLabel(), () => showContentFilterDialog(false)));
-    addButton('pts-follow-author', '作者をフォロー',
-      () => { void followCurrentAuthor(); });
-    addButton('pts-return-grid', '検索結果へ戻る',
-      returnToSearchGrid).hidden = true;
-
-    const bar = overlay.querySelector('.pts-bar');
-    const form = document.createElement('form');
-    form.className = 'pts-global-search';
-    form.setAttribute('role', 'search');
-
-    const input = document.createElement('input');
-    input.type = 'search';
-    input.placeholder = 'pixivで検索';
-    input.autocomplete = 'off';
-    input.enterKeyHint = 'search';
-    input.setAttribute('aria-label', 'pixiv検索ワード');
-    input.value = getSearchPageConfig()?.word || '';
-
-    const submit = document.createElement('button');
-    submit.type = 'submit';
-    submit.textContent = '検索';
-
-    form.append(input, submit);
-    form.addEventListener('submit', e => {
-      e.preventDefault();
-      const word = input.value.trim();
-      if (!word) return;
-      openSearchGrid(word);
-    });
-
-    bar.prepend(form);
-
-    const panel = document.createElement('div');
-    panel.className = 'pts-history-panel';
-    panel.hidden = true;
-
-    panel.innerHTML = `
-    <div class="pts-history-sheet">
-      <div class="pts-history-head">
-        閲覧履歴（最新50件）
-        <button type="button"
-          class="pts-history-close">閉じる</button>
-      </div>
-      <div class="pts-history-list"></div>
-    </div>
-  `;
-
-    overlay.appendChild(panel);
-
-    panel.querySelector('.pts-history-close')
-      .addEventListener('click', () => {
-        panel.hidden = true;
-      });
-
-    bindExperienceGestures();
-    document.addEventListener('keydown', handleViewerKeyboard, true);
-
-    document.addEventListener('keydown', e => {
-      if (contentFilterDialog?.open) return;
-      if (
-        e.key !== 'Escape' ||
-        overlay.style.display === 'none'
-      ) return;
-
-      // シリーズ一覧・専用閲覧レイヤー側のEscape操作を優先する。
-      if (seriesUI.sheetOpen || seriesUI.layerOpen) return;
-      // 検索入力中のEscapeは検索欄側に任せる。
-      if (e.target.closest?.('.pts-global-search')) return;
-
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      if (searchGrid.open) closeSearchGrid();
-      else confirmCloseViewer();
-    }, true);
-
-    if (!activeTick) {
-      activeTick = setInterval(tickViewing, 250);
-    }
-
-    installExperienceCSS();
-    installSearchGridUI();
-    syncDock();
-  }
-
-  /* ---------- v3.13.7: 検索グリッド（フィードとは独立） ---------- */
-  const searchGrid = {
-    open: false, token: 0, controller: null, busy: false,
-    finished: false, page: 1, config: null, tagsReady: false,
-    items: [], ids: new Set(), root: null, scroll: null,
-    cards: null, chips: null, title: null, status: null, retry: null
-  };
-
-  // グリッドで開いた作品からのみ有効な「検索結果へ戻る」。
-  // card/取得済みitemsはcloseSearchGridでは破棄しない。
-  let gridReturnState = null;
-  let gridTap = null;
-
-  function syncSearchGridBookmark(id) {
-    const g = searchGrid;
-    id = String(id);
-    const item = g.items.find(it => String(it.id) === id);
-    if (item) item.bookmarked = true;
-    const slide = slides.find(it => String(it.id) === id);
-    if (slide) slide.bookmarked = true;
-    const card = [...(g.cards?.children || [])]
-      .find(el => el.dataset.ptsId === id);
-    if (card) {
-      card.classList.add('pts-grid-bookmarked');
-      const button = card.querySelector('.pts-grid-save');
-      if (button) {
-        button.textContent = '✓';
-        button.disabled = true;
-        button.setAttribute('aria-label', '保存済み');
-      }
-    }
-  }
-
-  function reconcileSearchGridBookmarks() {
-    for (const it of searchGrid.items) {
-      const id = String(it.id);
-      if (it.bookmarked || knownBookmarkedIds.has(id) ||
-          slides.some(s => String(s.id) === id && s.bookmarked)) {
-        syncSearchGridBookmark(id);
-      }
-    }
-  }
-
-  function returnToSearchGrid() {
-    const g = searchGrid, back = gridReturnState;
-    if (!back || g.open || !overlay || overlay.style.display === 'none' ||
-        !g.root || !g.config || !g.rankContext ||
-        g.rankContext.queryKey !== back.queryKey ||
-        !searchContextValid(g.rankContext)) return false;
-    const current = slides[currentIndex()];
-    if (current?.kind === 'ugoira') stopUgoira(current);
-    reconcileSearchGridBookmarks();
-    g.open = true;
-    g.root.hidden = false;
-    overlay.classList.add('pts-grid-open');
-    g.scroll.scrollTop = back.scrollTop;
-    if (activeView) activeView.last = performance.now();
-    syncDock();
-    // 開いていた時点の読み込み進捗を引き継ぐ。再検索はしない。
-    return true;
-  }
-
-
-  function clearGridTap() {
-    if (gridTap?.timer) clearTimeout(gridTap.timer);
-    gridTap = null;
-  }
-
-  function closeSearchGrid(resume = true) {
-    const wasOpen = searchGrid.open;
-    clearGridTap();
-    searchGrid.token++;
-    searchGrid.controller?.abort();
-    searchGrid.controller = null;
-    searchGrid.busy = false;
-    searchGrid.open = false;
-
-    if (searchGrid.root) searchGrid.root.hidden = true;
-    overlay?.classList.remove('pts-grid-open');
-
-    if (wasOpen && activeView) {
-      activeView.last = performance.now();
-    }
-
-    if (wasOpen && resume) {
-      const s = slides[currentIndex()];
-      if (s?.isCurrent && s.kind === 'ugoira' &&
-          s.frameUrls?.length) {
-        startUgoira(s);
-      }
-    }
-    syncDock();
-  }
-
-  function openSearchGrid(value) {
-    const word = String(value || '').trim();
-    if (!word || !overlay || !searchGrid.root) return;
-
-    gridReturnState = null;
-    closeSearchGrid(false);
-    syncDock();
-
-    const current = slides[currentIndex()];
-    if (current?.kind === 'ugoira') stopUgoira(current);
-
-    const from = getSearchPageConfig();
-    searchGrid.config = {
-      word,
-      order: from?.order || 'popular_d',
-      searchMode: from?.searchMode || 'all',
-      matchMode: from?.matchMode || 's_tag'
-    };
-
-    searchGrid.page = 1;
-    searchGrid.finished = false;
-    searchGrid.searchBoosted = false;
-    searchGrid.fixedIds = new Set();
-    searchGrid.rankContext = getSearchRankContext(searchGrid.config, 1);
-    searchGrid.items = [];
-    searchGrid.ids.clear();
-    searchGrid.tagsReady = false;
-    searchGrid.cards.replaceChildren();
-    searchGrid.chips.replaceChildren();
-    searchGrid.scroll.scrollTop = 0;
-
-    searchGrid.title.textContent = `「${word}」の検索結果`;
-    searchGrid.status.textContent = '読み込み中…';
-    searchGrid.retry.hidden = true;
-    searchGrid.open = true;
-    searchGrid.root.hidden = false;
-
-    if (overlay) {
-      overlay.classList.add('pts-grid-open');
-    }
-
-    const input = overlay.querySelector('.pts-global-search input');
-    if (input) input.value = word;
-
-    const token = searchGrid.token;
-    void (async () => {
-      for (let n = 0; n < 2 && searchGrid.open &&
-          searchGrid.token === token && !searchGrid.finished &&
-          !searchGrid.items.length; n++) {
-        const ok = await searchGridLoadMore();
-        if (!ok) break;
-      }
-    })();
-  }
-
-
-  // v3.13.18: 検索APIヒットの証拠・ページ進捗を queryKey 単位で共有する。
-  function searchNormalize(value) {
-    return String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase();
-  }
-
-  // 検索API候補専用。illustTypeが欠落したときはrawTypeを使い、
-  // どちらも不明ならnullのままとする（ugoira加点なし）。
-  // 通常候補と同じ厳密な種別正規化を使う。
-  function searchIllustType(candidate) {
-    return contentType(candidate);
-  }
-
-  function normalizeSearchCandidate(candidate) {
-    const normalized = normalizeCandidate(candidate);
-    normalized.illustType = searchIllustType(candidate);
-    return normalized;
-  }
-
-  function legacySearchWordTier(it, word) {
-    const query = searchNormalize(word);
-    if (!query) return 0;
-    const tags = normTags(it.tags).map(searchNormalize);
-    if (tags.includes(query)) return 2;
-    return tags.some(t => t.includes(query)) ? 1 : 0;
-  }
-
-  const searchRankPools = new Map();
-  let searchPoolGeneration = 0;
-
-  // APIリクエストで結果集合を決める条件を一箇所で定義する。
-  // ページ番号は共有結果集合の資格とは別に管理する。
-  function searchApiConditions(config) {
-    return {
-      word: String(config.word || ''),
-      order: String(config.order || 'popular_d'),
-      mode: contentSourceMode(config.contentFilter || contentFilter, String(config.searchMode || 'all')),
-      type: contentSourceType(config.contentFilter || contentFilter),
-      s_mode: String(config.matchMode || 's_tag')
-    };
-  }
-
-  function searchQueryKey(config) {
-    return JSON.stringify([searchApiConditions(config), config.contentFilter || contentFilter]);
-  }
-
-  function getSearchRankContext(config, startPage = 1) {
-    const queryKey = searchQueryKey(config);
-    let ctx = searchRankPools.get(queryKey);
-    const page = Math.max(1, Number(startPage) || 1);
-    if (!ctx) {
-      const queryTokens = [...new Set(
-        searchNormalize(config.word).split(/\s+/u).filter(Boolean)
-      )];
-      ctx = {
-        queryKey, word: config.word, queryTokens,
-        config: Object.freeze({
-          word: String(config.word || ''),
-          order: String(config.order || 'popular_d'),
-          searchMode: String(config.searchMode || 'all'),
-          matchMode: String(config.matchMode || 's_tag'),
-          contentFilter: {...contentFilter}
-        }),
-        queryType: queryTokens.length > 1 ? 'multi-token' : 'single-token',
-        relatedTags: new Set(), searchOrderById: new Map(),
-        searchHitIds: new Set(), generation: ++searchPoolGeneration,
-        records: new Map(), fetchedPages: new Set(),
-        nextPage: page, finished: false, busy: null, firstBody: null,
-        total: null, failure: null
-      };
-      // モバイル端末のメモリを圧迫しないよう、過去の検索プールを制限。
-      if (searchRankPools.size >= 8) {
-        searchRankPools.delete(searchRankPools.keys().next().value);
-      }
-      searchRankPools.set(queryKey, ctx);
-    } else if (page < ctx.nextPage && !ctx.fetchedPages.has(page)) {
-      ctx.nextPage = page;
-      ctx.finished = false;
-    }
-    return ctx;
-  }
-
-  function searchContextValid(ctx) {
-    return !!ctx && searchRankPools.get(ctx.queryKey) === ctx;
-  }
-
-  // 共有API取得はルートのAbortSignalから独立。各ルートは自分の反映だけ中止する。
-  async function loadSearchApiBatch(ctx, config, isCurrent, signal) {
-    const routeValid = () => isCurrent() && searchContextValid(ctx) &&
-      !signal?.aborted && searchQueryKey(config) === ctx.queryKey;
-    if (!routeValid()) return { stale: true };
-
-    if (!ctx.busy) {
-      const job = (async () => {
-        let fetched = 0, first = null, error = null;
-        for (let attempt = 0; attempt < SEARCH_BATCH_PAGES;) {
-          if (!searchContextValid(ctx)) return { stale: true };
-          if (ctx.finished) break;
-          const page = ctx.nextPage;
-          if (page > 1000) { ctx.finished = true; break; }
-          if (ctx.fetchedPages.has(page)) { ctx.nextPage++; continue; }
-          let body;
-          try {
-            // ここにはフィード/グリッド固有のsignalを渡さない。
-            body = await fetchJson(searchApiUrl(ctx.config, page));
-          } catch (e) {
-            error = e;
-            break;
-          }
-          if (!searchContextValid(ctx)) return { stale: true };
-          const data = body?.illustManga?.data;
-          if (!Array.isArray(data)) {
-            error = new Error('検索API候補配列なし (p=' + page + ')');
-            break;
-          }
-          if (!first) first = body;
-          if (!ctx.firstBody) ctx.firstBody = body;
-          for (const tag of searchRelatedTags(body)) ctx.relatedTags.add(tag);
-          for (const raw of data) {
-            const it = normalizeSearchCandidate(raw);
-            const id = String(it.id || '');
-            if (!/^\d+$/.test(id) || ctx.searchHitIds.has(id)) continue;
-            ctx.searchHitIds.add(id);
-            ctx.searchOrderById.set(id, ctx.searchOrderById.size);
-            ctx.records.set(id, {
-              ...it, isSearchApiHit: true, queryKey: ctx.queryKey
-            });
-          }
-          ctx.fetchedPages.add(page);
-          ctx.nextPage = page + 1;
-          ctx.total = Number(body?.illustManga?.total);
-          fetched++;
-          attempt++;
-          if (!data.length || (Number.isFinite(ctx.total) &&
-              ctx.total >= 0 && page * 36 >= ctx.total)) ctx.finished = true;
-        }
-        if (!searchContextValid(ctx)) return { stale: true };
-        ctx.failure = error;
-        return { fetched, error, body: first || ctx.firstBody, stale: false };
-      })();
-      ctx.busy = job;
-    }
-
-    const sharedJob = ctx.busy;
-    try {
-      const outcome = await sharedJob;
-      return routeValid() ? outcome : { stale: true };
-    } finally {
-      if (ctx.busy === sharedJob) ctx.busy = null;
-    }
-  }
-
-  // 検索専用。関連度は最大400点に収め、1000点刻みのtierを維持する。
-  const SEARCH_WORD_TAG_WEIGHT = 40;
-  const SEARCH_RELATED_TAG_WEIGHT = 24;
-
-  function searchRelatedTags(body) {
-    const lists = [body?.relatedTags, body?.illustManga?.relatedTags,
-      body?.tagSuggestions, body?.suggestTags];
-    return [...new Set(lists.flatMap(items =>
-      Array.isArray(items) ? items.map(it => typeof it === 'string'
-        ? it : it?.tag ?? it?.name ?? it?.word) : []
-    ).filter(t => typeof t === 'string' && t.trim()).map(t =>
-      t.normalize('NFKC').trim().toLocaleLowerCase()))];
-  }
-
-  function searchWordRelevance(it, word, relatedTags = []) {
-    const query = String(word || '').normalize('NFKC')
-      .trim().toLocaleLowerCase();
-    if (!query) return 0;
-    const tags = [...new Set(normTags(it.tags).map(t =>
-      String(t).normalize('NFKC').toLocaleLowerCase()))];
-    const matches = tags.filter(t => t.includes(query)).length;
-    const related = tags.filter(t => t !== query && relatedTags.includes(t)).length;
-    return Math.min(400,
-      Math.min(8, matches) * SEARCH_WORD_TAG_WEIGHT +
-      Math.min(8, related) * SEARCH_RELATED_TAG_WEIGHT
-    );
-  }
-
-
-  // 辞書式比較。分散は同点集合内の動的選択だけで適用する。
-  function compareSearchRank(a, b, includeApiOrder = true) {
-    const tier = b.tier - a.tier;
-    if (tier) return tier;
-    const taste = b.taste - a.taste;
-    if (taste) return taste;
-    for (let i = 0; i < 4; i++) {
-      const direct = b.directRelevanceKey[i] - a.directRelevanceKey[i];
-      if (direct) return direct;
-    }
-    return includeApiOrder ? a.apiOrder - b.apiOrder : 0;
-  }
-
-  // 第1層の資格・第2層のtierは、検索APIから証拠を得たctxだけで計算。
-  function searchRankRow(ctx, candidate) {
-    const id = candidateId(candidate);
-    if (!ctx || !ctx.searchHitIds.has(id) ||
-      candidate.isSearchApiHit !== true ||
-      candidate.queryKey !== ctx.queryKey) return null;
-    const cached = ctx.records.get(id) || candidate;
-    const normalizedType = searchIllustType(cached) ??
-      searchIllustType(candidate);
-    const it = {
-      ...cached, ...candidate,
-      title: candidate.title || cached.title || '',
-      tags: normTags(candidate.tags).length ? candidate.tags : cached.tags,
-      userId: candidate.userId ?? cached.userId,
-      illustType: normalizedType
-    };
-    const match = searchDiagnosticMatch(it, ctx.word);
-    return {
-      it: candidate, meta: it, id, tier: match.tier,
-      taste: tasteScore(it),
-      directRelevanceKey: [
-        match.coverageCount, match.exactTagTokenCount,
-        match.titleTokenCount, match.partialTagTokenCount
-      ],
-      apiOrder: ctx.searchOrderById.get(id) ?? Number.MAX_SAFE_INTEGER
-    };
-  }
-
-  function searchTiePenalty(row, previous, source = null, repeated = 0) {
-    const last = previous.at(-1), second = previous.at(-2);
-    const a = String(row.meta.userId || '');
-    let penalty = 0;
-    if (a && a === String(last?.userId || '')) penalty += 12;
-    if (a && a === String(second?.userId || '')) penalty += 5;
-    if (last && String(last.id) !== String(source?.id || '')) {
-      penalty += Math.min(8, commonIdentityTags(row.meta, last) * 4);
-    }
-    if (second && String(second.id) !== String(source?.id || '')) {
-      penalty += Math.min(4, commonIdentityTags(row.meta, second) * 2);
-    }
-    if (source) {
-      const shared = commonIdentityTags(row.meta, source);
-      penalty += Math.min(12, shared * 5);
-      if (shared) penalty += Math.min(6, repeated * 1.5);
-    }
-    return penalty;
-  }
-
-  // モデルAの並べ替え本体。診断も同じ計算済み順位行を使う。
-  function orderSearchRankRows(input, options = {}) {
-    const { previous = [], source = null,
-      limit = Infinity, diversify = true } = options;
-    const rows = input.slice().sort(compareSearchRank);
-    if (!diversify) return rows.slice(0, limit).map(row => row.it);
-    const result = [], used = previous.slice(-2);
-    let repeated = 0;
-    for (let start = 0; start < rows.length;) {
-      let end = start + 1;
-      while (end < rows.length &&
-        compareSearchRank(rows[start], rows[end], false) === 0) end++;
-      const tie = rows.slice(start, end);
-      while (tie.length && result.length < limit) {
-        let best = 0, lowest = Infinity;
-        for (let i = 0; i < tie.length; i++) {
-          const penalty = searchTiePenalty(tie[i], used, source, repeated);
-          if (penalty < lowest || (penalty === lowest &&
-              tie[i].apiOrder < tie[best].apiOrder)) {
-            lowest = penalty;
-            best = i;
-          }
-        }
-        const chosen = tie.splice(best, 1)[0];
-        result.push(chosen.it);
-        used.push(chosen.meta);
-        if (source && commonIdentityTags(chosen.meta, source)) repeated++;
-      }
-      if (result.length >= limit) break;
-      start = end;
-    }
-    return result;
-  }
-
-  function searchRankCandidates(ctx, candidates, options = {}) {
-    const ids = new Set(), rows = [];
-    for (const candidate of candidates || []) {
-      const id = candidateId(candidate);
-      if (ids.has(id)) continue;
-      const row = searchRankRow(ctx, candidate);
-      if (!row || (options.onlyMatching && row.tier === 0)) continue;
-      ids.add(id);
-      rows.push(row);
-    }
-    return orderSearchRankRows(rows, options);
-  }
-
-  async function prepareSearchRankCandidates(ctx, excludeIds, isCurrent, signal) {
-    if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) return null;
-    const excluded = new Set((excludeIds || []).map(String));
-    const raw = [...ctx.records.values()].filter(it =>
-      !excluded.has(String(it.id)) && !isSeen(it.id) &&
-      !knownBookmarkedIds.has(String(it.id)) &&
-      !it.bookmarked
-    );
-    const prepared = await prepareCandidates(raw, {
-      excludeIds: [...excluded, ...seenTimes.keys()],
-      enrichTop: 0, rank: tasteScore, isCurrent
-    });
-    if (!isCurrent() || !searchContextValid(ctx) || signal?.aborted) return null;
-    return prepared.filter(it => ctx.searchHitIds.has(String(it.id)) &&
-      !isSeen(it.id) &&
-      !knownBookmarkedIds.has(String(it.id)) && !it.bookmarked
-    ).map(it => ({
-      ...it, isSearchApiHit: true, queryKey: ctx.queryKey
-    }));
-  }
-
-  function markSearchSlides(items, ctx) {
-    if (!searchContextValid(ctx)) return [];
-    return items.filter(slide => {
-      const id = String(slide.id);
-      if (!ctx.searchHitIds.has(id) || !ctx.records.has(id)) return false;
-      slide.isSearchApiHit = true;
-      slide.queryKey = ctx.queryKey;
-      return true;
-    });
-  }
-
-  async function fetchBookmarkRelatedCandidates(id) {
-    const epoch = contentFilterEpoch;
-    const anchor = slides.find(s => String(s.id) === String(id));
-    const filter = {...contentFilter};
-    if (filter.type === 'all' && contentType(anchor) !== null) filter.type = contentType(anchor) === 1 ? 'manga' : 'illust';
-    if (filter.age === 'all' && contentEnum(anchor?.xRestrict) !== null) filter.age = Number(anchor.xRestrict) > 0 ? 'r18' : 'safe';
-    // recommend の既存取得に discovery を1回だけ追加する。
-    const related = (async () => {
-      const body = await fetchJson(
-        `/ajax/illust/${encodeURIComponent(id)}/recommend/init?limit=60&lang=ja`
-      );
-
-      let candidates = customCandidateArray(body);
-
-      if (!candidates.length && Array.isArray(body?.nextIds) &&
-          body.nextIds.length) {
-        const ids = body.nextIds.slice(0, 60).map(String);
-        const more = await fetchJson(
-          '/ajax/illust/recommend/illusts?illustIds=' +
-          encodeURIComponent(ids.join(',')) + '&lang=ja'
-        );
-        candidates = customCandidateArray(more);
-      }
-
-      return candidates;
-    })();
-    const results = await Promise.allSettled([
-      related,
-      fetchJson(contentDiscoveryUrl(filter))
-        .then(customCandidateArray)
-    ]);
-    if (results.every(result => result.status === 'rejected')) {
-      throw results[0].reason;
-    }
-    if (epoch !== contentFilterEpoch) return [];
-    return results.flatMap(result =>
-      result.status === 'fulfilled' ? result.value : []
-    );
-  }
-
-
-  function searchContextForSlide(s) {
-    // 固有の検索条件に紐づいた作品を別検索へ誤帰属させない。
-    if (s?.queryKey) return searchRankPools.get(s.queryKey) || null;
-    if (!searchConfig) return null;
-    return getSearchRankContext(searchConfig, searchConfig.page);
-  }
-
-  function searchConfigForContext(ctx) {
-    return ctx ? {...ctx.config} : null;
-  }
-
-  // 差し込み・テール双方で使う共通の資格判定/順位。通常の検索API経路だけで補充。
-  async function searchBookmarkCandidates(
-    ctx, config, excludedIds, source, previous, isCurrent, signal
-  ) {
-    if (!ctx || !isCurrent()) return null;
-    let result = [];
-    for (let n = 0; n <= 2; n++) {
-      const available = await prepareSearchRankCandidates(
-        ctx, excludedIds, isCurrent, signal
-      );
-      if (!available || !isCurrent()) return null;
-      result = searchRankCandidates(ctx, available, {
-        previous, source, onlyMatching: true,
-        limit: INSERT_RECOMMENDATION_LIMIT
-      });
-      if (result.length >= INSERT_RECOMMENDATION_LIMIT || ctx.finished ||
-        n === 2) break;
-      const fetched = await loadSearchApiBatch(ctx, config, isCurrent, signal);
-      if (!isCurrent() || fetched.stale) return null;
-      if (fetched.error || !fetched.fetched) break;
-    }
-    return result;
-  }
-
-
-  function reorderSearchFeedTail(anchor, word) {
-    if (mode !== 'search' || !slides.includes(anchor) || !feedEl) return;
-    const ctx = searchContextForSlide(anchor);
-    if (!ctx) return;
-    const pos = slides.indexOf(anchor), slots = [];
-    for (let i = pos + 1; i < slides.length; i++) {
-      const s = slides[i];
-      if (!s.isCurrent && !s.searchFixed &&
-        s.seriesParentId !== String(anchor.id) &&
-        !viewedThisSession.has(String(s.id)) &&
-        s.isSearchApiHit === true && s.queryKey === ctx.queryKey) {
-        slots.push(i);
-      }
-    }
-    if (!slots.length) return;
-    const sorted = searchRankCandidates(ctx,
-      slots.map(i => slides[i]), {previous:[anchor],source:anchor}
-    );
-    if (sorted.length !== slots.length) return; // 資格を再検証、既存は落とさない
-    slots.forEach((i,j) => { slides[i] = sorted[j]; });
-    const top = feedEl.scrollTop;
-    // 固定済みノードには触れず、実際に可動だったスロットだけを操作。
-    const movable = new Set(slots);
-    for (let i = slides.length - 1; i > pos; i--) {
-      if (!movable.has(i)) continue;
-      const node = slides[i].sectionEl;
-      const following = slides[i + 1]?.sectionEl || null;
-      if (node && node.nextElementSibling !== following) {
-        feedEl.insertBefore(node, following);
-      }
-    }
-    feedEl.scrollTop = top;
-  }
-
-
-  async function improveSearchFeedAfterBookmark(s) {
-    if (!s || mode !== 'search' || !slides.includes(s) ||
-      s.searchImprovePromise) return;
-    const generation = feedGeneration;
-    const ctx = searchContextForSlide(s);
-    const config = searchConfigForContext(ctx);
-    if (!ctx || !config) return;
-    const valid = () => generation === feedGeneration &&
-      mode === 'search' && slides.includes(s) &&
-      searchContextValid(ctx);
-    const work = (async () => {
-      try {
-        const excluded = [
-          s.id, s.seriesNextId, ...slides.map(x => x.id),
-          ...searchGrid.items.map(x => x.id)
-        ];
-        const chosen = await searchBookmarkCandidates(
-          ctx, config, excluded, s, [s], valid
-        );
-        if (!valid() || chosen === null) return;
-        s.searchInsertedIds = new Set(chosen.map(it => String(it.id)));
-        if (chosen.length) {
-          const current = slides[currentIndex()];
-          const oldTop = feedEl.scrollTop;
-          const height = Math.max(1, feedEl.clientHeight);
-          let pos = slides.indexOf(s);
-          if (slides[pos + 1]?.seriesParentId === String(s.id)) pos++;
-          if (!valid()) return;
-          insertSlidesAfter(pos,
-            markSearchSlides(candidatesToSlides(chosen), ctx));
-          if (current && current !== s && slides.includes(current)) {
-            feedEl.scrollTop =
-              slides.indexOf(current) * height + oldTop % height;
-          }
-        }
-      } catch (e) {
-        console.warn('[PTS search] 検索API差し込み失敗', e);
-      } finally {
-        if (valid()) {
-          reorderSearchFeedTail(s, config.word);
-          markCurrentFromScroll();
-        }
-      }
-    })();
-    s.searchImprovePromise = work;
-    return work;
-  }
-
-  // 共通プールの未表示候補を現在の表示済みセットから除外して評価。
-  async function buildSearchRankedBatch(
-    ctx, previous = [], excludeIds = [], isCurrent = () => true, signal
-  ) {
-    const candidates = await prepareSearchRankCandidates(
-      ctx, excludeIds, isCurrent, signal
-    );
-    if (!candidates || !isCurrent()) return null;
-    return searchRankCandidates(ctx, candidates, { previous });
-  }
-
-  function searchGridThumbnail(it) {
-    // APIが正方形URLを明示していれば優先。URLを推測で生成しない。
-    const candidates = [it.urls?.square1200, it.square1200,
-      it.urls?.square, it.url, it.urls?.small,
-      it.urls?.regular, it.urls?.thumb];
-    return candidates.find(url => typeof url === 'string' && url) || '';
-  }
-
-  function renderGridTags(body) {
-    const bar = searchGrid.chips;
-    bar.replaceChildren();
-    const tags = findSearchTagCandidates(body, searchGrid.config.word);
-    for (const tag of tags) {
-      const chip = document.createElement('button');
-      chip.type = 'button';
-      chip.textContent = `#${tag}`;
-      chip.addEventListener('click', () => openSearchGrid(tag));
-      bar.appendChild(chip);
-    }
-    bar.hidden = !tags.length;
-  }
-
-  function installGridSaveCSS() {
-    if (document.getElementById('pts-grid-save-style')) return;
-    const style = document.createElement('style');
-    style.id = 'pts-grid-save-style';
-    style.textContent = `
-  #pts-overlay .pts-grid-item{position:relative;overflow:hidden}
-  #pts-overlay .pts-grid-open{
-    display:block;width:100%;height:100%;padding:0;margin:0;
-    border:0;background:transparent;touch-action:manipulation
-  }
-  #pts-overlay .pts-grid-open img{
-    display:block;width:100%;height:100%;object-fit:cover
-  }
-  #pts-overlay .pts-grid-save{
-    position:absolute;top:6px;right:6px;z-index:2;
-    min-width:30px;min-height:30px;border:1px solid #ffffff55;
-    border-radius:999px;background:#000b;color:#fff;
-    font-size:15px;touch-action:manipulation
-  }
-  #pts-overlay .pts-grid-bookmarked .pts-grid-save{
-    background:#993653ee
-  }
-  #pts-overlay .pts-grid-heart{
-    position:absolute;left:50%;top:50%;z-index:3;
-    pointer-events:none;font-size:44px;
-    animation:ptsHeart .85s ease-out forwards
-  }
-  `;
-    document.head.appendChild(style);
-  }
-
-  function createSearchGridCard(it) {
-    installGridSaveCSS();
-    const id = String(it.id);
-    const card = document.createElement('div');
-    card.className = 'pts-grid-item';
-    card.dataset.ptsId = id;
-
-    const thumb = document.createElement('button');
-    thumb.type = 'button';
-    thumb.className = 'pts-grid-open';
-    thumb.setAttribute('aria-label', it.title || `作品 ${id}`);
-
-    const img = document.createElement('img');
-    img.loading = 'lazy';
-    img.decoding = 'async';
-    img.alt = '';
-    const src = searchGridThumbnail(it);
-    const fallback = it.url || it.urls?.small || '';
-    if (src) img.src = src;
-    if (fallback && fallback !== src) {
-      img.addEventListener('error', () => {
-        img.src = fallback;
-      }, { once: true });
-    }
-    thumb.appendChild(img);
-
-    const save = document.createElement('button');
-    save.type = 'button';
-    save.className = 'pts-grid-save';
-    save.textContent = '♡';
-    save.setAttribute('aria-label', '作品を保存');
-    save.addEventListener('click', e => {
-      e.stopPropagation();
-      clearGridTap();
-      void saveGridArtwork(it, card, false);
-    });
-
-    thumb.addEventListener('click', () => {
-      const now = performance.now();
-      if (gridTap && gridTap.id === id && now - gridTap.time <= LIKE_TAP_WINDOW) {
-        clearGridTap();
-        void saveGridArtwork(it, card, true);
-        return;
-      }
-      clearGridTap();
-      const token = searchGrid.token;
-      gridTap = {
-        id, time: now,
-        timer: setTimeout(() => {
-          gridTap = null;
-          if (searchGrid.open && token === searchGrid.token) {
-            openGridArtwork(it);
-          }
-        }, LIKE_TAP_WINDOW)
-      };
-    });
-
-    card.append(thumb, save);
-    return card;
-  }
-
-  function appendGridCards(items, afterId = null) {
-    const g = searchGrid;
-    const fragment = document.createDocumentFragment();
-    const accepted = [];
-
-    for (const it of items) {
-      if (!contentMatches(it)) continue;
-      const id = String(it.id);
-      const ctx = g.rankContext;
-      if (!ctx || !searchContextValid(ctx) ||
-          !ctx.searchHitIds.has(id) || !ctx.records.has(id) ||
-          it.isSearchApiHit !== true || it.queryKey !== ctx.queryKey ||
-          !/^\d+$/.test(id) || g.ids.has(id) ||
-          isSeen(id) || knownBookmarkedIds.has(id) ||
-          it.bookmarked) continue;
-
-      g.ids.add(id);
-      accepted.push(it);
-      fragment.appendChild(createSearchGridCard(it));
-    }
-
-    if (!accepted.length) return;
-    if (!g.fixedIds) g.fixedIds = new Set();
-    accepted.forEach(it => g.fixedIds.add(String(it.id)));
-
-    const anchor = afterId == null ? null :
-      [...g.cards.children].find(el =>
-        el.dataset.ptsId === String(afterId));
-
-    if (anchor) {
-      const index = g.items.findIndex(it =>
-        String(it.id) === String(afterId));
-      g.cards.insertBefore(fragment, anchor.nextSibling);
-      g.items.splice(index + 1, 0, ...accepted);
-    } else {
-      g.cards.appendChild(fragment);
-      g.items.push(...accepted);
-    }
-  }
-
-  async function saveGridArtwork(it, card, byLike = false) {
-    if (!searchGrid.open || card.dataset.saving === '1') return;
-
-    const token = searchGrid.token;
-    const badge = card.querySelector('.pts-grid-save');
-    card.dataset.saving = '1';
-    badge.disabled = true;
-    badge.textContent = '…';
-
-    if (byLike) {
-      const heart = document.createElement('span');
-      heart.className = 'pts-grid-heart';
-      heart.textContent = '❤️';
-      card.appendChild(heart);
-      setTimeout(() => heart.remove(), 1100);
-    }
-
-    try {
-      const s = candidatesToSlides([it])[0];
-      if (!s) return;
-
-      if (byLike) {
-        learnFromWork(s.tags, s.userId, s.rawType, LEARN_LIKE_WEIGHT);
-        s.tasteLearned = true;
-      }
-
-      const newlySaved = await ensureBookmarked(s);
-      if (!searchGrid.open || token !== searchGrid.token) return;
-
-      badge.textContent = '✓';
-      card.classList.add('pts-grid-bookmarked');
-
-      if (newlySaved || (byLike &&
-          card.dataset.improved !== '1')) {
-        await improveSearchGridAfterBookmark(it, card, token);
-      }
-    } catch (e) {
-      console.warn('[PTS grid] 保存失敗', e);
-      if (searchGrid.open && token === searchGrid.token) {
-        badge.textContent = '♡';
-      }
-    } finally {
-      delete card.dataset.saving;
-      badge.disabled = card.classList.contains('pts-grid-bookmarked');
-    }
-  }
-
-
-  // 画面に一度でも現れたカードは固定。表示中・既読・保存済みも移動しない。
-  function lockVisibleSearchGridCards() {
-    const g = searchGrid;
-    if (!g.open || !g.cards) return;
-    if (!g.fixedIds) g.fixedIds = new Set();
-    // グリッドに一度追加されたカードは画面外も含めすべて固定。
-    for (const el of g.cards.children) {
-      g.fixedIds.add(String(el.dataset.ptsId));
-    }
-  }
-
-  function reorderSearchGridTail(anchorId, word) {
-    const g = searchGrid;
-    if (!g.open || !g.cards) return;
-    const ctx = g.rankContext;
-    if (!ctx || !searchContextValid(ctx)) return;
-    lockVisibleSearchGridCards();
-    const pos = g.items.findIndex(it => String(it.id) === String(anchorId));
-    if (pos < 0) return;
-    const slots = [];
-    for (let i = pos + 1; i < g.items.length; i++) {
-      const it = g.items[i], id = String(it.id);
-      if (!g.fixedIds.has(id) && !viewedThisSession.has(id) &&
-        !isSeen(id) && !knownBookmarkedIds.has(id) &&
-        it.isSearchApiHit === true && it.queryKey === ctx.queryKey) {
-        slots.push(i);
-      }
-    }
-    if (!slots.length) return;
-    const sorted = searchRankCandidates(ctx, slots.map(i => g.items[i]),
-      {previous: g.items.slice(Math.max(0,pos-1),pos+1),
-       source:g.items[pos]});
-    if (sorted.length !== slots.length) return;
-    slots.forEach((i,j) => { g.items[i] = sorted[j]; });
-    const nodes = new Map([...g.cards.children].map(
-      el => [el.dataset.ptsId,el]
-    ));
-    const top = g.scroll.scrollTop;
-    // 固定ノードを再接続しない。可動スロットのノードだけ操作。
-    const movable = new Set(slots);
-    for (let i = g.items.length - 1; i > pos; i--) {
-      if (!movable.has(i)) continue;
-      const node = nodes.get(String(g.items[i].id));
-      const following = g.items[i + 1]
-        ? nodes.get(String(g.items[i + 1].id)) : null;
-      if (node && node.nextElementSibling !== following) {
-        g.cards.insertBefore(node, following || null);
-      }
-    }
-    g.scroll.scrollTop = top;
-  }
-
-
-  async function improveSearchGridAfterBookmark(it, card, token) {
-    const g = searchGrid;
-    if (card.dataset.improved === '1' || !g.config?.word) return;
-    const ctx = g.rankContext;
-    if (!ctx) return;
-    card.dataset.improved = '1';
-    const id = String(it.id);
-    const valid = () => g.open && g.token === token &&
-      g.rankContext === ctx && searchContextValid(ctx);
-    try {
-      const excluded = [
-        id, ...g.ids, ...slides.map(s => s.id)
-      ];
-      const pos = g.items.findIndex(x => String(x.id) === id);
-      const anchor = pos >= 0 ? g.items[pos] : it;
-      const previous = pos >= 0
-        ? g.items.slice(Math.max(0,pos-1),pos+1) : [anchor];
-      const selected = await searchBookmarkCandidates(
-        ctx, g.config, excluded, anchor, previous, valid, g.controller?.signal
-      );
-      if (!valid() || selected === null) return;
-      lockVisibleSearchGridCards();
-      if (!valid()) return;
-      appendGridCards(selected, id);
-    } catch (e) {
-      console.warn('[PTS grid] 検索API差し込み失敗', e);
-      delete card.dataset.improved;
-    } finally {
-      if (valid()) {
-        reorderSearchGridTail(id, g.config.word);
-        g.status.textContent = g.items.length + '件表示中';
-      }
-    }
-  }
-
-  async function searchGridLoadMore() {
-    const g = searchGrid;
-    if (!g.open || g.busy || g.finished || !g.config) return false;
-    g.busy = true;
-    g.retry.hidden = true;
-    g.status.textContent = '読み込み中…';
-    const token = g.token, config = g.config;
-    const controller = new AbortController();
-    g.controller = controller;
-    const ctx = getSearchRankContext(config, g.page);
-    g.rankContext = ctx;
-    const valid = () => g.open && token === g.token &&
-      g.config === config && searchContextValid(ctx);
-    try {
-      const loaded = await loadSearchApiBatch(
-        ctx, config, valid, controller.signal
-      );
-      if (!valid() || loaded.stale) return false;
-      if (!g.tagsReady && ctx.firstBody) {
-        renderGridTags(ctx.firstBody);
-        g.tagsReady = true;
-      }
-      const ranked = await buildSearchRankedBatch(
-        ctx, g.items.slice(-2), [...g.ids], valid, controller.signal
-      );
-      if (!valid() || !ranked || controller.signal.aborted) return false;
-      // 表示済みカードは移動せず、新規取得候補だけを末尾へ追加。
-      if (!valid()) return false;
-      appendGridCards(ranked);
-      lockVisibleSearchGridCards();
-      g.page = ctx.nextPage;
-      g.finished = ctx.finished;
-      if (loaded.error) {
-        g.status.textContent =
-          '読み込み失敗: ' + (loaded.error.message || loaded.error);
-        g.retry.textContent = '再試行';
-        g.retry.hidden = false;
-      } else if (ctx.finished) {
-        g.status.textContent = g.items.length ? g.items.length + '件' :
-          contentEmptyMessage();
-      } else {
-        g.status.textContent = g.items.length + '件表示中';
-        if (g.scroll.scrollHeight <= g.scroll.clientHeight + 4) {
-          g.retry.textContent = '続きを取得';
-          g.retry.hidden = false;
-        }
-      }
-      return !loaded.error;
-    } catch (e) {
-      if (valid()) {
-        g.status.textContent = '読み込み失敗: ' + (e.message || e);
-        g.retry.textContent = '再試行';
-        g.retry.hidden = false;
-        console.warn('[PTS grid]', e);
-      }
-      return false;
-    } finally {
-      if (token === g.token) {
-        g.busy = false;
-        g.controller = null;
-      }
-    }
-  }
-
-  function openGridArtwork(it) {
-    if (!searchGrid.open || !feedEl || !contentMatches(it)) return;
-
-    const id = String(it?.id || '');
-    if (!/^\d+$/.test(id)) return;
-
-    const word = searchGrid.config?.word || '';
-    const gridContext = searchGrid.rankContext;
-    if (!gridContext || !searchContextValid(gridContext) ||
-      !gridContext.searchHitIds.has(id) || !gridContext.records.has(id) ||
-      !searchGrid.ids.has(id) || it.isSearchApiHit !== true ||
-      it.queryKey !== gridContext.queryKey) return;
-    const returnSnapshot = {
-      queryKey: gridContext.queryKey,
-      scrollTop: searchGrid.scroll.scrollTop
-    };
-    closeSearchGrid();
-
-    let idx = slides.findIndex(s => String(s.id) === id);
-
-    if (idx < 0) {
-      const selected = candidatesToSlides([it])[0];
-      if (!selected) return;
-
-      selected.gridSearchWord = word;
-      if (!markSearchSlides([selected], gridContext).length) return;
-
-      if (slides.length) {
-        insertSlidesAfter(
-          Math.min(currentIndex(), slides.length - 1),
-          [selected]
-        );
-      } else {
-        addItems([selected]);
-      }
-
-      idx = slides.indexOf(selected);
-    }
-
-    if (mode === 'custom') customSeenIds.add(id);
-    else {
-      slides[idx].gridSearchWord = word;
-      if (!markSearchSlides([slides[idx]], gridContext).length) return;
-    }
-
-    navIntent = { reason: 'other', until: 0 };
-    feedEl.scrollTop = idx * feedEl.clientHeight;
-    markCurrentFromScroll();
-    gridReturnState = returnSnapshot;
-    syncDock();
-    void resolveSlide(slides[idx]);
-  }
-
-  function installSearchGridCSS() {
-    const style = document.createElement('style');
-    style.textContent = `
-  #pts-overlay .pts-search-grid[hidden]{display:none!important}
-  #pts-overlay.pts-grid-open .pts-feed{visibility:hidden;pointer-events:none}
-  #pts-overlay.pts-grid-open .pts-search-tags{display:none!important}
-  #pts-overlay .pts-search-grid{
-    position:absolute;top:calc(63px + env(safe-area-inset-top));
-    bottom:calc(73px + env(safe-area-inset-bottom));left:0;right:0;
-    z-index:25;background:#0d0d11;color:#fff;
-    display:flex;flex-direction:column
-  }
-  #pts-overlay .pts-grid-heading{
-    display:flex;align-items:center;gap:8px;padding:10px 12px 4px;flex-shrink:0
-  }
-  #pts-overlay .pts-grid-title{
-    flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;font-weight:700
-  }
-  #pts-overlay .pts-grid-back,#pts-overlay .pts-grid-retry{
-    flex:0 0 auto;background:#2a2a30;color:#fff;border:1px solid #ffffff30;border-radius:999px;padding:7px 10px;cursor:pointer;touch-action:manipulation
-  }
-  #pts-overlay .pts-grid-chips{
-    display:flex;gap:6px;overflow-x:auto;padding:4px 10px 10px;
-    flex-shrink:0;scrollbar-width:none;-webkit-overflow-scrolling:touch
-  }
-  #pts-overlay .pts-grid-chips[hidden]{display:none!important}
-  #pts-overlay .pts-grid-chips button{
-    flex:0 0 auto;white-space:nowrap;background:#35353c;color:#fff;
-    border:1px solid #ffffff30;border-radius:999px;padding:7px 11px
-  }
-  #pts-overlay .pts-grid-scroll{
-    flex:1;min-height:0;overflow-y:auto;padding:0 10px 10px;-webkit-overflow-scrolling:touch
-  }
-  #pts-overlay .pts-grid-cards{
-    display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px
-  }
-  #pts-overlay .pts-grid-item{
-    display:block;aspect-ratio:1/1;min-width:0;width:100%;padding:0;
-    border:0;border-radius:2px;overflow:hidden;background:#202025;
-    touch-action:manipulation;cursor:pointer
-  }
-  #pts-overlay .pts-grid-item img{
-    display:block;width:100%;height:100%;object-fit:cover!important
-  }
-  #pts-overlay .pts-grid-footer{
-    display:flex;flex-wrap:wrap;align-items:center;justify-content:center;
-    gap:10px;padding:14px 4px;color:#bbb;font-size:12px
-  }
-  #pts-overlay .pts-grid-retry[hidden]{display:none!important}
-  `;
-    document.head.appendChild(style);
-  }
-
-  function installSearchGridUI() {
-    if (searchGrid.root || !overlay) return;
-    const root = document.createElement('section');
-    root.className = 'pts-search-grid';
-    root.hidden = true;
-    root.setAttribute('aria-label', '検索グリッド');
-    root.innerHTML = `
-      <div class="pts-grid-heading">
-        <span class="pts-grid-title"></span>
-        <button type="button" class="pts-grid-back">フィードに戻る</button>
-      </div>
-      <div class="pts-grid-chips" hidden></div>
-      <div class="pts-grid-scroll">
-        <div class="pts-grid-cards"></div>
-        <div class="pts-grid-footer">
-          <span class="pts-grid-status"></span>
-          <button type="button" class="pts-grid-retry" hidden>再試行</button>
-        </div>
-      </div>
-    `;
-    overlay.appendChild(root);
-    Object.assign(searchGrid, {
-      root, scroll: root.querySelector('.pts-grid-scroll'),
-      cards: root.querySelector('.pts-grid-cards'),
-      chips: root.querySelector('.pts-grid-chips'),
-      title: root.querySelector('.pts-grid-title'),
-      status: root.querySelector('.pts-grid-status'),
-      retry: root.querySelector('.pts-grid-retry')
-    });
-    root.querySelector('.pts-grid-back').addEventListener('click', closeSearchGrid);
-    searchGrid.retry.addEventListener('click', () => void searchGridLoadMore());
-    searchGrid.scroll.addEventListener('scroll', () => {
-      const el = searchGrid.scroll;
-      lockVisibleSearchGridCards();
-      if (el.scrollHeight - el.scrollTop - el.clientHeight <
-        el.clientHeight * 1.5) void searchGridLoadMore();
-    }, { passive: true });
-    installSearchGridCSS();
-  }
-
-  // 候補一覧の形をソースごとに吸収。IDだけの作者profile/allは採用しない。
-  function customCandidateArray(body) {
-    const preferred = [body?.illustManga?.data, body?.thumbnails?.illust,
-      body?.illusts, body?.works, body?.items, body?.data];
-    for (const a of preferred) if (Array.isArray(a) &&
-        a.some(x => x && (x.id != null || x.illustId != null))) return a;
-    const q = [{o:body, d:0}];
-    let traversed = 0;
-    while (q.length && traversed++ < 50) {
-      const {o,d} = q.shift();
-      if (!o || typeof o !== 'object' || d >= 3) continue;
-      for (const v of Object.values(o).slice(0,30)) {
-        if (Array.isArray(v) && v.some(x => x && typeof x === 'object' &&
-            (x.id != null || x.illustId != null))) return v;
-        if (v && !Array.isArray(v) && typeof v === 'object') q.push({o:v,d:d+1});
-      }
-    }
-    return [];
-  }
-
-  function getSearchPageConfig() {
-    const path = location.pathname;
-
-    const match = path.match(
-      /^\/tags\/([^/]+)(?:\/(?:artworks|illustrations|manga))?\/?$/
-    );
-
-    if (!match) return null;
-
-    let word;
-
-    try {
-      word = decodeURIComponent(match[1]);
-    } catch (e) {
-      return null;
-    }
-
-    word = word.trim();
-    if (!word) return null;
-
-    const params = new URLSearchParams(location.search);
-
-    const order = ['popular_d', 'date_d'].includes(
-      params.get('order')
-    ) ? params.get('order') : 'popular_d';
-
-    const searchMode = ['all', 'safe', 'r18'].includes(
-      params.get('mode')
-    ) ? params.get('mode') : 'all';
-
-    const matchMode = ['s_tag', 's_tag_full'].includes(
-      params.get('s_mode')
-    ) ? params.get('s_mode') : 's_tag';
-
-    const requestedPage = Number(params.get('p'));
-    const page = Number.isInteger(requestedPage) &&
-      requestedPage >= 1 && requestedPage <= 1000
-        ? requestedPage : 1;
-
-    return { word, order, searchMode, matchMode, page };
-  }
-
-  let searchConfig = null;
-  let searchPage = 1;
-  let searchBusy = false;
-  let searchFinished = false;
-  let searchLastFailure = 0;
-  let searchTagCandidates = [];
-
-  // 検索専用。1回の追加読み込みで最大3ページ取得。
-  const SEARCH_BATCH_PAGES = 3;
-
-  function findSearchTagCandidates(body, currentWord) {
-    const result = [];
-    const used = new Set([currentWord]);
-
-    const add = value => {
-      const tag = String(value || '').trim();
-
-      if (!tag || used.has(tag) || tag.length > 80) return;
-      used.add(tag);
-      result.push(tag);
-    };
-
-    const read = items => {
-      if (Array.isArray(items)) {
-        for (const item of items) {
-          if (typeof item === 'string') add(item);
-          else if (item && typeof item === 'object') {
-            add(item.tag ?? item.name ?? item.word);
-          }
-        }
-      }
-    };
-
-    read(body?.relatedTags);
-    read(body?.illustManga?.relatedTags);
-    read(body?.tagSuggestions);
-    read(body?.suggestTags);
-
-    if (!result.length) {
-      document.querySelectorAll(
-        'a[href^="/tags/"]'
-      ).forEach(a => {
-        if (result.length >= 12) return;
-        if (overlay?.contains(a)) return;
-
-        const href = a.getAttribute('href') || '';
-        const m = href.match(/^\/tags\/([^/?#]+)/);
-        if (!m) return;
-
-        try {
-          add(decodeURIComponent(m[1]));
-        } catch (e) {}
-      });
-    }
-
-    if (!result.length) {
-      const values = new Map();
-
-      for (const source of [
-        historyProfile.tags,
-        profile.tags
-      ]) {
-        for (const [tag, score] of Object.entries(source || {})) {
-          const weight = Number(score);
-          if (tag && Number.isFinite(weight) && weight > 0) {
-            values.set(tag, (values.get(tag) || 0) + weight);
-          }
-        }
-      }
-
-      for (const [tag] of [...values].sort(
-        (a, b) => b[1] - a[1]
-      )) {
-        add(tag);
-        if (result.length >= 12) break;
-      }
-    }
-
-    return result.slice(0, 12);
-  }
-
-  function renderSearchTagCandidates() {
-    let bar = overlay?.querySelector('.pts-search-tags');
-    if (!overlay) return;
-
-    if (!bar) {
-      bar = document.createElement('nav');
-      bar.className = 'pts-search-tags';
-      bar.setAttribute('aria-label', '検索ワード候補');
-      overlay.appendChild(bar);
-    }
-
-    bar.replaceChildren();
-
-    if (mode !== 'search' || !searchTagCandidates.length) {
-      bar.hidden = true;
-      return;
-    }
-
-    for (const tag of searchTagCandidates) {
-      const chip = document.createElement('button');
-      chip.type = 'button';
-      chip.textContent = `#${tag}`;
-
-      chip.addEventListener('click', () => {
-        window.location.assign(
-          '/tags/' + encodeURIComponent(tag) + '/artworks'
-        );
-      });
-
-      bar.appendChild(chip);
-    }
-
-    bar.hidden = false;
-  }
-
-
-  async function searchLoadMore() {
-    if (mode !== 'search' || !searchConfig || searchBusy ||
-      searchFinished || overlay?.style.display === 'none') return;
-    if (Date.now() - searchLastFailure < 4000) return;
-    searchBusy = true;
-    const generation = feedGeneration;
-    const config = searchConfig;
-    const ctx = getSearchRankContext(config, searchPage);
-    const valid = () => generation === feedGeneration &&
-      mode === 'search' && searchConfig === config &&
-      searchContextValid(ctx);
-    try {
-      const loaded = await loadSearchApiBatch(ctx, config, valid);
-      if (!valid() || loaded.stale) return; // 取得後の世代検証
-      if (!searchTagCandidates.length && ctx.firstBody) {
-        searchTagCandidates = findSearchTagCandidates(ctx.firstBody, config.word);
-        renderSearchTagCandidates();
-      }
-      const ids = new Set(slides.map(s => String(s.id)));
-      const ranked = await buildSearchRankedBatch(
-        ctx, slides.slice(-2), [...ids], valid
-      );
-      if (!valid() || !ranked) return; // 候補準備後の世代検証
-      const selected = ranked.filter(it => {
-        const id = String(it.id);
-        if (ids.has(id) || isSeen(id) ||
-          knownBookmarkedIds.has(id) || it.bookmarked) return false;
-        ids.add(id);
-        return true;
-      });
-      if (!valid()) return; // DOM反映直前の世代検証
-      const first = slides.length === 0;
-      if (selected.length) {
-        addItems(markSearchSlides(candidatesToSlides(selected), ctx));
-        if (first) markCurrentFromScroll();
-      }
-      searchPage = ctx.nextPage;
-      searchFinished = ctx.finished;
-      searchLastFailure = loaded.error ? Date.now() : 0;
-      if (loaded.error) console.warn('[PTS search]', loaded.error);
-      if (!slides.length && (ctx.finished || loaded.error)) {
-        const counter = overlay?.querySelector('.pts-counter');
-        if (counter) counter.textContent = loaded.error
-          ? '検索取得失敗: ' + (loaded.error.message || loaded.error)
-          : contentEmptyMessage();
-      }
-    } catch (e) {
-      if (valid()) {
-        searchLastFailure = Date.now();
-        console.warn('[PTS search]', e);
-      }
-    } finally {
-      if (generation === feedGeneration) { searchBusy = false; showContentEmpty(); }
-    }
-  }
-
-  async function startSearchFeed() {
-    if (!overlay || !feedEl || !searchConfig) return;
-
-    feedGeneration++;
-    const generation = feedGeneration;
-
-    slides.forEach(cleanupSlide);
-    slides = [];
-
-    feedEl.replaceChildren();
-    feedEl.scrollTop = 0;
-
-    mode = 'search';
-    activeView = null;
-
-    searchPage = searchConfig.page;
-    searchBusy = false;
-    searchFinished = false;
-    searchLastFailure = 0;
-    searchTagCandidates = [];
-
-    updateCounter();
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (
-        generation !== feedGeneration ||
-        searchFinished ||
-        slides.length
-      ) break;
-
-      await searchLoadMore();
-
-      if (searchLastFailure) break;
-    }
-
-    if (
-      generation === feedGeneration &&
-      slides.length
-    ) {
-      markCurrentFromScroll();
-    }
-  }
-  let customTagOffset = 0;
-  let customFollowPage = 1;
-  let customFollowFinished = false;
-  let customAuthorOffset = 0;
-
-  /* ---------- 片手・ハンズフリー向け機能 ---------- */
-
-  let wakeLock = null;
-  let csrfToken = null;
-
-  let csrfTokenSource = '';
-  let csrfReadPromise = null;
-  let csrfPreferHome = false;
-  let lastBookmarkAttempt = null;
-  let bookmarkToastTimer = null;
-
-  function bookmarkSafeMessage(value) {
-    let text = String(value ?? '');
-    if (csrfToken) text = text.split(csrfToken).join('[非表示]');
-    return text
-      .replace(/(?:csrf[_-]?token|token|authorization)\s*[:=]\s*["']?[\w+\-/.]{8,}/ig,
-        'token=[非表示]')
-      .replace(/[A-Za-z0-9_\-]{32,}/g, '[非表示]')
-      .replace(/[\r\n\t]+/g, ' ').slice(0, 120);
-  }
-
-  function recordBookmarkAttempt(result, stage, httpStatus, apiMessage) {
-    lastBookmarkAttempt = {
-      at: new Date().toLocaleString('ja-JP'), result, stage,
-      httpStatus: httpStatus ?? null,
-      apiMessage: bookmarkSafeMessage(apiMessage),
-      tokenSource: csrfTokenSource || '未取得',
-      tokenLength: csrfToken?.length || 0
-    };
-    updateBookmarkDiagnosticUI();
-  }
-
-  function bookmarkDiagnosticText() {
-    const a = lastBookmarkAttempt;
-    if (!a) return '9. ブックマーク送信: 未施行 (POST診断は実行しません)';
-    const http = a.httpStatus == null
-      ? '未到達' : String(a.httpStatus);
-    return '9. ブックマーク送信: ' +
-      `${a.result} / 段階=${a.stage} / HTTP=${http}` +
-      ` / API=${a.apiMessage || 'なし'}` +
-      ` / token取得元=${a.tokenSource} (${a.tokenLength}文字)` +
-      ` / ${a.at}`;
-  }
-
-  function updateBookmarkDiagnosticUI() {
-    const el = overlay?.querySelector('.pts-bookmark-last');
-    if (el) el.textContent = bookmarkDiagnosticText();
-  }
-
-  function showBookmarkError(message) {
-    const toast = overlay?.querySelector('.pts-bookmark-toast');
-    if (!toast) return;
-    toast.textContent = '保存に失敗しました: ' +
-      bookmarkSafeMessage(message);
-    toast.hidden = false;
-    toast.classList.add('is-visible');
-    clearTimeout(bookmarkToastTimer);
-    bookmarkToastTimer = setTimeout(() => {
-      toast.classList.remove('is-visible');
-      toast.hidden = true;
-    }, 4500);
-  }
-
-  class BookmarkError extends Error {
-    constructor(stage, httpStatus, apiMessage) {
-      super(bookmarkSafeMessage(apiMessage)
-        || bookmarkStageLabel(stage));
-      this.name = 'BookmarkError';
-      this.stage = stage;
-      this.httpStatus = httpStatus ?? null;
-      this.apiMessage = bookmarkSafeMessage(apiMessage);
-    }
-  }
-
-  function bookmarkStageLabel(stage) {
-    return {
-      token: 'トークン取得失敗',
-      network: '通信エラー',
-      http: 'HTTPエラー',
-      response: '応答解析失敗',
-      api: 'APIエラー'
-    }[stage] || '保存に失敗しました';
-  }
-
-  function bookmarkFailure(
-    stage, message, httpStatus = null, apiMessage = ''
-  ) {
-    const err = new Error(bookmarkSafeMessage(message));
-    err.bookmarkStage = stage;
-    err.httpStatus = httpStatus;
-    err.apiMessage = bookmarkSafeMessage(apiMessage);
-    return err;
-  }
-
-  function csrfValid(value) {
-    return typeof value === 'string' &&
-      /^[A-Za-z0-9_-]{10,128}$/.test(value);
-  }
-
-  function csrfParse(text) {
-    try { return JSON.parse(text); }
-    catch (e) { return null; }
-  }
-
-  function csrfFromDocument(doc, html, prefix) {
-    const global = csrfParse(
-      doc.querySelector('meta[name="global-data"]')
-        ?.getAttribute('content') || ''
-    );
-    const globalToken =
-      global?.token ||
-      global?.csrfToken ||
-      global?.userData?.token;
-    if (csrfValid(globalToken)) {
-      return {
-        value: globalToken,
-        source: prefix + '.global-data'
-      };
-    }
-
-    const next = csrfParse(
-      doc.querySelector('#__NEXT_DATA__')?.textContent || ''
-    );
-    const props = next?.props?.pageProps;
-
-    let state = props?.serverSerializedPreloadedState;
-    if (typeof state === 'string') {
-      state = csrfParse(state);
-    }
-
-    const nextToken =
-      state?.api?.token ||
-      state?.api?.csrfToken ||
-      props?.api?.token ||
-      props?.csrfToken ||
-      props?.token;
-
-    if (csrfValid(nextToken)) {
-      return {
-        value: nextToken,
-        source: prefix + '.__NEXT_DATA__'
-      };
-    }
-
-    const matched = String(html || '').match(
-      /["']token["']\s*:\s*["']([A-Za-z0-9_-]{10,128})["']/i
-    );
-
-    return csrfValid(matched?.[1])
-      ? { value: matched[1], source: prefix + '.regex' }
-      : null;
-  }
-
-  function gotoSlide(i, reason = 'other') {
-    if (!feedEl || i < 0 || i >= slides.length || !contentMatches(slides[i])) return;
-
-    navIntent = {
-      reason,
-      until: performance.now() + 3000
-    };
-
-    feedEl.scrollTo({
-      top: i * feedEl.clientHeight,
-      behavior: 'smooth'
-    });
-  }
-
-  function currentIndex() {
-    if (!feedEl) return 0;
-    return Math.round(feedEl.scrollTop / Math.max(1, feedEl.clientHeight));
-  }
-
-  // 自動送り：表示が落ち着いたらタイマーを張り直す。うごイラは1ループ分は最低待つ
-
-  // 画面が消えないようにする（対応ブラウザのみ）
-  async function keepAwake(on) {
-    try {
-      if (on && navigator.wakeLock) {
-        wakeLock = await navigator.wakeLock.request('screen');
-      } else if (wakeLock) {
-        await wakeLock.release();
-        wakeLock = null;
-      }
-    } catch (e) { /* 非対応なら何もしない */ }
-  }
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && overlay && overlay.style.display !== 'none') keepAwake(true);
-  });
-
-  async function getCsrfToken() {
-    if (csrfToken) return csrfToken;
-    if (csrfReadPromise) return csrfReadPromise;
-
-    csrfReadPromise = (async () => {
-      const page = () =>
-        (csrfFromDocument(document, document.documentElement.outerHTML, 'page') ||
-          csrfFromDocument(document, '', 'page'));
-
-      const home = async () => {
-        try {
-          const res = await fetch('https://www.pixiv.net/', {
-            method: 'GET',
-            credentials: 'same-origin',
-            cache: 'no-store'
-          });
-          if (!res.ok) return null;
-          const html = await res.text();
-          const doc = new DOMParser().parseFromString(html, 'text/html');
-          return csrfFromDocument(doc, html, 'home');
-        } catch (e) {
-          return null;
-        }
-      };
-
-      // 直前にCSRF拒否された場合はトップページを先に確認。
-      const hit = csrfPreferHome
-        ? (await home() || page())
-        : (page() || await home());
-
-      csrfPreferHome = false;
-      csrfToken = hit?.value || null;
-      csrfTokenSource = hit?.source || '未取得';
-
-      return csrfToken;
-    })();
-
-    try {
-      return await csrfReadPromise;
-    } finally {
-      csrfReadPromise = null;
-    }
-  }
-
-  function installBookmarkFeedback() {
-    if (!overlay || overlay.querySelector('.pts-bookmark-toast')) return;
-
-    const toast = document.createElement('div');
-    toast.className = 'pts-bookmark-toast';
-    toast.setAttribute('role', 'alert');
-    toast.hidden = true;
-    overlay.appendChild(toast);
-
-    const panel = overlay.querySelector(
-      '.pts-diag-panel .pts-diag-toolbar'
-    );
-    if (!panel) return;
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'pts-bookmark-diag';
-    button.textContent = 'ブックマークの状態';
-    button.addEventListener('click', () => {
-      const el = overlay.querySelector('.pts-bookmark-last');
-      if (!el) return;
-      el.textContent = bookmarkDiagnosticText();
-    });
-    panel.appendChild(button);
-
-    const last = document.createElement('div');
-    last.className = 'pts-bookmark-last';
-    last.textContent = bookmarkDiagnosticText();
-    last.style.cssText =
-      'white-space:normal;font:12px/1.5 monospace;' +
-      'padding:8px 4px;color:#ddd;overflow-wrap:anywhere;';
-    panel.after(last);
-
-    const style = document.createElement('style');
-    style.textContent = `
-    #pts-overlay .pts-bookmark-toast[hidden]{
-      display:none!important
-    }
-    #pts-overlay .pts-bookmark-toast{
-      position:absolute;left:50%;
-      bottom:calc(90px + env(safe-area-inset-bottom));
-      transform:translateX(-50%);z-index:100;
-      width:max-content;max-width:calc(100% - 24px);
-      box-sizing:border-box;padding:12px 16px;
-      background:#541923ee;border:1px solid #ff9baa;
-      border-radius:12px;color:#fff;
-      font-size:13px;line-height:1.5;
-      text-align:center;pointer-events:none;
-      box-shadow:0 4px 20px #000b;
-      opacity:0;transition:opacity .25s ease;
-    }
-    #pts-overlay .pts-bookmark-toast.is-visible{
-      opacity:1;
-    }
-    `;
-    document.head.appendChild(style);
-    updateBookmarkDiagnosticUI();
-  }
-
-  function paintBookmarkBtn(s) {
-    if (!s.bookmarkBtn) return;
-    if (s.bookmarked) {
-      s.bookmarkBtn.textContent = '✓ 保存済み';
-      s.bookmarkBtn.classList.add('pts-bookmarked');
-      s.bookmarkBtn.disabled = false;
-    }
-  }
-
-  // ブックマークの通信・状態更新・学習を共通化（ChatGPT実装）
-  // おすすめ差し込みは呼び出し側の責務とする
-  async function ensureBookmarked(s) {
-    const id = String(s.id);
-    if (s.bookmarkPromise) return s.bookmarkPromise;
-
-    if (s.bookmarked || knownBookmarkedIds.has(id)) {
-      s.bookmarked = true;
-      knownBookmarkedIds.add(id);
-      paintBookmarkBtn(s);
-      syncSearchGridBookmark(id);
-      return false;
-    }
-
-    const promise = (async () => {
-      let stage = 'token';
-      let status = null;
-      try {
-        const token = await getCsrfToken();
-        if (!token) {
-          throw bookmarkFailure('token', 'トークン取得失敗');
-        }
-
-        stage = 'network';
-        let res;
-        try {
-          res = await fetch('/ajax/illusts/bookmarks/add', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: {
-              Accept: 'application/json',
-              'Content-Type': 'application/json; charset=UTF-8',
-              'x-csrf-token': token
-            },
-            body: JSON.stringify({ illust_id: id, restrict: 0 })
-          });
-        } catch (error) {
-          if (csrfToken) {
-            csrfToken = null;
-            csrfTokenSource = '';
-          }
-          throw bookmarkFailure(
-            'network', '通信エラー', null, bookmarkSafeMessage(error)
-          );
-        }
-
-        status = res.status;
-        stage = 'http';
-
-        if (res.status === 401 || res.status === 403) {
-          csrfPreferHome = true;
-          csrfToken = null;
-          csrfTokenSource = '';
-        }
-
-        stage = 'response';
-
-        let json;
-        try {
-          json = await res.json();
-        } catch (e) {
-          throw bookmarkFailure(
-            res.ok ? 'response' : 'http',
-            res.ok ? 'JSON解析失敗' : `HTTP ${status}`,
-            status, ''
-          );
-        }
-
-        const message =
-          json?.body?.bookmarked ? '' :
-          json?.error?.message || json?.message || '';
-
-        if (!res.ok) {
-          throw bookmarkFailure(
-            'http', `HTTP ${status}`, status, message
-          );
-        }
-
-        stage = 'api';
-
-        if (!json || typeof json !== 'object' ||
-          json.error !== false) {
-          throw bookmarkFailure(
-            'api',
-            message || 'API成功応答を確認できません',
-            status, message
-          );
-        }
-
-        recordBookmarkAttempt('成功', '完了', status, '');
-
-        s.bookmarked = true;
-        knownBookmarkedIds.add(id);
-        paintBookmarkBtn(s);
-        syncSearchGridBookmark(id);
-
-        if (!s.tasteLearned && s.tags?.length) {
-          learnFromWork(s.tags, s.userId, s.rawType, LEARN_BOOKMARK_WEIGHT);
-          s.tasteLearned = true;
-        }
-
-        if (
-          mode === 'search' &&
-          slides.includes(s) &&
-          !searchGrid.open
-        ) {
-          void improveSearchFeedAfterBookmark(s);
-        }
-
-        return true;
-      } catch (err) {
-        const step = err.bookmarkStage || stage;
-        const http = err.httpStatus ?? status;
-        const api = bookmarkSafeMessage(err.apiMessage);
-
-        recordBookmarkAttempt(
-          '失敗', step, http, api || err.message
-        );
-
-        if (step === 'http' && (http === 401 || http === 403)) {
-          csrfPreferHome = true;
-          csrfToken = null;
-          csrfTokenSource = '';
-        }
-
-        const detail =
-          step === 'token' ? 'トークン取得失敗'
-          : step === 'http'
-            ? `HTTP ${http}${api ? ' / ' + api : ''}`
-            : step === 'api'
-              ? `API: ${api || err.message}`
-              : step === 'network' ? '通信エラー'
-              : step === 'response' ? '応答形式エラー'
-              : bookmarkSafeMessage(err.message);
-
-        showBookmarkError(detail);
-        throw err;
-      }
-    })();
-
-    s.bookmarkPromise = promise;
-
-    try {
-      return await promise;
-    } finally {
-      if (s.bookmarkPromise === promise) {
-        s.bookmarkPromise = null;
-      }
-    }
-  }
-
-  // ブックマークした作品のおすすめを、その作品の直後に最大12件差し込む
-  async function insertSeriesAfter(s) {
-    // シリーズ続編は検索APIヒット資格がないため検索系では追加しない。
-    if (mode === 'search' || !s || s.seriesInsertStarted ||
-        !slides.includes(s)) return;
-
-    s.seriesInsertStarted = true;
-    const generation = feedGeneration;
-
-    try {
-      if (!s.seriesInfoChecked) {
-        const body = await fetchJson(
-          `/ajax/illust/${encodeURIComponent(s.id)}`
-        );
-
-        s.seriesNextId = seriesNextId(body?.seriesNavData);
-        s.seriesInfoChecked = true;
-      }
-
-      const id = String(s.seriesNextId || '');
-
-      if (!/^\d+$/.test(id) ||
-          id === String(s.id) ||
-          isSeen(id) ||
-          knownBookmarkedIds.has(id) ||
-          viewedThisSession.has(id) ||
-          slides.some(x => String(x.id) === id)) return;
-
-      const next = await fetchJson(
-        `/ajax/illust/${encodeURIComponent(id)}`
-      );
-
-      if (!next || !contentMatches(next) ||
-          next.bookmarkData ||
-          !next.urls ||
-          generation !== feedGeneration ||
-          !slides.includes(s) ||
-          slides.some(x => String(x.id) === id) ||
-          isSeen(id) ||
-          knownBookmarkedIds.has(id)) return;
-
-      const item = newSlide(
-        id,
-        next.urls.regular || next.urls.original || '',
-        next.title || '',
-        next.userName || ''
-      );
-
-      item.tags = normTags(next.tags);
-      item.userId = next.userId == null
-        ? null : String(next.userId);
-      item.rawType = contentEnum(next.illustType);
-      item.xRestrict = contentEnum(next.xRestrict);
-      item.contentFilterEpoch = contentFilterEpoch;
-      item.seriesParentId = String(s.id);
-
-      const current = slides[currentIndex()];
-      const oldTop = feedEl.scrollTop;
-      const height = Math.max(1, feedEl.clientHeight);
-
-      insertSlidesAfter(slides.indexOf(s), [item]);
-
-      if (current && current !== s &&
-          slides.includes(current)) {
-        feedEl.scrollTop =
-          slides.indexOf(current) * height + oldTop % height;
-      }
-
-      markCurrentFromScroll();
-
-    } catch (e) {
-      s.seriesInsertStarted = false;
-    }
-  }
-
-  async function insertRecommendationsAfterBookmark(s) {
-    if (!s || s.recommendInsertStarted || !slides.includes(s)) return;
-
-    s.recommendInsertStarted = true;
-    const generation = feedGeneration;
-
-    try {
-      if (!s.resolved && !s.tags?.length) {
-        await resolveSlide(s);
-      }
-
-      if (generation !== feedGeneration || !slides.includes(s)) return;
-
-      const candidates = await fetchBookmarkRelatedCandidates(s.id);
-
-      const ranked = await prepareCandidates(candidates, {
-        excludeIds: [s.id, s.seriesNextId, ...seenTimes.keys()]
-          .filter(Boolean),
-        enrichTop: 16
-      });
-
-      if (generation !== feedGeneration ||
-        !feedEl || !slides.includes(s)) return;
-
-      const existing = new Set(slides.map(x => String(x.id)));
-
-      const available = ranked.filter(it => {
-        const id = String(it.id);
-        if (existing.has(id) || isSeen(id) ||
-          knownBookmarkedIds.has(id) ||
-          it.bookmarked) return false;
-        existing.add(id);
-        return true;
-      });
-
-      let pos = slides.indexOf(s);
-      const next = slides[pos + 1];
-      const seriesNext = next?.seriesParentId === String(s.id)
-        ? next : null;
-
-      const sorted = diversifyBookmarkRecommendations(
-        available, s, seriesNext ? [s, seriesNext] : [s],
-        INSERT_RECOMMENDATION_LIMIT
-      );
-
-      const selected = sorted.slice(0, 12);
-      if (!selected.length) return;
-
-      const current = slides[currentIndex()];
-      const oldTop = feedEl.scrollTop;
-      const height = Math.max(1, feedEl.clientHeight);
-
-      if (seriesNext) pos++;
-      insertSlidesAfter(pos, candidatesToSlides(selected));
-
-      if (current && current !== s && slides.includes(current)) {
-        feedEl.scrollTop =
-          slides.indexOf(current) * height + oldTop % height;
-      }
-
-      markCurrentFromScroll();
-    } catch (e) {
-      console.warn('[PTS] 関連差し込み失敗:', e);
-      s.recommendInsertStarted = false;
-    }
-  }
-
-
-  // スライドの後片付け（タイマー・通信・Blobを残さない。長時間閲覧でのメモリ圧迫対策）
-  function cleanupSlide(s) {
-    stopUgoira(s);
-    s.ugoiraPlayer=null;
-    s.animSeekMs=null;
-    s.ugoiraCanvas?.remove();
-    s.ugoiraCanvas=null;
-    s.sectionEl?.querySelector('.pts-holder')?.classList.remove('pts-ugoira-active');
-    if (s.loadWatch) { clearTimeout(s.loadWatch); s.loadWatch = null; }
-    if (s.ugoiraAbort) { try { s.ugoiraAbort.abort(); } catch (e) {} s.ugoiraAbort = null; }
-    if (s.resolveAbort) { try { s.resolveAbort.abort(); } catch (e) {} }
-    if (s.frameUrls) {
-      s.frameUrls.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
-      s.frameUrls = null;
-    }
-  }
-
-  async function refreshCurrentSlide() {
-    const s = slides[currentIndex()];
-    if (!s || s.refreshBusy) return;
-
-    s.refreshBusy = true;
-    const generation = feedGeneration;
-    const btn = overlay?.querySelector('.pts-rescan');
-
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '更新中…';
-    }
-
-    const oldPage = s.pageIdx || 0;
-    const oldFrames = [...(s.frameUrls || [])];
-
-    try {
-      if (s.resolveAbort) s.resolveAbort.abort();
-      if (s.ugoiraAbort) s.ugoiraAbort.abort();
-
-      if (s.resolvePromise) {
-        await s.resolvePromise.catch(() => {});
-      }
-
-      // 中断したZIP展開の終了を短時間待つ。
-      for (let i = 0; i < 20 && s.preparingUgoira; i++) {
-        await new Promise(r => setTimeout(r, 50));
-      }
-
-      if (generation !== feedGeneration ||
-          !slides.includes(s)) return;
-
-      stopUgoira(s);
-
-      if (s.loadWatch) clearTimeout(s.loadWatch);
-      s.loadWatch = null;
-
-      s.resolved = false;
-      s.resolving = false;
-      s.resolveError = null;
-      s.ugoiraError = null;
-      s.resolvePromise = null;
-      s.resolveAbort = null;
-      s.metaPromise = null;
-
-      s.frameUrls = null;
-      s.ugoiraPlayer = null;
-      s.animSeekMs = null;
-      s.ugoiraCanvas?.remove();
-      s.ugoiraCanvas = null;
-      s.sectionEl?.querySelector('.pts-holder')?.classList.remove('pts-ugoira-active');
-      s.frames = null;
-      s.pairs = null;
-      s.zipUrl = null;
-      s.zipSmall = null;
-      s.zipFull = null;
-      s.hiDone = false;
-      s.animIdx = 0;
-      s.origLoading = false;
-      s.forceRefetch = true;
-
-      if (Number(s.rawType) === 2 || s.kind === 'ugoira') {
-        setUgoiraStatus(s, 'loading');
-      }
-
-      await resolveSlide(s);
-
-      if (generation !== feedGeneration ||
-          !slides.includes(s)) return;
-
-      s.forceRefetch = false;
-
-      if (s.kind === 'multi' && s.pairs?.length) {
-        const pager = s.sectionEl?.querySelector('.pts-pager');
-        const idx = Math.min(oldPage, s.pairs.length - 1);
-
-        s.pageIdx = idx;
-        loadHorizontalNeighbors(s, idx);
-
-        if (pager) {
-          pager.scrollLeft = idx * pager.clientWidth;
-        }
-
-        upgradeSlide(s);
-      }
-
-      if (s.kind === 'single' && s.isCurrent) {
-        const oldImg = s.mainImg;
-        const url = s.pairs?.[0]?.o || s.pairs?.[0]?.r;
-
-        if (oldImg?.isConnected && url) {
-          const fresh = new Image();
-          fresh.className = 'pts-img';
-          fresh.decoding = 'async';
-          fresh.alt = s.title || '';
-          fresh.src = url;
-
-          const replace = () => {
-            if (s.isCurrent && oldImg.isConnected &&
-                generation === feedGeneration) {
-              oldImg.replaceWith(fresh);
-              s.mainImg = fresh;
-            }
-          };
-
-          if (fresh.decode) {
-            fresh.decode().then(replace).catch(() => {});
-          } else {
-            fresh.onload = replace;
-          }
-        }
-      }
-
-      if (s.kind === 'ugoira' && s.isCurrent &&
-          !s.frameUrls && !s.preparingUgoira) {
-        void prepareUgoira(s);
-      }
-
-      armWatchdog(s);
-      markCurrentFromScroll();
-
-    } catch (e) {
-      console.warn('[PTS refresh]', e);
-      setUgoiraStatus(s, 'error', e?.message || String(e));
-
-    } finally {
-      s.forceRefetch = false;
-      s.refreshBusy = false;
-
-      // 旧Blobがまだ画像に使われていれば解放しない。
-      setTimeout(() => {
-        for (const url of oldFrames) {
-          if (url?.startsWith('blob:') &&
-              s.mainImg?.src !== url &&
-              !s.frameUrls?.includes(url)) {
-            URL.revokeObjectURL(url);
-          }
-        }
-      }, 12000);
-
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = '更新';
-      }
-    }
-  }
-
-
-
-  /* ---------- 背後ページの無限読み込みと連動 ---------- */
-
-
-  /* ---------- オーバーレイ ---------- */
-
-  function setupObservers() {
-    // 近づいたら解決する（先読み範囲だけ。全部は処理しないので軽い）
-    nearObs = new IntersectionObserver((entries) => {
-      entries.forEach((en) => {
-        if (!en.isIntersecting) return;
-        const s = slides.find((x) => x.sectionEl === en.target);
-        if (!s) return;
-        // 遅らせていた仮表示サムネイルをここで読み込む
-        if (s.mainImg && s.mainImg.dataset && s.mainImg.dataset.ptsPh && !s.mainImg.getAttribute('src') && s.thumb) {
-          s.mainImg.src = s.thumb;
-        }
-        if (!s.resolved) resolveSlide(s);
-        else upgradeSlide(s);
-      });
-    }, { root: null, rootMargin: '300% 0px 300% 0px', threshold: 0 });
-    // 「表示中」の決定は markCurrentFromScroll（スクロール位置ベース）に一本化した。
-    // 以前はIntersectionObserverと二重に書き換えて競合していた（ChatGPTレビュー反映）
-  }
-
-  /* ---------- 診断モード v3.10.1（GETのみ・オンデマンド） ---------- */
-
-  const ptsDiag = {
-    installed: false,
-    seq: 0,
-    controller: null,
-    lines: []
-  };
-
-  function diagText(value) {
-    return String(value == null ? 'なし' : value)
-      .replace(/[\r\n]/g, ' ')
-      .slice(0, 180);
-  }
-
-  function diagKeys(obj) {
-    if (!obj || typeof obj !== 'object') return 'なし';
-    return Object.keys(obj).join(', ') || '空';
-  }
-
-  function diagTagShape(tags) {
-    if (tags == null) {
-      return { shape: 'なし', count: 0 };
-    }
-
-    const nested =
-      !Array.isArray(tags) &&
-      typeof tags === 'object' &&
-      Array.isArray(tags.tags);
-
-    const arr = nested ? tags.tags : tags;
-
-    if (Array.isArray(arr)) {
-      const first = arr.find(x => x != null);
-      const kind = first == null
-        ? '空'
-        : typeof first === 'string'
-          ? '文字列'
-          : typeof first === 'object'
-            ? 'オブジェクト'
-            : typeof first;
-
-      const count = arr.filter(x =>
-        (typeof x === 'string' && x.length > 0) ||
-        (x && typeof x === 'object' &&
-          typeof x.tag === 'string' &&
-          x.tag.length > 0)
-      ).length;
-
-      return {
-        shape: `${nested ? 'オブジェクト内の' : ''}${kind}配列`,
-        count
-      };
-    }
-
-    return {
-      shape: typeof tags === 'object'
-        ? `オブジェクト(${diagKeys(tags)})`
-        : typeof tags,
-      count: typeof tags === 'string' && tags.length ? 1 : 0
-    };
-  }
-
-  function diagTopKey(history, live) {
-    const scores = new Map();
-
-    for (const source of [history, live]) {
-      if (!source || typeof source !== 'object') continue;
-
-      for (const [key, raw] of Object.entries(source)) {
-        const num = Number(raw);
-
-        if (key && Number.isFinite(num) && num > 0) {
-          scores.set(key, (scores.get(key) || 0) + num);
-        }
-      }
-    }
-
-    return [...scores]
-      .sort((a, b) => b[1] - a[1])[0]?.[0] || '';
-  }
-
-  // 既知のレスポンス形式を優先し、
-  // 見つからなければ深さ3まで候補配列を探す。
-  function diagFindArray(body) {
-    const preferred = [
-      ['body.illustManga.data', body?.illustManga?.data],
-      ['body.thumbnails.illust', body?.thumbnails?.illust],
-      ['body.thumbnails.manga', body?.thumbnails?.manga],
-      ['body.illusts', body?.illusts],
-      ['body.works', body?.works],
-      ['body.items', body?.items],
-      ['body.data', body?.data]
-    ];
-
-    const chosen = preferred.find(
-      ([, value]) => Array.isArray(value)
-    );
-
-    if (chosen) {
-      return { path: chosen[0], data: chosen[1] };
-    }
-
-    const queue = [
-      { value: body, path: 'body', depth: 0 }
-    ];
-
-    let checked = 0;
-
-    while (queue.length && checked++ < 80) {
-      const { value, path, depth } = queue.shift();
-
-      if (!value ||
-          typeof value !== 'object' ||
-          depth >= 3) {
-        continue;
-      }
-
-      for (const [key, child] of
-        Object.entries(value).slice(0, 30)) {
-
-        const nextPath = `${path}.${key}`;
-
-        if (
-          Array.isArray(child) &&
-          (
-            child.length === 0 ||
-            child.some(x =>
-              x &&
-              typeof x === 'object' &&
-              (x.id != null || x.illustId != null)
-            )
-          )
-        ) {
-          return { path: nextPath, data: child };
-        }
-
-        if (
-          child &&
-          typeof child === 'object' &&
-          !Array.isArray(child)
-        ) {
-          queue.push({
-            value: child,
-            path: nextPath,
-            depth: depth + 1
-          });
-        }
-      }
-    }
-
-    return null;
-  }
-
-  function diagError(error) {
-    return diagText(
-      error && error.message ? error.message : error
-    );
-  }
-
-  // 診断専用GET。
-  // 既存fetchJsonとは独立させてHTTPステータスを取得する。
-  async function diagGet(url, signal) {
-    if (signal.aborted) throw new Error('中止');
-
-    const controller = new AbortController();
-    let timedOut = false;
-
-    const abort = () => controller.abort();
-
-    signal.addEventListener('abort', abort, {
-      once: true
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, 12000);
-
-    try {
-      const res = await fetch(url, {
-        method: 'GET',
-        credentials: 'same-origin',
-        cache: 'no-store',
-        headers: {
-          Accept: 'application/json'
-        },
-        signal: controller.signal
-      });
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      let json;
-
-      try {
-        json = await res.json();
-      } catch (e) {
-        throw new Error(
-          `HTTP ${res.status} / JSON解釈失敗`
-        );
-      }
-
-      if (!json || typeof json !== 'object') {
-        throw new Error('JSONがオブジェクトではない');
-      }
-
-      if (json.error) {
-        throw new Error(
-          `API error: ${diagText(json.message)}`
-        );
-      }
-
-      if (!json.body ||
-          typeof json.body !== 'object') {
-        throw new Error(
-          `HTTP ${res.status} / body形式が想定外`
-        );
-      }
-
-      return json.body;
-
-    } catch (e) {
-      if (timedOut) {
-        throw new Error('タイムアウト（12秒）');
-      }
-
-      if (signal.aborted) {
-        throw new Error('中止');
-      }
-
-      throw e;
-
-    } finally {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', abort);
-    }
-  }
-
-  function diagAppend(seq, line) {
-    if (seq !== ptsDiag.seq) return;
-
-    ptsDiag.lines.push(line);
-
-    const out = overlay?.querySelector(
-      '.pts-diag-output'
-    );
-
-    if (out) {
-      out.value = ptsDiag.lines.join('\n');
-      out.scrollTop = out.scrollHeight;
-    }
-  }
-
-  // 1チェックごとに独立してエラーを処理する。
-  async function diagCheck(seq, label, work) {
-    try {
-      let result;
-
-      if (label === '2. 履歴学習') {
-        const key = accountStorageKey(PROFILE_KEY);
-
-        if (!key) {
-          throw new Error(
-            'ログインID不明（履歴学習停止中）'
-          );
-        }
-
-        const raw = localStorage.getItem(key);
-
-        if (!raw) {
-          throw new Error(
-            'このアカウントのプロフィール未保存'
-          );
-        }
-
-        const saved = JSON.parse(raw);
-        const history = saved?.history;
-
-        if (!history ||
-            !Array.isArray(history.works) ||
-            String(history.userId || '') !== getMyUserId()) {
-          throw new Error(
-            '履歴なし、または保存アカウントが不一致'
-          );
-        }
-
-        const tagged = history.works.filter(
-          w => diagTagShape(w?.tags).count > 0
-        ).length;
-
-        result =
-          `OK / ログイン識別=OK` +
-          ` / initialized=${history.initialized === true}` +
-          ` / 保存${history.works.length}件` +
-          ` / tags ${tagged}/${history.works.length}`;
-
-      } else {
-        result = await work();
-      }
-
-      diagAppend(seq, `${label}: ${result}`);
-
-    } catch (e) {
-      diagAppend(
-        seq,
-        `${label}: NG / ${diagError(e)}`
-      );
-    }
-
-    // v3.12.0で追加したシリーズ診断を維持。
-    if (label === '7. カルーセル照合' &&
-        seq === ptsDiag.seq) {
-      await diagCheck(
-        seq,
-        '8. シリーズ情報',
-        async () => {
-          const id = String(
-            slides[currentIndex()]?.id ||
-            location.pathname.match(
-              /^\/artworks\/(\d+)/
-            )?.[1] || ''
-          );
-
-          if (!/^\d+$/.test(id)) {
-            return '対象外（作品IDなし）';
-          }
-
-          const body = await diagGet(
-            `/ajax/illust/${id}`,
-            ptsDiag.controller?.signal
-          );
-
-          const nav = body?.seriesNavData;
-          const next = seriesNextId(nav);
-
-          return (
-            `OK / seriesNavData=${
-              nav && typeof nav === 'object'
-                ? 'あり' : 'なし'
-            } / next=${next || 'なし'}`
-          );
-        }
-      );
-    }
-  }
-
-  // pixiv本体の「おすすめ作品」見出しを探す。
-  // ビューア自身のDOMは対象に含めない。
-  function diagCarouselIds(pageId) {
-    const headingSelector =
-      'h1,h2,h3,h4,h5,h6,[role="heading"],' +
-      'section strong,aside strong,' +
-      'section span,aside span';
-
-    const headings = document.querySelectorAll(
-      headingSelector
-    );
-
-    for (const head of headings) {
-      if (head.closest('#pts-overlay')) continue;
-
-      const title = (head.textContent || '').trim();
-
-      if (
-        title.length > 45 ||
-        !/おすすめ作品/.test(title)
-      ) {
-        continue;
-      }
-
-      let root = head.parentElement;
-
-      for (
-        let depth = 0;
-        root && depth < 6;
-        depth++, root = root.parentElement
-      ) {
-        const links = root.querySelectorAll(
-          'a[href*="/artworks/"]'
-        );
-
-        if (!links.length || links.length > 80) {
-          continue;
-        }
-
-        const ids = new Set();
-
-        for (const link of links) {
-          const id = (
-            link.getAttribute('href') || ''
-          ).match(/\/artworks\/(\d+)/)?.[1];
-
-          if (id && id !== pageId) {
-            ids.add(id);
-          }
-        }
-
-        if (ids.size) {
-          return [...ids];
-        }
-      }
-    }
-
-    return [];
-  }
-
-  function closeDiagnosticPanel() {
-    cancelSearchDiagnostic();
-    if (!ptsDiag.installed) return;
-
-    // 古い診断結果が次の実行に混ざらないようにする。
-    ptsDiag.seq++;
-
-    if (ptsDiag.controller) {
-      ptsDiag.controller.abort();
-    }
-
-    ptsDiag.controller = null;
-
-    const panel = overlay?.querySelector(
-      '.pts-diag-panel'
-    );
-
-    if (panel) {
-      panel.style.display = 'none';
-    }
-
-    const start = overlay?.querySelector(
-      '.pts-diagnostic'
-    );
-
-    if (start) {
-      start.disabled = false;
-    }
-  }
-
-  async function copyDiagnosticReport() {
-    const out = overlay?.querySelector(
-      '.pts-diag-output'
-    );
-
-    const btn = overlay?.querySelector(
-      '.pts-diag-copy'
-    );
-
-    if (!out || !btn) return;
-
-    let copied = false;
-
-    // 第一候補：Clipboard API
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(
-          out.value
-        );
-
-        copied = true;
-      }
-    } catch (e) {
-      // Safariで失敗したら従来方式を試す。
-    }
-
-    // 第二候補：旧来のコピー処理
-    if (!copied) {
-      try {
-        out.focus();
-        out.select();
-
-        out.setSelectionRange(
-          0,
-          out.value.length
-        );
-
-        copied = !!document.execCommand('copy');
-      } catch (e) {
-        // 手動コピーへ
-      }
-    }
-
-    btn.textContent = copied
-      ? 'コピー完了'
-      : '選択して手動コピー';
-  }
-
-  async function runDiagnostic() {
-    if (
-      !ptsDiag.installed ||
-      ptsDiag.controller
-    ) {
-      return;
-    }
-
-    const panel = overlay.querySelector(
-      '.pts-diag-panel'
-    );
-
-    panel.style.display = 'flex';
-
-    const start = overlay.querySelector(
-      '.pts-diagnostic'
-    );
-
-    const copy = overlay.querySelector(
-      '.pts-diag-copy'
-    );
-
-    start.disabled = true;
-    copy.textContent = 'コピー';
-
-    const controller = new AbortController();
-    ptsDiag.controller = controller;
-
-    const seq = ++ptsDiag.seq;
-    ptsDiag.lines = [];
-
-    diagAppend(
-      seq,
-      `pixiv診断 v3.10.2 / ${new Date().toLocaleString('ja-JP')}`
-    );
-
-    diagAppend(
-      seq,
-      '通信はGETのみ。APIの返答形式は実機で確認します。'
-    );
-    diagAppend(seq,bookmarkDiagnosticText());
-    diagAppend(seq,
-      `ログインID検出: ${getMyUserId() ? 'OK' : '失敗'}` +
-      ` / 取得元=${loginIdDetection.source}` +
-      ` / 保存値=${loginIdDetection.saved ? 'あり' : 'なし'}` +
-      (loginIdDetection.saveError ? ' / 保存失敗' : '')
-    );
-
-    const recCache = new Map();
-
-    let bookmarkWorks = [];
-    let storedHistoryWorks = [];
-
-    try {
-
-      /* ----- 1. ブックマーク一覧 ----- */
-
-      await diagCheck(
-        seq,
-        '1. ブックマーク一覧',
-        async () => {
-          const id = getMyUserId();
-
-          if (!id) {
-            throw new Error(
-              '自分のユーザーIDが不明'
-            );
-          }
-
-          // A → Bの順で試す。
-          // 診断はbookmarkApiMethodを変更しない。
-          const result =
-            await fetchBookmarkBodyWithFallback(
-              id,
-              0,
-              48,
-              url => diagGet(
-                url,
-                controller.signal
-              )
-            );
-
-          const body = result.body;
-          bookmarkWorks = body.works;
-
-          const first = bookmarkWorks[0];
-
-          const tagged = bookmarkWorks.filter(
-            w =>
-              diagTagShape(w?.tags).count > 0
-          ).length;
-
-          const users = bookmarkWorks.filter(
-            w =>
-              w?.userId != null &&
-              String(w.userId) !== ''
-          ).length;
-
-          const ugoira = bookmarkWorks.filter(
-            w =>
-              Number(w?.illustType) === 2
-          ).length;
-
-          const status = result.fallbackReason
-            ? (
-                ` / 第一候補NG: ` +
-                diagText(result.fallbackReason)
-              )
-            : '';
-
-          return (
-            `OK / 方式=${result.method}` +
-            ` / ${bookmarkWorks.length}件` +
-            ` / tags ${tagged}/${bookmarkWorks.length}` +
-            `（先頭: ${
-              diagTagShape(first?.tags).shape
-            }）` +
-            ` / userId ${users}/${bookmarkWorks.length}` +
-            ` / うごイラ ${ugoira}` +
-            ` / total ${
-              body.total ?? 'なし'
-            }` +
-            ` / 学習側方式=${
-              bookmarkApiMethod || '未取得'
-            }` +
-            status +
-            `\n   先頭キー: ${diagKeys(first)}`
-          );
-        }
-      );
-
-      /* ----- 2. 履歴学習 ----- */
-
-      await diagCheck(
-        seq,
-        '2. 履歴学習',
-        async () => {
-          const raw = localStorage.getItem(
-            'PTS_PROFILE_V2'
-          );
-
-          if (raw == null) {
-            throw new Error(
-              'PTS_PROFILE_V2が存在しない'
-            );
-          }
-
-          const saved = JSON.parse(raw);
-
-          const history =
-            saved?.history ??
-            saved?.bookmarkHistory;
-
-          if (
-            !history ||
-            typeof history !== 'object'
-          ) {
-            throw new Error(
-              `historyなし（保存キー: ${
-                diagKeys(saved)
-              }）`
-            );
-          }
-
-          if (!Array.isArray(history.works)) {
-            throw new Error(
-              '保存済みhistory.worksが配列でない'
-            );
-          }
-
-          storedHistoryWorks = history.works;
-
-          const tagged =
-            storedHistoryWorks.filter(
-              w =>
-                diagTagShape(w?.tags).count > 0
-            ).length;
-
-          return (
-            `OK / initialized=${
-              history.initialized === true
-            }` +
-            ` / 保存${storedHistoryWorks.length}件` +
-            ` / tags ${tagged}/${storedHistoryWorks.length}`
-          );
-        }
-      );
-
-      /* ----- 3. recommend/init ----- */
-
-      await diagCheck(
-        seq,
-        '3. recommend/init',
-        async () => {
-          const first =
-            bookmarkWorks.find(
-              w =>
-                w &&
-                (
-                  w.id != null ||
-                  w.illustId != null
-                )
-            ) ||
-            storedHistoryWorks.find(
-              w =>
-                w &&
-                (
-                  w.id != null ||
-                  w.illustId != null
-                )
-            );
-
-          const id = String(
-            first?.id ??
-            first?.illustId ??
-            ''
-          );
-
-          if (!/^\d+$/.test(id)) {
-            throw new Error(
-              'ブックマーク先頭の作品IDがない'
-            );
-          }
-
-          const body = await diagGet(
-            `/ajax/illust/${
-              encodeURIComponent(id)
-            }/recommend/init?limit=60&lang=ja`,
-            controller.signal
-          );
-
-          recCache.set(id, body);
-
-          if (!Array.isArray(body.illusts)) {
-            throw new Error(
-              `body.illustsなし（bodyキー: ${
-                diagKeys(body)
-              }）`
-            );
-          }
-
-          const a = body.illusts;
-
-          const tagged = a.filter(
-            w =>
-              diagTagShape(w?.tags).count > 0
-          ).length;
-
-          const users = a.filter(
-            w =>
-              w?.userId != null &&
-              String(w.userId) !== ''
-          ).length;
-
-          const bookmarks = a.filter(
-            w =>
-              w &&
-              Object.prototype.hasOwnProperty.call(
-                w,
-                'bookmarkData'
-              )
-          ).length;
-
-          return (
-            `OK / illusts ${a.length}件` +
-            ` / tags ${tagged}/${a.length}` +
-            ` / userId ${users}/${a.length}` +
-            ` / bookmarkDataキー ${
-              bookmarks
-            }/${a.length}` +
-            ` / nextIds ${
-              Array.isArray(body.nextIds)
-                ? body.nextIds.length
-                : '配列なし'
-            }` +
-            `\n   先頭キー: ${
-              diagKeys(a[0])
-            }`
-          );
-        }
-      );
-
-      /* ----- 4. タグ検索 ----- */
-
-      await diagCheck(
-        seq,
-        '4. タグ検索（popular_d）',
-        async () => {
-          const tag =
-            diagTopKey(
-              historyProfile.tags,
-              profile.tags
-            ) || 'R-18';
-
-          const url =
-            `/ajax/search/artworks/${
-              encodeURIComponent(tag)
-            }?` +
-            new URLSearchParams({
-              word: tag,
-              order: 'popular_d',
-              mode: 'all',
-              s_mode: 's_tag',
-              p: '1'
-            });
-
-          const body = await diagGet(
-            url,
-            controller.signal
-          );
-
-          const found = diagFindArray(body);
-
-          if (!found) {
-            throw new Error(
-              `候補配列なし（bodyキー: ${
-                diagKeys(body)
-              }）`
-            );
-          }
-
-          return (
-            `OK / タグ「${diagText(tag)}」` +
-            ` / popular_d指定（有効性未確認）` +
-            ` / ${found.path} ${
-              found.data.length
-            }件` +
-            `\n   先頭キー: ${
-              diagKeys(found.data[0])
-            }` +
-            ` / bodyキー: ${diagKeys(body)}`
-          );
-        }
-      );
-
-      /* ----- 5. 作者作品一覧 ----- */
-
-      await diagCheck(
-        seq,
-        '5. 作者作品一覧',
-        async () => {
-          const userId =
-            diagTopKey(
-              historyProfile.authors,
-              profile.authors
-            ) ||
-            String(
-              (
-                bookmarkWorks.find(
-                  w => w?.userId
-                )?.userId ??
-                storedHistoryWorks.find(
-                  w => w?.userId
-                )?.userId
-              ) || ''
-            );
-
-          if (!/^\d+$/.test(userId)) {
-            throw new Error(
-              '最頻作者IDがない'
-            );
-          }
-
-          let reason = '';
-
-          // 第1候補：profile/all
-          try {
-            const body = await diagGet(
-              `/ajax/user/${
-                encodeURIComponent(userId)
-              }/profile/all`,
-              controller.signal
-            );
-
-            const il = body.illusts;
-
-            if (
-              !il ||
-              typeof il !== 'object'
-            ) {
-              throw new Error(
-                `illusts形式不明（bodyキー: ${
-                  diagKeys(body)
-                }）`
-              );
-            }
-
-            const count = Array.isArray(il)
-              ? il.length
-              : Object.keys(il).length;
-
-            const keys = Array.isArray(il)
-              ? []
-              : Object.keys(il);
-
-            const kind = Array.isArray(il)
-              ? '配列'
-              : keys.length === 0
-                ? '空オブジェクト'
-                : keys.every(
-                    k => /^\d+$/.test(k)
-                  )
-                  ? '数字IDキーのオブジェクト'
-                  : 'キー形式不明のオブジェクト';
-
-            const manga =
-              body.manga &&
-              typeof body.manga === 'object'
-                ? (
-                    Array.isArray(body.manga)
-                      ? body.manga.length
-                      : Object.keys(
-                          body.manga
-                        ).length
-                  )
-                : 'なし';
-
-            return (
-              `OK / profile/all` +
-              ` / illusts: ${kind} ${count}件` +
-              ` / manga ${manga}` +
-              ` / bodyキー: ${diagKeys(body)}`
-            );
-
-          } catch (e) {
-            reason = diagError(e);
-          }
-
-          // 第2候補：illusts
-          try {
-            const body = await diagGet(
-              `/ajax/user/${
-                encodeURIComponent(userId)
-              }/illusts` +
-              '?limit=30&tag=&lang=ja',
-              controller.signal
-            );
-
-            const found = diagFindArray(body);
-
-            if (!found) {
-              throw new Error(
-                `候補配列なし（bodyキー: ${
-                  diagKeys(body)
-                }）`
-              );
-            }
-
-            return (
-              `OK / 代替illusts使用` +
-              ` / ${found.path} ${
-                found.data.length
-              }件` +
-              ` / 先頭キー: ${
-                diagKeys(found.data[0])
-              }` +
-              ` / 第一候補NG: ${reason}`
-            );
-
-          } catch (e) {
-            throw new Error(
-              `profile/all: ${reason}` +
-              ` / 代替illusts: ${
-                diagError(e)
-              }`
-            );
-          }
-        }
-      );
-
-      /* ----- 6. フォロー新着 ----- */
-
-      await diagCheck(
-        seq,
-        '6. フォロー新着',
-        async () => {
-          const body = await diagGet(
-            '/ajax/follow_latest/illust?mode=all&p=1',
-            controller.signal
-          );
-
-          const found = diagFindArray(body);
-
-          if (!found) {
-            throw new Error(
-              `候補配列なし（bodyキー: ${
-                diagKeys(body)
-              }）`
-            );
-          }
-
-          return (
-            `OK / ${found.path} ${
-              found.data.length
-            }件` +
-            `\n   先頭キー: ${
-              diagKeys(found.data[0])
-            }` +
-            ` / bodyキー: ${diagKeys(body)}`
-          );
-        }
-      );
-
-      /* ----- 7. カルーセル照合 ----- */
-
-      await diagCheck(
-        seq,
-        '7. カルーセル照合',
-        async () => {
-          const id = location.pathname.match(
-            /^\/artworks\/(\d+)/
-          )?.[1];
-
-          if (!id) {
-            return '対象外（作品ページ以外）';
-          }
-
-          const carousel = diagCarouselIds(id);
-
-          if (!carousel.length) {
-            return (
-              '見つからず（見出し・DOMの変化は要確認）'
-            );
-          }
-
-          const body =
-            recCache.get(id) ||
-            await diagGet(
-              `/ajax/illust/${
-                encodeURIComponent(id)
-              }/recommend/init?limit=60&lang=ja`,
-              controller.signal
-            );
-
-          if (!Array.isArray(body.illusts)) {
-            throw new Error(
-              `illustsなし（bodyキー: ${
-                diagKeys(body)
-              }）`
-            );
-          }
-
-          const ids = new Set(
-            body.illusts.map(
-              x => String(
-                x?.id ??
-                x?.illustId ??
-                ''
-              )
-            )
-          );
-
-          const matched = carousel.filter(
-            x => ids.has(x)
-          ).length;
-
-          return (
-            `OK / カルーセル${
-              carousel.length
-            }件中` +
-            ` recommend/initに${matched}件` +
-            ` / DOM見出し探索（要確認）`
-          );
-        }
-      );
-
-      diagAppend(
-        seq,
-        '完了（診断中の書き込み操作なし）'
-      );
-
-    } finally {
-      if (seq === ptsDiag.seq) {
-        ptsDiag.controller = null;
-        start.disabled = false;
-      }
-    }
-  }
-  /* ---------- 検索ランキング診断（閲覧状態には書き込まない） ---------- */
-  const SEARCH_DIAG_PAGES = 3;
-  const SEARCH_DIAG_BANDS = [5, 3, 7];
-  const SEARCH_DIAG_LAMBDAS = [3, 1, 5];
-  const SEARCH_DIAG_RELEVANCE_CAP = 400;
-  let searchDiagnostic = null;
-  let searchDiagnosticGeneration = 0;
-
-  function searchApiUrl(config, page) {
-    const conditions = searchApiConditions(config);
-    const params = new URLSearchParams({...conditions, p: String(page)});
-    return '/ajax/search/artworks/' +
-      encodeURIComponent(conditions.word) + '?' + params;
-  }
-
-  function searchDiagnosticContext() {
-    const config = searchGrid.open ? searchGrid.config :
-      mode === 'search' ? searchConfig : null;
-    if (!config || !overlay || overlay.style.display === 'none') return null;
-    return {search: {word: config.word, order: config.order || 'popular_d',
-      searchMode: config.searchMode, matchMode: config.matchMode},
-    grid: searchGrid.open, token: searchGrid.token, feed: feedGeneration,
-    route: location.href};
-  }
-
-
-  // 診断と本番で共用する4段階tierと直接一致の証拠。
-  function searchDiagnosticMatch(it, word) {
-    const query = searchNormalize(word);
-    const tokens = [...new Set(query.split(/\s+/u).filter(Boolean))];
-    const title = searchNormalize(it.title), tags = normTags(it.tags).map(searchNormalize);
-    const tokenEvidence = tokens.map(token => ({
-      token, exactTags: tags.filter(t => t === token),
-      partialTags: tags.filter(t => t !== token && t.includes(token)),
-      titleContains: title.includes(token)
-    }));
-    const coverageCount = tokenEvidence.filter(e =>
-      e.exactTags.length || e.partialTags.length || e.titleContains).length;
-    const exactTagTokenCount = tokenEvidence.filter(e => e.exactTags.length).length;
-    const titleTokenCount = tokenEvidence.filter(e => e.titleContains).length;
-    const partialTagTokenCount = tokenEvidence.filter(e => e.partialTags.length).length;
-    const titleContainsQuery = !!query && title.includes(query);
-    const exactTagMatches = tags.filter(t => t === query);
-    const partialTagMatches = tags.filter(t => t !== query && t.includes(query));
-    const multi = tokens.length > 1;
-    const tier = multi ? (coverageCount === tokens.length ?
-      (exactTagTokenCount ? 3 : 2) : coverageCount ? 1 : 0) :
-      (titleContainsQuery && exactTagMatches.length ? 3 : exactTagMatches.length ? 2 :
-       titleContainsQuery || partialTagMatches.length ? 1 : 0);
-    return {
-      tier, tierReason: (multi ? 'multi-token' : 'single-token') + ':tier-' + tier,
-      appliedRule: multi ? 'multi-token' : 'single-token', titleContainsQuery,
-      titleExactQuery: !!query && title === query, exactTagMatches, partialTagMatches,
-      coverageCount, coverageTotal: tokens.length,
-      coverageRatio: tokens.length ? coverageCount / tokens.length : 0,
-      exactTagTokenCount, titleTokenCount, partialTagTokenCount,
-      directRelevanceKey: [coverageCount, exactTagTokenCount,
-        titleTokenCount, partialTagTokenCount],
-      tokenEvidence, ruleVersion: '3.13.18'
-    };
-  }
-
-  // Raw/Softは実験専用。履歴・tasteScore本体は変更しない。
-  function searchDiagnosticTasteVariants(taste) {
-    const tagCap = 30, authorCap = 27;
-    const soft = (v, cap) => v <= cap
-      ? v : cap + cap * (1 - Math.exp(-(v-cap)/cap));
-    const common = taste.ugoira + taste.r18 +
-      taste.other;
-    return {
-      raw: Math.max(0, taste.tagRaw + taste.authorRaw + common),
-      soft: Math.max(0,
-        soft(taste.tagRaw, tagCap) + soft(taste.authorRaw, authorCap) + common),
-      rule: 'diagnostic-only; raw uncapped; soft=cap+cap*(1-exp(-(raw-cap)/cap)); negative feedback removed'
-    };
-  }
-
-  function searchDiagnosticSaturation(rows) {
-    // 同じ作品が複数ページに現れても飽和率を二重計上しない。
-    const seen = new Set();
-    const uniqueRows = rows.filter(row => {
-      const id = String(row.api.id);
-      if (seen.has(id)) return false;
-      seen.add(id);
-      return true;
-    });
-    const n = uniqueRows.length;
-    const totals = uniqueRows.map(r => r.taste.total);
-    const top = n ? Math.max(...totals) : null;
-    const topTied = top === null ? 0 : totals.filter(v => v === top).length;
-    const tag = uniqueRows.filter(r => r.taste.tagRaw >= 30).length;
-    const author = uniqueRows.filter(r => r.taste.authorRaw >= 27).length;
-    const both = uniqueRows.filter(r => r.taste.tagRaw >= 30 &&
-      r.taste.authorRaw >= 27).length;
-    return {
-      sampleSize: n, rawApiRows: rows.length, maxObservedTotal: top,
-      maxObservedTotalTieCount: topTied,
-      maxObservedTotalTieRate: n ? topTied / n : 0,
-      exactly25Count: totals.filter(v => v === 25).length,
-      tagCap: 30, tagAtOrOverCap: tag, tagSaturationRate: n ? tag / n : 0,
-      authorCap: 27, authorAtOrOverCap: author,
-      authorSaturationRate: n ? author / n : 0,
-      bothAtOrOverCap: both,
-      anyComponentSaturationCount: tag + author - both,
-      anyComponentSaturationRate: n ? (tag + author - both) / n : 0,
-      note: 'Observed maximum is not a theoretical cap; totals reflect positive signals'
-    };
-  }
-
-
-  function rankSearchDiagnostic(result) {
-    const rows = result.candidates;
-    const tie = (a, b) => a.api.apiOrder - b.api.apiOrder;
-    const tier = (a, b) => b.match.tier - a.match.tier;
-    const taste = (a, b) => b.taste.total - a.taste.total;
-    const rel = (a, b) => b.relevance.legacyTotal - a.relevance.legacyTotal;
-    const direct = (a, b) => {
-      for (let i = 0; i < 4; i++) {
-        const d = b.match.directRelevanceKey[i] -
-          a.match.directRelevanceKey[i];
-        if (d) return d;
-      }
-      return 0;
-    };
-    // A-directは本番と同一の単一比較関数を使う。
-    const productionModel = row => ({
-      tier: row.match.tier, taste: row.taste.total,
-      directRelevanceKey: row.match.directRelevanceKey,
-      apiOrder: row.api.apiOrder
-    });
-    const models = {
-      rankA: (a, b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b),
-      rankADirect: (a,b) => compareSearchRank(productionModel(a), productionModel(b)),
-      rankALegacy: (a,b) => tier(a,b) || taste(a,b) || rel(a,b) || tie(a,b),
-      rankATasteRaw: (a,b) => tier(a,b) ||
-        b.tasteVariants.raw - a.tasteVariants.raw || direct(a,b) || tie(a,b),
-      rankATasteSoft: (a,b) => tier(a,b) ||
-        b.tasteVariants.soft - a.tasteVariants.soft || direct(a,b) || tie(a,b)
-    };
-    for (const width of SEARCH_DIAG_BANDS) models['rankB' + width] = (a,b) =>
-      tier(a,b) || Math.floor(b.taste.total / width) - Math.floor(a.taste.total / width) ||
-      rel(a,b) || taste(a,b) || tie(a,b);
-    for (const weight of SEARCH_DIAG_LAMBDAS) models['rankC' + weight] = (a,b) =>
-      tier(a,b) || (b.taste.total + weight * b.relevance.legacyTotal / SEARCH_DIAG_RELEVANCE_CAP) -
-      (a.taste.total + weight * a.relevance.legacyTotal / SEARCH_DIAG_RELEVANCE_CAP) || tie(a,b);
-    result.modelRanks = {};
-    for (const [name, compare] of Object.entries(models)) {
-      result.modelRanks[name] = rows.slice().sort(compare).map((row, i) => {
-        row[name] = i + 1;
-        return {apiOrder: row.api.apiOrder, id: row.api.id, rank: i + 1};
-      });
-    }
-
-    // 同じ候補・同じ事前計算済みtaste値で診断A-directと
-    // 本番モデルAの分散前後を比較する。再計算しない。
-    const firstById = new Map();
-    for (const row of rows) {
-      const id = String(row.api.id);
-      if (!id || firstById.has(id)) continue;
-      firstById.set(id, row);
-    }
-    const eligibleRows = [...firstById.values()].filter(row => {
-      const e = row.feedEligibility;
-      return !e.alreadyDisplayed && !e.seen &&
-        !e.stronglySkipped && !e.knownBookmarked &&
-        !e.apiBookmarked && !e.feedbackExcluded;
-    });
-    const preparedRows = eligibleRows.map(row => ({
-      id: String(row.api.id),
-      it: { id: String(row.api.id) },
-      meta: { id: String(row.api.id),
-        userId: row.api.userId, tags: row.api.tags },
-      tier: row.match.tier,
-      taste: row.taste.total,
-      directRelevanceKey: row.match.directRelevanceKey,
-      apiOrder: row.api.apiOrder
-    }));
-    const before = orderSearchRankRows(preparedRows, {diversify:false});
-    const after = orderSearchRankRows(preparedRows, {diversify:true});
-    const rankList = arr => arr.map((it,i) => ({
-      id: String(it.id), rank: i + 1
-    }));
-    result.modelRanks.rankADirectBeforeDiversity = rankList(before);
-    result.modelRanks.rankADirectAfterDiversity = rankList(after);
-
-    // 診断rankADirectの同一適格作品集合を、同一の計算済みtasteで比較。
-    // 全API行の順位からの抽出だと別スナップショット/重複行に依存する。
-    const directSubset = eligibleRows.slice().sort((a,b) =>
-      compareSearchRank(productionModel(a), productionModel(b))
-    ).map(row => String(row.api.id));
-    const beforeIds = before.map(it => String(it.id));
-    const afterIds = after.map(it => String(it.id));
-    const sameInputOrder =
-      JSON.stringify(directSubset) === JSON.stringify(beforeIds);
-    result.productionComparable = {
-      queryKey: searchQueryKey(result.search),
-      eligibleCount: preparedRows.length,
-      tasteSource: 'diagnostic precomputed taste.total (no recomputation)',
-      diagnosticADirectEligibleIds: directSubset,
-      beforeDiversityIds: beforeIds,
-      afterDiversityIds: afterIds,
-      sameInputOrder,
-      scope: 'same eligible unique search API hits, same taste values'
-    };
-    if (!sameInputOrder) result.errors.push({
-      page: null, code: 'a-direct-production-comparator-mismatch'
-    });
-    result.saturation = searchDiagnosticSaturation(rows);
-    result.counts = {
-      candidates: rows.length,
-      uniqueIds: new Set(rows.map(r => r.api.id)).size,
-      duplicates: rows.filter(r => r.api.duplicateOf !== null).length
-    };
-  }
-
-  function searchDiagnosticJson() {
-    if (searchDiagnostic?.result) searchDiagnostic.result.contextCurrent =
-      JSON.stringify(searchDiagnostic.context) === JSON.stringify(searchDiagnosticContext());
-    return searchDiagnostic?.result ? JSON.stringify(searchDiagnostic.result,
-      (key, value) => typeof value === 'number' && !Number.isFinite(value) ? null : value, 2) : '';
-  }
-
-  function renderSearchDiagnostic() {
-    const out = overlay?.querySelector('.pts-diag-output');
-    if (out && searchDiagnostic?.result) out.value = searchDiagnosticJson();
-  }
-
-  function cancelSearchDiagnostic(reason = 'cancelled') {
-    const run = searchDiagnostic;
-    if (!run?.running) return;
-    run.running = false;
-    run.controller.abort();
-    run.result.errors.push({page: run.page, code: reason});
-    run.result.status = run.result.completedPages.length ? 'partial' : 'failed';
-    renderSearchDiagnostic();
-  }
-
-  async function runSearchDiagnostic() {
-    cancelSearchDiagnostic('superseded');
-    const context = searchDiagnosticContext();
-    const generation = ++searchDiagnosticGeneration;
-    const search = context?.search || null;
-    const result = {schemaVersion: '1.1.0', scriptVersion: '3.13.22',
-      capturedAt: new Date().toISOString(), diagnosticId: 'search-' + Date.now() + '-' + generation,
-      search, requestedPages: Array.from({length: SEARCH_DIAG_PAGES}, (_, i) => i + 1),
-      completedPages: [], apiTotal: null, relatedTags: [],
-      queryTokens: search ? searchDiagnosticMatch({}, search.word).tokenEvidence.map(e => e.token) : [],
-      tokenizationRule: 'NFKC; trim; locale lowercase; whitespace split; unique tokens',
-      counts: {}, status: 'failed', errors: [], candidates: []};
-    const run = {result, context, generation, controller: new AbortController(), running: true, page: null};
-    searchDiagnostic = run;
-    const current = () => run === searchDiagnostic && run.running &&
-      generation === searchDiagnosticGeneration &&
-      JSON.stringify(context) === JSON.stringify(searchDiagnosticContext());
-    const timer = setInterval(() => {
-      if (run.running && !current()) cancelSearchDiagnostic('context-changed');
-    }, 100);
-    const displayed = new Set([...slides, ...searchGrid.items].map(it => String(it.id)));
-    const ids = new Map();
-    try {
-      if (!context) { result.errors.push({page: null, code: 'no-active-search'}); return; }
-      for (const page of result.requestedPages) {
-        run.page = page;
-        if (!current()) { cancelSearchDiagnostic('context-changed'); break; }
-        const body = await fetchJson(searchApiUrl(search, page), run.controller.signal);
-        if (!current()) { cancelSearchDiagnostic('context-changed'); break; }
-        const data = body?.illustManga?.data;
-        if (!Array.isArray(data)) throw new Error('invalid-candidates');
-        result.apiTotal = body.illustManga.total == null ? null : Number(body.illustManga.total);
-        result.relatedTags = [...new Set([...result.relatedTags, ...searchRelatedTags(body)])];
-        for (const [index, raw] of data.entries()) {
-          const it = normalizeSearchCandidate(raw);
-          const apiOrder = result.candidates.length;
-          const taste = {};
-          tasteScore(it, taste);
-          const sum = taste.tagCapped + taste.authorCapped + taste.ugoira + taste.r18 +
-            taste.other;
-          if (Math.abs(sum - taste.total) > 1e-9 || !Number.isFinite(sum))
-            result.errors.push({page, apiOrder, code: 'taste-sum-mismatch'});
-          result.candidates.push({api: {id: String(it.id), apiPage: page,
-            apiIndexInPage: index, apiOrder, title: typeof raw.title === 'string' ? raw.title : null,
-            tags: it.tags, userId: it.userId, illustType: it.illustType,
-            bookmarked: it.bookmarked, bookmarkStateKnown: it.bookmarkStateKnown,
-            dataAvailability: {title: typeof raw.title === 'string', tags: raw.tags != null,
-              userId: raw.userId != null, illustType: raw.illustType != null},
-            duplicateOf: ids.has(it.id) ? ids.get(it.id) : null},
-          match: searchDiagnosticMatch(it, search.word), legacy: {matchTier: legacySearchWordTier(it, search.word)},
-          taste, tasteVariants: searchDiagnosticTasteVariants(taste), relevance: null,
-          feedEligibility: {alreadyDisplayed: displayed.has(it.id), seen: isSeen(it.id),
-            knownBookmarked: knownBookmarkedIds.has(it.id),
-            apiBookmarked: it.bookmarked},
-          humanEvaluation: {relevance: null, taste: null, centralityReason: null, notes: null}});
-          if (!ids.has(it.id)) ids.set(it.id, apiOrder);
-        }
-        result.completedPages.push(page);
-        renderSearchDiagnostic();
-      }
-    } catch (e) {
-      // レスポンス本文・URL・例外メッセージは出力しない。
-      if (run.running) result.errors.push({page: run.page,
-        code: e?.name === 'AbortError' ? 'aborted' : 'request-or-processing-failed'});
-    } finally {
-      clearInterval(timer);
-      for (const row of result.candidates) {
-        const tags = [...new Set(row.api.tags.map(t => t.normalize('NFKC').toLocaleLowerCase()))];
-        const query = search.word.normalize('NFKC').trim().toLocaleLowerCase();
-        const exactTagContribution = Math.min(8, tags.filter(t => t.includes(query)).length) * SEARCH_WORD_TAG_WEIGHT;
-        const relatedTagsUsed = tags.filter(t => t !== query && result.relatedTags.includes(t));
-        const relatedTagContribution = Math.min(8, relatedTagsUsed.length) * SEARCH_RELATED_TAG_WEIGHT;
-        row.relevance = {legacyTotal: searchWordRelevance(row.api, search.word, result.relatedTags),
-          exactTagContribution, relatedTagContribution,
-          capped: exactTagContribution + relatedTagContribution > SEARCH_DIAG_RELEVANCE_CAP,
-          relatedTagsUsed, exactTagContributionRule: 'legacy substring tag matches'};
-      }
-      result.status = result.completedPages.length === SEARCH_DIAG_PAGES && !result.errors.length ?
-        'complete' : result.completedPages.length ? 'partial' : 'failed';
-      run.running = false;
-      if (search) rankSearchDiagnostic(result);
-      if (run === searchDiagnostic) renderSearchDiagnostic();
-    }
-  }
-
-  /* ---------- 診断UIの設置 ---------- */
-
-  function installDiagnosticUI() {
-    if (ptsDiag.installed || !overlay) return;
-
-    ptsDiag.installed = true;
-
-    // 上部バーのボタン
-    const btn = document.createElement('button');
-
-    btn.className = 'pts-diagnostic';
-    btn.type = 'button';
-    btn.textContent = '診断';
-
-    overlay.querySelector('.pts-rescan').before(btn);
-
-    // 診断結果パネル
-    const panel = document.createElement('div');
-
-    panel.className = 'pts-diag-panel';
-    panel.style.display = 'none';
-
-    panel.innerHTML = `
-      <div class="pts-diag-sheet"
-           role="dialog"
-           aria-modal="true"
-           aria-label="API診断">
-        <div class="pts-diag-toolbar">
-          <strong>pixiv API診断（読み取り専用）</strong>
-          <button type="button" class="pts-search-diag-run">検索ランキング診断を実行</button>
-          <button type="button" class="pts-search-diag-copy">診断JSONをコピー</button>
-          <button type="button" class="pts-search-diag-save">診断JSONをファイル保存</button>
-          <button type="button" class="pts-search-diag-cancel">診断をキャンセル</button>
-          <button type="button" class="pts-diag-copy">コピー</button>
-          <button type="button" class="pts-diag-close">閉じる</button>
-        </div>
-        <textarea
-          class="pts-diag-output"
-          readonly
-          spellcheck="false"
-          aria-label="診断結果"></textarea>
-      </div>
-    `;
-
-    overlay.appendChild(panel);
-    panel.querySelector('.pts-search-diag-run').onclick = () => { void runSearchDiagnostic(); };
-    panel.querySelector('.pts-search-diag-cancel').onclick = () => cancelSearchDiagnostic();
-    panel.querySelector('.pts-search-diag-copy').onclick = () => {
-      renderSearchDiagnostic();
-      if (searchDiagnostic && !searchDiagnostic.running) void copyDiagnosticReport();
-    };
-    panel.querySelector('.pts-search-diag-save').onclick = () => {
-      if (searchDiagnostic?.running) return;
-      const json = searchDiagnosticJson();
-      if (!json) return;
-      const url = URL.createObjectURL(new Blob([json], {type: 'application/json;charset=utf-8'}));
-      const a = document.createElement('a');
-      a.href = url; a.download = searchDiagnostic.result.diagnosticId + '.json'; a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    };
-
-    const style = document.createElement('style');
-
-    style.textContent = `
-      #pts-overlay .pts-diagnostic {
-        background: rgba(255,255,255,.15);
-        color: #fff;
-        border: 0;
-        border-radius: 999px;
-        padding: 7px 10px;
-        font-size: 12px;
-        white-space: nowrap;
-        flex-shrink: 0;
-      }
-
-      #pts-overlay .pts-bar {
-        overflow-x: auto;
-        overscroll-behavior-x: contain;
-        white-space: nowrap;
-        -webkit-overflow-scrolling: touch;
-      }
-
-      #pts-overlay .pts-close {
-        position: sticky;
-        right: 0;
-        flex-shrink: 0;
-        z-index: 4;
-      }
-
-      #pts-overlay .pts-diag-panel {
-        position: absolute;
-        inset: 0;
-        z-index: 30;
-        background: rgba(0,0,0,.85);
-        align-items: center;
-        justify-content: center;
-        padding:
-          calc(14px + env(safe-area-inset-top))
-          12px
-          calc(14px + env(safe-area-inset-bottom));
-        box-sizing: border-box;
-      }
-
-      #pts-overlay .pts-diag-sheet {
-        width: 100%;
-        max-width: 900px;
-        height: 83vh;
-        height: 83dvh;
-        max-height: 100%;
-        display: flex;
-        flex-direction: column;
-        background: #171717;
-        color: white;
-        border: 1px solid #555;
-        border-radius: 12px;
-        box-sizing: border-box;
-        padding: 10px;
-        min-height: 0;
-      }
-
-      #pts-overlay .pts-diag-toolbar {
-        flex-wrap: wrap;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 8px;
-        font-size: 13px;
-      }
-
-      #pts-overlay .pts-diag-toolbar strong {
-        flex: 1;
-      }
-
-      #pts-overlay .pts-diag-toolbar button {
-        background: #333;
-        color: white;
-        border: 1px solid #666;
-        border-radius: 8px;
-        padding: 9px 12px;
-        white-space: nowrap;
-      }
-
-      #pts-overlay .pts-diag-output {
-        width: 100%;
-        flex: 1;
-        min-height: 0;
-        resize: none;
-        box-sizing: border-box;
-        background: #080808;
-        color: #eee;
-        border: 1px solid #444;
-        border-radius: 7px;
-        padding: 10px;
-        font: 12px/1.65 ui-monospace, Menlo, monospace;
-        white-space: pre-wrap;
-        overflow: auto;
-        -webkit-overflow-scrolling: touch;
-      }
-    `;
-
-    document.head.appendChild(style);
-
-    btn.addEventListener(
-      'click',
-      () => {
-        void runDiagnostic();
-      }
-    );
-
-    panel.querySelector('.pts-diag-close')
-      .addEventListener(
-        'click',
-        closeDiagnosticPanel
-      );
-
-    panel.querySelector('.pts-diag-copy')
-      .addEventListener(
-        'click',
-        () => {
-          void copyDiagnosticReport();
-        }
-      );
-  }
-
-  function openViewer() {
-    if (overlay && overlay.style.display !== 'none') return;
-    if (!contentFilterConfirmed) { showContentFilterDialog(true); return; }
-
-    buildOverlay();
-    installDiagnosticUI();
-    installBookmarkFeedback();
-    installExperienceUI();
-    installSeriesUI();
-    installSeriesLayer();
-    bindUserNavigationIntent();
-
-
-    viewedThisSession.clear();
-    navIntent = { reason: 'other', until: 0 };
-
-    sessionTrail.length = 0;
-    activeView = null;
-
-    searchConfig = getSearchPageConfig();
-    mode = searchConfig ? 'search' : 'custom';
-    gridReturnState = null;
-
-    overlay.style.display = 'block';
-    keepAwake(true);
-
-    if (mode === 'search') {
-      void startSearchFeed();
-    } else {
-      renderSearchTagCandidates();
-      void startCustomFeed();
-    }
-  }
-
-  function closeViewer() {
-    if (contentFilterDialog) { contentFilterDialog.close(); contentFilterDialog.remove(); contentFilterDialog=null; }
-    if (!overlay) return;
-    tickViewing();
-    finishViewing(activeView, false);
-    clearTimeout(viewSaveTimer);
-    viewSaveTimer = null;
-    saveProfile();
-    gridReturnState = null;
-    closeSearchGrid(false);
-    seriesCloseLayer();
-    seriesHideList();
-    closeDiagnosticPanel();
-    clearTimeout(bookmarkToastTimer);
-    const toast = overlay.querySelector('.pts-bookmark-toast');
-    if (toast) {
-      toast.classList.remove('is-visible');
-      toast.hidden = true;
-    }
-    lastTap = null;
-    touchStart = null;
-    clearTimeout(closeConfirmTimer);
-    overlay.querySelector('.pts-history-panel')
-      ?.setAttribute('hidden', '');
-    feedGeneration++;
-    customResetState();
-    searchBusy = false;
-    slides.forEach(cleanupSlide);
-    slides = [];
-    if (feedEl) feedEl.replaceChildren();
-    activeView = null;
-    overlay.style.display = 'none';
-    resetSessionLearning();
-    keepAwake(false);
-    saveSeenTimes();
-  }
-
-  function buildOverlay() {
-    if (overlay) return;
-
-    setupObservers();
-
-    overlay = document.createElement('div');
-    overlay.id = 'pts-overlay';
-
-    overlay.innerHTML = `
-      <div class="pts-bar">
-        <span class="pts-counter">…</span>
-        <button type="button" class="pts-rescan">更新</button>
-        <button type="button" class="pts-close">閉じる</button>
-      </div>
-      <div class="pts-feed"></div>
-    `;
-
-    feedEl = overlay.querySelector('.pts-feed');
-
-    overlay.querySelector('.pts-close')
-      .addEventListener('click', closeViewer);
-
-    overlay.querySelector('.pts-rescan')
-      .addEventListener('click', () => {
-        void refreshCurrentSlide();
-      });
-
-    feedEl.addEventListener('scroll', () => {
-      const remaining =
-        feedEl.scrollHeight -
-        feedEl.scrollTop -
-        feedEl.clientHeight;
-
-      if (remaining < feedEl.clientHeight * 2) {
-        if (mode === 'custom') {
-          void customLoadMore();
-        } else if (mode === 'search') {
-          void searchLoadMore();
-        }
-      }
-
-      clearTimeout(curTimer);
-      curTimer = setTimeout(markCurrentFromScroll, 130);
-    }, { passive: true });
-
-    const style = document.createElement('style');
-
-    style.textContent = `
-      #pts-overlay{
-        position:fixed;inset:0;background:#000;
-        z-index:99999;display:none
-      }
-      .pts-bar{
-        position:absolute;top:0;left:0;right:0;z-index:3;
-        display:flex;align-items:center;gap:8px;
-        padding:10px 14px;color:#fff;
-        background:linear-gradient(#000a,transparent);
-        font-size:13px
-      }
-      .pts-counter{opacity:.9}
-      .pts-rescan,.pts-close{
-        background:#ffffff26;color:white;border:0;
-        border-radius:9px;padding:9px 12px;font-size:12px
-      }
-      .pts-feed{
-        height:100%;overflow-y:auto;
-        scroll-snap-type:y mandatory;
-        scrollbar-width:none;overscroll-behavior:contain
-      }
-      .pts-feed::-webkit-scrollbar{display:none}
-      .pts-slide{
-        position:relative;height:100%;
-        scroll-snap-align:start;scroll-snap-stop:always;
-        background:#000
-      }
-      .pts-holder{
-        position:absolute;inset:0;
-        display:flex;align-items:center;justify-content:center
-      }
-      .pts-img{
-        max-width:100%;max-height:100%;object-fit:contain
-      }
-      .pts-pager{
-        display:flex;height:100%;width:100%;
-        overflow-x:auto;overflow-y:hidden;
-        scroll-snap-type:x mandatory;
-        scrollbar-width:none;overscroll-behavior:contain
-      }
-      .pts-pager::-webkit-scrollbar{display:none}
-      .pts-page{
-        min-width:100%;height:100%;
-        scroll-snap-align:start;scroll-snap-stop:always;
-        display:flex;align-items:center;justify-content:center
-      }
-      .pts-pagechip{
-        position:absolute;top:52px;right:14px;z-index:2;
-        background:#0009;color:#fff;
-        font-size:12px;padding:4px 9px;border-radius:999px
-      }
-      .pts-seek{
-        position:absolute;left:12px;right:12px;
-        bottom:75px;height:32px;z-index:27;
-        touch-action:none
-      }
-    `;
-
-    document.head.appendChild(style);
-    document.body.appendChild(overlay);
-  }
-
-  function shouldAutoOpenPixivView() {
-    if (location.hostname !== 'www.pixiv.net') {
-      return false;
-    }
-
-    const path = location.pathname;
-
-    const excludedPaths = [
-      // 設定・アカウント管理
-      /^\/(?:settings?|accounts?)(?:\/|$)/i,
-
-      // 認証・API
-      /^\/(?:login|logout|signup|register|auth|oauth|ajax|api)(?:\/|$)/i,
-
-      // 投稿・アップロード・管理・編集
-      /^\/(?:upload|uploads|editor|edit|create|dashboard|manage)(?:\/|$)/i,
-
-      // メッセージ・通知
-      /^\/(?:messages?|inbox|notifications?)(?:\/|$)/i,
-
-      // 決済・有料プラン
-      /^\/(?:premium|payment|payments|checkout|billing)(?:\/|$)/i,
-
-      // ユーザー情報や小説の編集
-      /^\/users\/[^/]+\/(?:edit|settings?|manage)(?:\/|$)/i,
-      /^\/novel\/(?:new|edit|create|upload)(?:\/|$)/i,
-
-      // 旧式PHPの設定・投稿ページ
-      /^\/(?:setting_[^/]*|upload[^/]*|edit[^/]*|new_illust)\.php$/i,
-
-      // 閲覧用途ではない案内ページ
-      /^\/(?:error|maintenance|help|terms|privacy|policy)(?:\/|$)/i
-    ];
-
-    if (excludedPaths.some(re => re.test(path))) {
-      return false;
-    }
-
-    // 旧式の作品編集・投稿画面
-    if (/^\/member_illust\.php$/i.test(path)) {
-      const mode = new URLSearchParams(
-        location.search
-      ).get('mode') || '';
-
-      if (/^(?:edit|upload|new)$/i.test(mode)) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  function installRouteAutoStart() {
-    let lastRoute =
-      location.pathname + location.search;
-
-    const openForRoute = route => {
-      if (routeAutoStartSuppressed) return;
-      requestAnimationFrame(() => {
-        const current =
-          location.pathname + location.search;
-
-        if (current !== route) return;
-        if (routeAutoStartSuppressed) return;
-        if (!shouldAutoOpenPixivView()) return;
-
-        if (
-          !overlay ||
-          overlay.style.display === 'none'
-        ) {
-          openViewer();
-        }
-      });
-    };
-
-    const checkRoute = () => {
-      const current =
-        location.pathname + location.search;
-
-      // 同一URLなら何もしない。
-      if (current === lastRoute) return;
-
-      lastRoute = current;
-
-      // 新しいURLに移った場合は旧フィードを終了。
-      if (
-        overlay &&
-        overlay.style.display !== 'none'
-      ) {
-        closeViewer();
-      }
-
-      // 設定・投稿画面などでは起動しない。
-      if (routeAutoStartSuppressed) return;
-      if (!shouldAutoOpenPixivView()) return;
-
-      openForRoute(current);
-    };
-
-    // 最初のページ読み込みで1回だけ起動する。
-    if (shouldAutoOpenPixivView()) {
-      openForRoute(lastRoute);
-    }
-
-    // 戻る・進む操作への即時対応。
-    window.addEventListener('popstate', checkRoute);
-
-    // SPAルーターによるURL変更を検知。
-    // pixiv本体のhistory APIは変更しない。
-    window.setInterval(checkRoute, 700);
+  // Compatibility adapters for the formerly embedded ugoira renderer.
+  function setUgoiraStatus(s, kind, text) {
+    if(kind==='error')say(text||'うごイラエラー','error');
   }
-
-  const btn = document.createElement('button');
-
-  btn.id = 'pts-launch';
-  btn.textContent = '縦スクロール';
-
-  btn.style.cssText = [
-    'position:fixed',
-    'right:16px',
-    'bottom:16px',
-    'z-index:99998',
-    'background:#0096fa',
-    'color:#fff',
-    'border:0',
-    'border-radius:999px',
-    'padding:12px 18px',
-    'font-size:14px',
-    'font-weight:700',
-    'cursor:pointer',
-    'box-shadow:0 4px 16px #0006'
-  ].join(';');
-
-  btn.addEventListener('click', openViewer);
-  document.body.appendChild(btn);
-
-  // 閲覧ページでは自動起動。
-  // SPA遷移も監視するが、ユーザーが閉じた後は手動起動のみ。
-  installRouteAutoStart();
+  function onUgoiraLoop() {}
+  function upgradeUgoiraHiRes() {} // Never fetch a second, redundant ZIP.
+  window.addEventListener('pagehide',()=>{if(overlay&&!overlay.hidden)closeUI();});
+  startButton();
 })();

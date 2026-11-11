@@ -61,7 +61,7 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
     assert.equal(await page.locator('#pts-only-target-outline').count(),1,
       'current selected page image has a visible frame');
     assert.match(await page.locator('#pts-only-status').innerText(),/画面中央の枠で囲んだ画像/);
-    assert.match(await page.locator('#pts-only-launch').innerText(),/操作受付済 α5/);
+    assert.match(await page.locator('#pts-only-launch').innerText(),/操作受付済 α7/);
     await page.locator('#pts-only-current').click();
     const canvas=page.locator('#pts-only-inplace-canvas');
     await canvas.waitFor({state:'attached',timeout:30000});
@@ -106,6 +106,40 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
     await page.waitForFunction(()=>!!document.querySelector('#pts-only-inplace-canvas'),null,{timeout:30000});
     assert.equal(await page.evaluate(()=>window.__gmFetchCount),2,
       'the newly visible artwork CDN variant is processed by explicit request');
+    // Even after the network path is forbidden, a saved file must still
+    // enhance the CURRENT pixiv artwork in-place with zero new CDN GETs.
+    await page.evaluate(()=>{
+      window.GM.xmlHttpRequest=opts=>{
+        window.__gmFetchCount++;
+        const p=Promise.resolve({status:403,response:null});
+        p.abort=()=>{};
+        return p;
+      };
+      document.querySelector('#original').src=
+        'https://i.pximg.net/img-master/img/2026/11/11/00/00/00/123_p2_master1200.jpg';
+    });
+    await page.route('**/*',route=>{
+      if(route.request().url().includes('123_p2_master1200.jpg'))
+        return route.fulfill({contentType:'image/png',body:bytes});
+      return route.continue();
+    });
+    await page.waitForFunction(()=>document.querySelector('#original')?.complete&&
+      document.querySelector('#original').naturalWidth===100);
+    await page.waitForTimeout(5100);
+    await page.locator('#pts-only-current').click();
+    await page.waitForFunction(()=>document.querySelector('#pts-only-status')?.textContent.includes('HTTP 403'),
+      null,{timeout:10000});
+    const forbiddenCount=await page.evaluate(()=>window.__gmFetchCount);
+    const fileChooser=page.waitForEvent('filechooser');
+    await page.locator('#pts-only-local-overlay').click();
+    const chooser=await fileChooser;
+    await chooser.setFiles({name:'saved.png',mimeType:'image/png',buffer:bytes});
+    await page.waitForFunction(()=>document.querySelector('#pts-only-status')?.textContent.includes('AI超解像を適用しました'),
+      null,{timeout:30000});
+    assert.equal(await page.evaluate(()=>window.__gmFetchCount),forbiddenCount,
+      'local file must not make a CDN request even after HTTP 403');
+    assert.equal(await canvas.count(),1,'file CNN is overlaid on current pixiv image');
+    assert(await page.locator('#original').isVisible(),'pixiv original remains');
     await page.locator('#pts-only-close').click();
     assert.equal(await canvas.count(),0,'closing removes GPU canvas');
     console.log('PASS current pixiv in-place trained AI: one explicit CDN GET, zero metadata, original preserved, compare, scroll, cleanup');

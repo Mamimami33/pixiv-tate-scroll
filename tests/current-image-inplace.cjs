@@ -28,7 +28,7 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
     const network=[];
     await page.route('**/*',route=>{
       network.push(route.request().url());
-      if(route.request().url()===url)
+      if(route.request().url()===url || route.request().url().includes('unusual-name-master1200.jpg'))
         return route.fulfill({contentType:'image/png',body:bytes});
       if(route.request().url().includes('/artworks/123'))
         return route.fulfill({contentType:'text/html',body:
@@ -83,6 +83,18 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
       return c && parseInt(c.style.top,10)<previous;
     },before);
     assert.equal(await page.evaluate(()=>window.__gmFetchCount),1,'scroll never refetches');
+    // Pixiv can use a CDN image URL without a visible "123_p0" filename.
+    // Ensure that the current large artwork is still selected.
+    await page.evaluate(()=>{
+      const img=document.querySelector('#original');
+      img.src='https://i.pximg.net/img-master/img/2026/11/11/00/00/00/unusual-name-master1200.jpg';
+    });
+    await page.waitForFunction(()=>document.querySelector('#original')?.complete&&
+      document.querySelector('#original').naturalWidth===100);
+    await page.locator('#pts-only-current').click();
+    await page.waitForFunction(()=>!!document.querySelector('#pts-only-inplace-canvas'),null,{timeout:30000});
+    assert.equal(await page.evaluate(()=>window.__gmFetchCount),2,
+      'the newly visible artwork CDN variant is processed by explicit request');
     await page.locator('#pts-only-close').click();
     assert.equal(await canvas.count(),0,'closing removes GPU canvas');
     console.log('PASS current pixiv in-place trained AI: one explicit CDN GET, zero metadata, original preserved, compare, scroll, cleanup');

@@ -5,6 +5,7 @@ on:
     branches:
       - feat/pixiv-enhance-only-20261111
       - feat/pixiv-current-image-inplace-20261111
+      - fix/pixiv-current-image-selection-20261111
   pull_request:
     paths:
       - 'pixiv-tate-scroll.user.js'

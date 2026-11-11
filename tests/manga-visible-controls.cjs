@@ -51,6 +51,9 @@ const source=fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js')
    // Scroll to the next manga page; selection tracks the image on screen.
    await page.evaluate(()=>window.scrollTo(0,600));
    await page.locator('#pts-only-diagnose').click();
+   assert.match(await page.locator('#pts-only-status').innerText(),/診断（追加通信なし）/);
+   assert.match(await page.locator('#pts-only-status').innerText(),/GM通信API：あり/);
+   assert.match(await page.locator('#pts-only-status').innerText(),/画面要素：img/);
    const second=await page.locator('#pts-only-target-outline').boundingBox();
    const secondImg=await page.locator('#page1').boundingBox();
    assert(Math.abs(second.y-secondImg.y)<2,'next page selected after scroll');

@@ -51,3 +51,9 @@ jobs:
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: node tests/manga-visible-controls.cjs
+      - name: Install WebKit for Safari-engine diagnostics
+        run: npx playwright install --with-deps webkit
+      - name: Safari engine mobile touch and manga selection regression
+        env:
+          BROWSER_ENGINE: webkit
+        run: node tests/manga-visible-controls.cjs

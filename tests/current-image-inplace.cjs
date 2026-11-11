@@ -61,7 +61,7 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
     assert.equal(await page.locator('#pts-only-target-outline').count(),1,
       'current selected page image has a visible frame');
     assert.match(await page.locator('#pts-only-status').innerText(),/画面中央の枠で囲んだ画像/);
-    assert.match(await page.locator('#pts-only-launch').innerText(),/操作受付済 α7/);
+    assert.match(await page.locator('#pts-only-launch').innerText(),/操作受付済 α8/);
     await page.locator('#pts-only-current').click();
     const canvas=page.locator('#pts-only-inplace-canvas');
     await canvas.waitFor({state:'attached',timeout:30000});

@@ -618,6 +618,8 @@
   function updateInPlaceButtons() {
     const button = byId('pts-only-current');
     const compare = byId('pts-only-current-compare');
+    const fileOverlay=byId('pts-only-local-overlay');
+    if(fileOverlay)fileOverlay.disabled=inPlaceBusy;
     if (button) {
       button.disabled = inPlaceBusy;
       button.textContent = inPlaceBusy ? '画像をGPU処理中…' :
@@ -906,6 +908,9 @@
     directGroup.id = 'pts-only-direct-controls';
     for (const [id, label, action] of [
       ['pts-only-current','この画像をAI超解像',()=>void enhanceVisiblePixivImage()],
+      ['pts-only-clipboard','コピーした画像を重ねる',()=>enhanceFromClipboard()],
+      ['pts-only-local-overlay','ファイルから重ねる',
+        ()=>chooseFile('image/png,image/jpeg,image/webp',enhanceVisiblePixivImage)],
       ['pts-only-current-compare','元画像に戻す',compareInPlace],
       ['pts-only-current-motion','動き補間: OFF',toggleMotion],
       ['pts-only-current-play','一時停止',togglePlayback]
@@ -918,6 +923,8 @@
       });
       directGroup.appendChild(button);
     }
+    // These fallback controls never request Pixiv CDN data. The user may
+    // copy the image from Safari or choose an already saved image.
     const diagnose=document.createElement('button');
     diagnose.id='pts-only-diagnose';diagnose.type='button';
     diagnose.textContent='画像の再検出・診断';

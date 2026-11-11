@@ -35,7 +35,7 @@ const source=fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js')
    const errors=[];page.on('pageerror',e=>errors.push(e.message));
    await page.addScriptTag({content:source});
    const button=page.locator('#pts-only-launch');
-   assert.match(await button.innerText(),/alpha\.5|α5/);
+   assert.match(await button.innerText(),/alpha\.7|α7/);
    // Safari-like pointerup must open panel without any image CDN API fetch.
    await button.evaluate(el=>el.dispatchEvent(new PointerEvent('pointerup',{
       bubbles:true,cancelable:true,pointerType:'touch'

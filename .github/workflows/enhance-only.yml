@@ -6,6 +6,7 @@ on:
       - feat/pixiv-enhance-only-20261111
       - feat/pixiv-current-image-inplace-20261111
       - fix/pixiv-current-image-selection-20261111
+      - fix/pixiv-ios-visible-controls-diagnostics-20261111
   pull_request:
     paths:
       - 'pixiv-tate-scroll.user.js'
@@ -13,11 +14,12 @@ on:
       - 'tests/ai-tiling.cjs'
       - 'tests/current-image-inplace.cjs'
       - 'tests/current-ugoira-inplace.cjs'
+      - 'tests/manga-visible-controls.cjs'
       - '.github/workflows/enhance-only.yml'
 
 jobs:
   enhance:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -45,3 +47,13 @@ jobs:
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
         run: node tests/current-ugoira-inplace.cjs
+      - name: Manga page selection and touch diagnostic regression
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+        run: node tests/manga-visible-controls.cjs
+      - name: Install WebKit for Safari-engine diagnostics
+        run: npx playwright install --with-deps webkit
+      - name: Safari engine mobile touch and manga selection regression
+        env:
+          BROWSER_ENGINE: webkit
+        run: node tests/manga-visible-controls.cjs

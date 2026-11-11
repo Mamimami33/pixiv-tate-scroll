@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.4
+// @version      4.0.0-alpha.5
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
 // @grant        GM.xmlHttpRequest
@@ -16,6 +16,9 @@
   window.__ptsEnhanceOnlyLoaded = true;
 
   // Explicit user operation only. No polling, feed discovery, bookmark, ranking or telemetry.
+  const ENHANCER_VERSION = '4.0.0-alpha.5';
+  let launchTapAt = 0;
+  let selectedOutline = null;
   const ZIP_MAX_BYTES = 64 * 1024 * 1024;
   const MAX_IMAGE_FILE_BYTES = 18 * 1024 * 1024;
   let overlay = null;
@@ -471,6 +474,106 @@
     return true;
   }
 
+
+  /* The launcher MUST make its result visible before any GPU or network operation. */
+  function describeCurrentTarget(){
+    const images=[...document.querySelectorAll('img')];
+    const cdn=images.filter(img=>{
+      try{return new URL(img.currentSrc||img.src||'',location.href).hostname==='i.pximg.net';}
+      catch(_){return false;}
+    });
+    const visible=cdn.filter(img=>{
+      const r=img.getBoundingClientRect();
+      return r.bottom>0&&r.top<innerHeight&&r.right>0&&r.left<innerWidth;
+    });
+    const selected=visiblePixivArtworkImage();
+    const result={
+      total:images.length,cdn:cdn.length,visible:visible.length,
+      selected:!!selected,artworkId:currentArtworkId(),
+      dimensions:selected ? (selected.naturalWidth+'×'+selected.naturalHeight) : '-',
+      filename:selected ? (selected.currentSrc||selected.src).split('/').pop().slice(0,80) : '-',
+      gm:typeof GM!=='undefined' && typeof GM.xmlHttpRequest==='function',
+      runtime:String(globalThis.GM_info?.scriptHandler||globalThis.GM?.info?.scriptHandler||'unknown')
+    };
+    return result;
+  }
+  function currentTargetSummary(){
+    const d=describeCurrentTarget();
+    if(!d.artworkId)return '作品ページではありません。pixivで作品画像を開いてください。';
+    if(!d.selected)return '画像をまだ特定できません。pixiv画像 '+d.cdn+'枚／画面内 '+d.visible+
+      '枚。作品画像が中央に見えるようにして再度確認してください。';
+    return '画面中央の枠で囲んだ画像（'+d.dimensions+'）を対象に選択しました。' +
+      ' 高画質化するには「この画像をAI超解像」を押してください。';
+  }
+  function ensureTargetOutline(){
+    if(selectedOutline?.isConnected)return selectedOutline;
+    const el=document.createElement('div');
+    el.id='pts-only-target-outline';
+    el.style.cssText=[
+      'position:fixed','z-index:2147480900','pointer-events:none',
+      'border:3px solid #33dcff','box-sizing:border-box',
+      'border-radius:2px','box-shadow:inset 0 0 0 1px #0009'
+    ].join(';');
+    const tag=document.createElement('span');
+    tag.textContent='AI超解像の対象';
+    tag.style.cssText='position:absolute;top:0;left:0;background:#087aa1;color:#fff;'+
+      'font:600 12px/22px system-ui;padding:0 6px;max-width:100%;white-space:nowrap';
+    el.appendChild(tag);
+    document.body.appendChild(el);
+    selectedOutline=el;
+    return el;
+  }
+  function updateTargetOutline(){
+    if(!overlay || overlay.hidden || inPlaceBusy || inPlaceResult){
+      if(selectedOutline)selectedOutline.hidden=true;
+      return;
+    }
+    const img=visiblePixivArtworkImage();
+    if(!img){
+      if(selectedOutline)selectedOutline.hidden=true;
+      return;
+    }
+    const r=img.getBoundingClientRect();
+    const el=ensureTargetOutline();
+    el.hidden=false;
+    Object.assign(el.style,{
+      left:r.left+'px',top:r.top+'px',width:r.width+'px',height:r.height+'px'
+    });
+  }
+  function clearTargetOutline(){
+    selectedOutline?.remove();
+    selectedOutline=null;
+  }
+  function diagnosticReport(){
+    const d=describeCurrentTarget();
+    return [
+      'pixiv enhancer '+ENHANCER_VERSION,
+      'artwork='+Boolean(d.artworkId),
+      'images='+d.total+' / CDN='+d.cdn+' / visible='+d.visible,
+      'selected='+d.selected+' / size='+d.dimensions,
+      'GM request='+d.gm+' / runtime='+d.runtime,
+      'status='+(byId('pts-only-status')?.textContent||'none')
+    ].join('\n');
+  }
+  function showLaunchError(error){
+    const message='画質補間 '+ENHANCER_VERSION+'：操作パネルを開けません。'+
+      String(error?.message||error);
+    const button=byId('pts-only-launch');
+    if(button){button.textContent='起動エラー α5';button.title=message;}
+    try{window.alert(message);}catch(_){}
+    console.error('[PTS enhancer launcher]',error);
+  }
+  function openEnhancerControls(){
+    const button=byId('pts-only-launch');
+    if(button)button.textContent='操作受付済 α5';
+    try{
+      ensureOpen();
+      // Important: opening the panel does NOT launch a CDN fetch or GPU job.
+      say(currentTargetSummary(),visiblePixivArtworkImage()?'neutral':'error');
+      updateTargetOutline();
+    }catch(error){showLaunchError(error);}
+  }
+
   function discardInPlace() {
     inPlaceToken++;
     try { inPlaceXHR?.abort?.(); } catch (_) {}
@@ -597,6 +700,7 @@
     discardInPlace();
     const ticket = inPlaceToken;
     inPlaceBusy = true;
+    updateTargetOutline();
     updateInPlaceButtons();
     say('表示中の画像をその場でAI超解像します。初回は画像CDNへ1回の取得があります');
     let localUrl = '';
@@ -648,6 +752,7 @@
       ].join(';');
       document.body.appendChild(output);
       inPlaceResult = output;
+      clearTargetOutline();
       inPlaceTarget = target;
       inPlaceOriginalURL = url;
       inPlaceVisible = true;
@@ -666,6 +771,7 @@
       if (ticket === inPlaceToken) {
         inPlaceBusy = false;
         updateInPlaceButtons();
+        updateTargetOutline();
       }
     }
   }
@@ -704,7 +810,9 @@
     updateButtons();
   }
   function closeUI() {
-    resetStage();overlay.hidden=true;updateButtons();
+    resetStage();overlay.hidden=true;clearTargetOutline();updateButtons();
+    const button=byId('pts-only-launch');
+    if(button)button.textContent='画質・コマ補間 α5';
   }
   function createUI() {
     if(overlay)return;
@@ -723,7 +831,7 @@
 }
 #pts-only-motion-surface .pts-ugoira-motion-canvas{z-index:2}
 #pts-only-overlay.pts-only-compact {
-  inset:auto 10px calc(18px + env(safe-area-inset-bottom)) auto;
+  inset:auto 10px calc(100px + env(safe-area-inset-bottom)) auto;
   width:min(350px,calc(100vw - 20px));height:auto;max-height:75vh;
   border:1px solid #586277;border-radius:14px;overflow:auto;
   box-shadow:0 4px 28px #000a;
@@ -732,27 +840,38 @@
 #pts-only-overlay.pts-only-compact #pts-only-stage {display:none}
 #pts-only-overlay.pts-only-compact #pts-only-stage + #pts-only-controls {display:none}
 #pts-only-direct-controls{display:flex;gap:6px;flex-wrap:wrap;padding:8px;justify-content:center}
-#pts-only-overlay.pts-only-compact #pts-only-status{max-height:90px;overflow:auto;padding:8px 10px}
+#pts-only-overlay.pts-only-compact #pts-only-status{max-height:170px;overflow:auto;padding:10px;font-size:13px;line-height:1.5;white-space:pre-wrap}
 `;
     document.head.appendChild(css);
     overlay=document.createElement('div');
     overlay.id='pts-only-overlay';overlay.hidden=true;
-    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
+    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α5</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
     document.body.appendChild(overlay);
     stage=byId('pts-only-stage');
     const directGroup = document.createElement('div');
     directGroup.id = 'pts-only-direct-controls';
     for (const [id, label, action] of [
-      ['pts-only-current','この作品画像をAI超解像',()=>void enhanceVisiblePixivImage()],
+      ['pts-only-current','この画像をAI超解像',()=>void enhanceVisiblePixivImage()],
       ['pts-only-current-compare','元画像に戻す',compareInPlace],
       ['pts-only-current-motion','動き補間: OFF',toggleMotion],
       ['pts-only-current-play','一時停止',togglePlayback]
     ]) {
       const button=document.createElement('button');
       button.type='button';button.id=id;button.textContent=label;
-      button.addEventListener('click',action);
+      button.addEventListener('click',()=>{
+        try { const result=action(); Promise.resolve(result).catch(finishError); }
+        catch(error){finishError(error);}
+      });
       directGroup.appendChild(button);
     }
+    const diagnose=document.createElement('button');
+    diagnose.id='pts-only-diagnose';diagnose.type='button';
+    diagnose.textContent='画像の再検出・診断';
+    diagnose.addEventListener('click',()=>{
+      say(currentTargetSummary(),visiblePixivArtworkImage()?'neutral':'error');
+      updateTargetOutline();
+    });
+    directGroup.appendChild(diagnose);
     overlay.insertBefore(directGroup,stage);
     byId('pts-only-close').onclick=closeUI;
     byId('pts-only-artwork').textContent='うごイラを処理する';
@@ -776,6 +895,7 @@
     window.addEventListener('resize',positionInPlace,{passive:true});
     window.addEventListener('resize',positionUgoiraOnArtwork,{passive:true});
     document.addEventListener('scroll',positionInPlace,true);
+    document.addEventListener('scroll',updateTargetOutline,true);
     document.addEventListener('scroll',positionUgoiraOnArtwork,true);
     window.addEventListener('popstate',discardInPlace);
     updateButtons();
@@ -784,14 +904,26 @@
     if(byId('pts-only-launch'))return;
     const button=document.createElement('button');
     button.id='pts-only-launch';button.type='button';
-    button.textContent='画質・コマ補間';
-    button.title='作品の超解像と、うごイラの動き補間のみ';
-    button.addEventListener('click',()=>{
-      ensureOpen();
-      if (explainCurrentImageSelection()) void enhanceVisiblePixivImage();
+    button.textContent='画質・コマ補間 α5';
+    button.type='button';
+    button.title='まず操作パネルと対象画像を確認します。読み込み・AI処理は実行ボタンで開始';
+    button.addEventListener('click',event=>{
+      event.stopPropagation();
+      if(Date.now()-launchTapAt<650)return;
+      launchTapAt=Date.now();
+      openEnhancerControls();
+    });
+    // Some iPhone Safari/Pixiv touch handlers can swallow the synthesized
+    // click. pointerup triggers only for a completed real touch.
+    button.addEventListener('pointerup',event=>{
+      if(event.pointerType!=='touch')return;
+      event.stopPropagation();
+      if(Date.now()-launchTapAt<650)return;
+      launchTapAt=Date.now();
+      openEnhancerControls();
     });
     const style=document.createElement('style');
-    style.textContent='#pts-only-launch{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:2147480000;background:#252534;color:#fff;padding:12px 14px;border:1px solid #777;border-radius:12px;font:600 13px system-ui;box-shadow:0 5px 22px #0008;touch-action:manipulation}';
+    style.textContent='#pts-only-launch{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:2147480000;background:#252534;color:#fff;padding:12px 14px;border:1px solid #777;border-radius:12px;font:600 13px system-ui;box-shadow:0 5px 22px #0008;touch-action:manipulation;-webkit-tap-highlight-color:#337e}';
     document.head.appendChild(style);
     document.body.appendChild(button);
   }

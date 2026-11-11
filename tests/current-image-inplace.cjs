@@ -54,6 +54,15 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
     assert.equal(await page.evaluate(()=>window.__gmFetchCount),0,'zero privileged GET on load');
     assert.equal(network.filter(x=>x.includes('/ajax/')).length,0,'zero API GET on load');
     await page.locator('#pts-only-launch').click();
+    assert.equal(await page.evaluate(()=>window.__gmFetchCount),0,
+      'launch must never cause a CDN fetch before explicit action');
+    assert.equal(await page.locator('#pts-only-inplace-canvas').count(),0,
+      'launch never starts GPU processing implicitly');
+    assert.equal(await page.locator('#pts-only-target-outline').count(),1,
+      'current selected page image has a visible frame');
+    assert.match(await page.locator('#pts-only-status').innerText(),/画面中央の枠で囲んだ画像/);
+    assert.match(await page.locator('#pts-only-launch').innerText(),/操作受付済 α5/);
+    await page.locator('#pts-only-current').click();
     const canvas=page.locator('#pts-only-inplace-canvas');
     await canvas.waitFor({state:'attached',timeout:30000});
     assert.deepEqual(await canvas.evaluate(c=>[c.width,c.height]),[200,200],

@@ -1,19 +1,19 @@
 // No real Pixiv requests. Covers multi-page manga selection and Safari-like touch event.
 'use strict';
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
-const {chromium}=require('playwright');
+const {chromium,webkit}=require('playwright');
+const useWebKit=process.env.BROWSER_ENGINE==='webkit';
 const source=fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js'),'utf8');
 (async()=>{
- const browser=await chromium.launch({
-   executablePath:process.env.CHROMIUM_PATH||'/usr/bin/google-chrome',headless:true,
-   args:['--no-sandbox','--enable-webgl','--use-gl=angle','--use-angle=swiftshader']
+ const browser=await (useWebKit?webkit:chromium).launch({
+   headless:true,
+   ...(useWebKit?{}:{
+     executablePath:process.env.CHROMIUM_PATH||'/usr/bin/google-chrome',
+     args:['--no-sandbox','--enable-webgl','--use-gl=angle','--use-angle=swiftshader']
+   })
  });
  try{
    const page=await browser.newPage({viewport:{width:390,height:844},hasTouch:true,isMobile:true});
-   const pic=await page.evaluate(async()=>{
-     const c=document.createElement('canvas');c.width=300;c.height=450;
-     c.getContext('2d').fillRect(0,0,300,450);return c.toDataURL('image/png').split(',')[1];
-   }).catch(()=>null);
    // about:blank is available without any network. Build a tiny fake PNG locally.
    const img=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQ1sAAAAASUVORK5CYII=','base64');
    const requests=[];
@@ -58,6 +58,6 @@ const source=fs.readFileSync(path.join(__dirname,'../pixiv-tate-scroll.user.js')
    await page.locator('#pts-only-close').click();
    assert.equal(await page.locator('#pts-only-target-outline').count(),0,'outline cleanup');
    assert.deepEqual(errors,[],'zero browser JS exceptions');
-   console.log('PASS manga current-page selection: Safari-like touch, immediate visible panel, proper image target, scroll follows, no extra requests');
+   console.log('PASS '+(useWebKit?'WebKit':'Chromium')+' manga current-page selection: mobile touch, immediate panel, proper image target, scroll follows, no extra requests');
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

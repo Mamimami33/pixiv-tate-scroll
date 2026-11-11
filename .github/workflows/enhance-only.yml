@@ -7,6 +7,7 @@ on:
       - feat/pixiv-current-image-inplace-20261111
       - fix/pixiv-current-image-selection-20261111
       - fix/pixiv-ios-visible-controls-diagnostics-20261111
+      - fix/pixiv-cdn-403-stop-20261111
   pull_request:
     paths:
       - 'pixiv-tate-scroll.user.js'

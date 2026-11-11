@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.5
+// @version      4.0.0-alpha.6
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
 // @grant        GM.xmlHttpRequest
@@ -16,7 +16,7 @@
   window.__ptsEnhanceOnlyLoaded = true;
 
   // Explicit user operation only. No polling, feed discovery, bookmark, ranking or telemetry.
-  const ENHANCER_VERSION = '4.0.0-alpha.5';
+  const ENHANCER_VERSION = '4.0.0-alpha.6';
   let launchTapAt = 0;
   let selectedOutline = null;
   const ZIP_MAX_BYTES = 64 * 1024 * 1024;
@@ -29,6 +29,7 @@
   let currentRequest = null;
   let operationId = 0;
   let sessionBlocked = false;
+  let imageCdnForbidden = false;
   let inPlaceResult = null;
   let inPlaceTarget = null;
   let inPlaceOriginalURL = '';
@@ -559,13 +560,13 @@
     const message='画質補間 '+ENHANCER_VERSION+'：操作パネルを開けません。'+
       String(error?.message||error);
     const button=byId('pts-only-launch');
-    if(button){button.textContent='起動エラー α5';button.title=message;}
+    if(button){button.textContent='起動エラー α6';button.title=message;}
     try{window.alert(message);}catch(_){}
     console.error('[PTS enhancer launcher]',error);
   }
   function openEnhancerControls(){
     const button=byId('pts-only-launch');
-    if(button)button.textContent='操作受付済 α5';
+    if(button)button.textContent='操作受付済 α6';
     try{
       ensureOpen();
       // Important: opening the panel does NOT launch a CDN fetch or GPU job.
@@ -643,6 +644,7 @@
 
   async function gmReadVisibleImage(url, token) {
     if (sessionBlocked) throw new Error('HTTP 429発生後のため通信を停止しています');
+    if (imageCdnForbidden) throw new Error('画像CDNが403を返したため、このページでは再取得を停止しています。画像を保存して「画像を選ぶ」から処理してください');
     if (typeof GM === 'undefined' || typeof GM.xmlHttpRequest !== 'function')
       throw new Error('Userscriptsの画像アクセス権限がありません。保存画像を選択してください');
     const now = Date.now();
@@ -670,6 +672,10 @@
       const response = await request;
       if (token !== inPlaceToken) throw new DOMException('中止','AbortError');
       if (response.status === 429) sessionBlocked = true;
+      if (response.status === 403) {
+        imageCdnForbidden = true;
+        throw new Error('画像取得 HTTP 403：pixiv CDNが追加の画像取得を拒否しました。このページでは再試行しません。画像を保存して「画像を選ぶ」から処理してください');
+      }
       if (response.status !== 200) throw new Error('画像取得 HTTP ' + response.status);
       const payload = response.response;
       const blob = payload instanceof Blob ? payload :
@@ -708,6 +714,21 @@
     let output = null;
     try {
       if (!aiCnnCanUseSource(target)) {
+        // A Pixiv image already painted on the page can be read only when
+        // its origin-clean flag allows Canvas access. Probe without network.
+        // A CORS-tainted canvas must not be used as CNN input.
+        let samePageReadable=false;
+        try {
+          const probe=document.createElement('canvas');
+          probe.width=1;probe.height=1;
+          const ctx=probe.getContext('2d',{willReadFrequently:true});
+          ctx.drawImage(target,0,0,1,1);
+          ctx.getImageData(0,0,1,1);
+          samePageReadable=true;
+        } catch (_) {}
+        if(samePageReadable) {
+          say('ページ内の画像を追加取得せずにAI処理します');
+        } else {
         const blob = await gmReadVisibleImage(url, ticket);
         if (ticket !== inPlaceToken) return;
         localUrl = URL.createObjectURL(blob);
@@ -715,6 +736,7 @@
         workingImage.src = localUrl;
         await workingImage.decode();
         // A bounded canvas will be created below for oversized images.
+        }
       }
       const isCurrent = () => ticket === inPlaceToken && !overlay?.hidden &&
         target.isConnected && url === (target.currentSrc || target.src) && !document.hidden;
@@ -760,8 +782,8 @@
       say('表示中の画像にAI超解像を適用しました。元画像との切替は通信なし');
     } catch (error) {
       if (ticket === inPlaceToken && error?.name !== 'AbortError') {
-        say('高画質化できませんでした。画像を保存して「画像を選ぶ」でも処理できます。' +
-          String(error?.message || error), 'error');
+        say('高画質化できませんでした。' + String(error?.message || error) +
+          ' 保存画像からの処理は「画像を選ぶ」を使ってください。', 'error');
       }
       if (output && output !== inPlaceResult) {
         output.width = 0; output.height = 0;
@@ -812,7 +834,7 @@
   function closeUI() {
     resetStage();overlay.hidden=true;clearTargetOutline();updateButtons();
     const button=byId('pts-only-launch');
-    if(button)button.textContent='画質・コマ補間 α5';
+    if(button)button.textContent='画質・コマ補間 α6';
   }
   function createUI() {
     if(overlay)return;
@@ -845,7 +867,7 @@
     document.head.appendChild(css);
     overlay=document.createElement('div');
     overlay.id='pts-only-overlay';overlay.hidden=true;
-    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α5</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
+    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α6</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
     document.body.appendChild(overlay);
     stage=byId('pts-only-stage');
     const directGroup = document.createElement('div');
@@ -904,7 +926,7 @@
     if(byId('pts-only-launch'))return;
     const button=document.createElement('button');
     button.id='pts-only-launch';button.type='button';
-    button.textContent='画質・コマ補間 α5';
+    button.textContent='画質・コマ補間 α6';
     button.type='button';
     button.title='まず操作パネルと対象画像を確認します。読み込み・AI処理は実行ボタンで開始';
     button.addEventListener('click',event=>{

@@ -607,7 +607,7 @@
     try{
       ensureOpen();
       // Important: opening the panel does NOT launch a CDN fetch or GPU job.
-      say(readonlyCdnDiagnostic());
+      say(currentTargetSummary(),visiblePixivArtworkImage()?'neutral':'error');
       updateTargetOutline();
     }catch(error){showLaunchError(error);}
   }

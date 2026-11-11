@@ -13,17 +13,20 @@ small,.muted{color:#aab9cf}li{margin:8px 0}code{color:#f2dba4}
 </style>
 </head>
 <body><main>
-<p class="muted">v4.0.0-alpha.3 / 試験用ブランチ / main未統合</p>
+<p class="muted">v4.0.0-alpha.5 / 試験用ブランチ / main未統合</p>
 <h1>pixiv 画質向上・フレーム補間専用</h1>
 <p>おすすめ・縦スクロール・検索・ブックマークを含まない、画像のAI超解像と、うごイラのフレーム補間だけに絞ったiPhone Safari向けUserscriptsです。</p>
-<a class="install" href="https://raw.githubusercontent.com/Mamimami33/pixiv-tate-scroll/feat/pixiv-current-image-inplace-20261111/pixiv-tate-scroll.user.js">試作版JavaScriptを開く</a>
+<a class="install" href="https://raw.githubusercontent.com/Mamimami33/pixiv-tate-scroll/fix/pixiv-ios-visible-controls-diagnostics-20261111/pixiv-tate-scroll.user.js">試作版JavaScriptを開く</a>
 <h2>使い方</h2>
 <ol>
 <li>既存の「pixiv縦スクロール」は無効にし、上記のスクリプトだけをUserscriptsに登録します。</li>
 <li>Safariのpixiv作品ページ（<code>/artworks/作品ID</code>）を開きます。</li>
-<li>静止画を表示したまま右下の「画質・コマ補間」を押すと、見ている画像をその位置でAI超解像します。元画像との切替も可能です。</li>
+<li>pixivで作品を表示し、右下の「画質・コマ補間 α5」を押します。先に操作パネルだけが開き、対象の画像が青枠で囲まれます。漫画の複数ページが見えていれば画面中央の画像が対象です。</li><li>「この画像をAI超解像」を押すとその1枚だけを高画質化します。元画像との切替も可能です。</li>
 <li>うごイラでは「うごイラを処理する」を選び、読み込み完了後に「動き補間：ON」。作品の再生領域へ結果を重ねます。読み込めない場合は端末内の画像・ZIPファイルも使用できます。</li>
 </ol>
+<h2>iPhoneで動かない場合</h2>
+<p>ボタンの文字が「画質・コマ補間 α5」になっていることを確認します。古い文字ならUserscriptsで旧版を無効化し、α5を保存してからSafariの拡張機能メニューを開き直し、pixivを再読み込みしてください。</p>
+<p>タップを受け付けると「操作受付済 α5」に変わり、操作パネルが開きます。そこで「画像の再検出・診断」を押すと、pixiv画像を何枚認識したかが表示されます。何も起きない場合はボタンと画面全体のスクリーンショットが診断に役立ちます。</p>
 <h2>通信・画質について</h2>
 <p>ページを開いた時点では追加通信を行いません。表示中の静止画を高画質化すると、その画像をpixiv CDNから明示的に1回取得する場合があります。元画像との比較では再取得しません。うごイラは操作時だけ作品JSON・フレーム情報・元ZIPを各1回取得し、自動巡回・自動再試行はしません。</p>
 <p>Safari Userscriptsの <code>GM.xmlHttpRequest</code> 権限を使って、ブラウザ内のCORS制限とは別の許可された画像取得を試みます。拡張機能側の許可・pixivの応答によって失敗する場合は、画像・ZIPを保存し、ファイル選択から読み込んでください。画像を外部AIサービスへ送信しません。</p>

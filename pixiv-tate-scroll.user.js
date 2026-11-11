@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.6
+// @version      4.0.0-alpha.7
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
 // @grant        GM.xmlHttpRequest
@@ -16,7 +16,7 @@
   window.__ptsEnhanceOnlyLoaded = true;
 
   // Explicit user operation only. No polling, feed discovery, bookmark, ranking or telemetry.
-  const ENHANCER_VERSION = '4.0.0-alpha.6';
+  const ENHANCER_VERSION = '4.0.0-alpha.7';
   let launchTapAt = 0;
   let selectedOutline = null;
   const ZIP_MAX_BYTES = 64 * 1024 * 1024;
@@ -560,13 +560,13 @@
     const message='画質補間 '+ENHANCER_VERSION+'：操作パネルを開けません。'+
       String(error?.message||error);
     const button=byId('pts-only-launch');
-    if(button){button.textContent='起動エラー α6';button.title=message;}
+    if(button){button.textContent='起動エラー α7';button.title=message;}
     try{window.alert(message);}catch(_){}
     console.error('[PTS enhancer launcher]',error);
   }
   function openEnhancerControls(){
     const button=byId('pts-only-launch');
-    if(button)button.textContent='操作受付済 α6';
+    if(button)button.textContent='操作受付済 α7';
     try{
       ensureOpen();
       // Important: opening the panel does NOT launch a CDN fetch or GPU job.
@@ -618,6 +618,8 @@
   function updateInPlaceButtons() {
     const button = byId('pts-only-current');
     const compare = byId('pts-only-current-compare');
+    const fileOverlay=byId('pts-only-local-overlay');
+    if(fileOverlay)fileOverlay.disabled=inPlaceBusy;
     if (button) {
       button.disabled = inPlaceBusy;
       button.textContent = inPlaceBusy ? '画像をGPU処理中…' :
@@ -689,7 +691,7 @@
     }
   }
 
-  async function enhanceVisiblePixivImage() {
+  async function enhanceVisiblePixivImage(sourceBlob = null) {
     ensureOpen();
     // Do not redownload merely to toggle a result already created.
     const target = visiblePixivArtworkImage();
@@ -698,7 +700,7 @@
       return;
     }
     const url = target.currentSrc || target.src;
-    if (inPlaceResult && inPlaceTarget === target && inPlaceOriginalURL === url) {
+    if (!sourceBlob && inPlaceResult && inPlaceTarget === target && inPlaceOriginalURL === url) {
       compareInPlace(); return;
     }
     // Very large images are downscaled to the GPU budget after one explicit
@@ -708,12 +710,21 @@
     inPlaceBusy = true;
     updateTargetOutline();
     updateInPlaceButtons();
-    say('表示中の画像をその場でAI超解像します。初回は画像CDNへ1回の取得があります');
+    say(sourceBlob ? '端末内の画像を使って、表示中の作品の位置へAI超解像を重ねます（pixivへの追加通信なし）' : '表示中の画像をその場でAI超解像します。必要な場合のみ画像CDNへ1回取得します');
     let localUrl = '';
     let workingImage = target;
     let output = null;
     try {
-      if (!aiCnnCanUseSource(target)) {
+      if (sourceBlob) {
+        if(!/^image\/(png|jpeg|webp)$/i.test(sourceBlob.type||''))
+          throw new Error('PNG・JPEG・WebP画像を選択してください');
+        if(sourceBlob.size<1||sourceBlob.size>MAX_IMAGE_FILE_BYTES)
+          throw new Error('画像は18MB以下にしてください');
+        localUrl=URL.createObjectURL(sourceBlob);
+        workingImage=new Image();
+        workingImage.src=localUrl;
+        await workingImage.decode();
+      } else if (!aiCnnCanUseSource(target)) {
         // A Pixiv image already painted on the page can be read only when
         // its origin-clean flag allows Canvas access. Probe without network.
         // A CORS-tainted canvas must not be used as CNN input.
@@ -798,6 +809,29 @@
     }
   }
 
+
+  async function enhanceFromClipboard() {
+    // Safari requires an explicit user gesture and may not expose copied
+    // image pixels to navigator.clipboard.read. Never fall back to CDN GET.
+    if(!navigator.clipboard?.read){
+      say('このSafariでは画像のクリップボード読み込みに対応していません。画像を保存し「ファイルから重ねる」を使ってください','error');
+      return;
+    }
+    try{
+      const items=await navigator.clipboard.read();
+      let blob=null;
+      for(const item of items){
+        const mime=item.types.find(type=>/^image\/(png|jpeg|webp)$/i.test(type));
+        if(mime){blob=await item.getType(mime);break;}
+      }
+      if(!blob)throw new Error('クリップボードにPNG/JPEG/WebP画像がありません。pixiv画像を長押しして「コピー」を選んでください');
+      await enhanceVisiblePixivImage(blob);
+    }catch(error){
+      say('画像の貼り付けに失敗しました：'+String(error?.message||error)+
+        '。代わりに「ファイルから重ねる」を利用できます','error');
+    }
+  }
+
   function updateButtons() {
     const still=!!currentImage,animated=!!state;
     byId('pts-only-upscale').disabled=!still;
@@ -834,7 +868,7 @@
   function closeUI() {
     resetStage();overlay.hidden=true;clearTargetOutline();updateButtons();
     const button=byId('pts-only-launch');
-    if(button)button.textContent='画質・コマ補間 α6';
+    if(button)button.textContent='画質・コマ補間 α7';
   }
   function createUI() {
     if(overlay)return;
@@ -867,13 +901,16 @@
     document.head.appendChild(css);
     overlay=document.createElement('div');
     overlay.id='pts-only-overlay';overlay.hidden=true;
-    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α6</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
+    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α7</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
     document.body.appendChild(overlay);
     stage=byId('pts-only-stage');
     const directGroup = document.createElement('div');
     directGroup.id = 'pts-only-direct-controls';
     for (const [id, label, action] of [
       ['pts-only-current','この画像をAI超解像',()=>void enhanceVisiblePixivImage()],
+      ['pts-only-clipboard','コピーした画像を重ねる',()=>enhanceFromClipboard()],
+      ['pts-only-local-overlay','ファイルから重ねる',
+        ()=>chooseFile('image/png,image/jpeg,image/webp',enhanceVisiblePixivImage)],
       ['pts-only-current-compare','元画像に戻す',compareInPlace],
       ['pts-only-current-motion','動き補間: OFF',toggleMotion],
       ['pts-only-current-play','一時停止',togglePlayback]
@@ -886,6 +923,8 @@
       });
       directGroup.appendChild(button);
     }
+    // These fallback controls never request Pixiv CDN data. The user may
+    // copy the image from Safari or choose an already saved image.
     const diagnose=document.createElement('button');
     diagnose.id='pts-only-diagnose';diagnose.type='button';
     diagnose.textContent='画像の再検出・診断';
@@ -926,7 +965,7 @@
     if(byId('pts-only-launch'))return;
     const button=document.createElement('button');
     button.id='pts-only-launch';button.type='button';
-    button.textContent='画質・コマ補間 α6';
+    button.textContent='画質・コマ補間 α7';
     button.type='button';
     button.title='まず操作パネルと対象画像を確認します。読み込み・AI処理は実行ボタンで開始';
     button.addEventListener('click',event=>{

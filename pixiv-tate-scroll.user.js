@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.3
+// @version      4.0.0-alpha.4
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
 // @grant        GM.xmlHttpRequest
@@ -423,34 +423,52 @@
   // the existing page <img> cannot be read by WebGL due to CDN CORS.
   // No searches, image crawling, retries or background downloads.
   function visiblePixivArtworkImage() {
-    const id = currentArtworkId();
-    if (!id) return null;
-    let selected = null, best = 0;
-    for (const img of document.querySelectorAll('img')) {
-      if (img.closest('#pts-only-overlay') || !img.complete || !img.naturalWidth ||
-          !img.naturalHeight) continue;
-      const raw = img.currentSrc || img.src || '';
+    // Pixiv's real pages use several CDN URL layouts, resized thumbnails,
+    // lazy loading and a lightbox. Do not require the old "123_p0" filename
+    // pattern. Choose the large, visible artwork image rather than avatars.
+    const id=currentArtworkId();
+    if(!id)return null;
+    const candidates=[];
+    for(const img of document.querySelectorAll('img')){
+      if(img.closest('#pts-only-overlay,#pts-only-launch,#pts-only-motion-surface') ||
+        !img.complete || !img.naturalWidth || !img.naturalHeight)continue;
+      const url=img.currentSrc||img.src||'';
       let parsed;
-      try { parsed = new URL(raw, location.href); } catch (_) { continue; }
-      if (parsed.protocol !== 'https:' || parsed.hostname !== 'i.pximg.net') continue;
-      if (!new RegExp('(?:^|[/_])' + id + '_p\\d+(?:[_./]|$)').test(parsed.pathname)) continue;
-      const rect = img.getBoundingClientRect();
-      if (rect.width < 120 || rect.height < 120) continue;
-      const visibleWidth = Math.max(0, Math.min(window.innerWidth, rect.right) -
-        Math.max(0, rect.left));
-      const visibleHeight = Math.max(0, Math.min(window.innerHeight, rect.bottom) -
-        Math.max(0, rect.top));
-      if (visibleWidth < 100 || visibleHeight < 100) continue;
-      const area = visibleWidth * visibleHeight;
-      const distance = Math.hypot(
-        (rect.left + rect.right) / 2 - window.innerWidth / 2,
-        (rect.top + rect.bottom) / 2 - window.innerHeight / 2
-      );
-      const score = area / (1 + distance / 1200) *
-        (img.closest('[role="dialog"]') ? 1.35 : 1);
-      if (score > best) { best = score; selected = img; }
+      try{parsed=new URL(url,location.href);}catch(_){continue;}
+      if(parsed.protocol!=='https:'||parsed.hostname!=='i.pximg.net')continue;
+      const path=parsed.pathname;
+      // A pixiv artwork is served from img-original, img-master, or custom
+      // image directories. Reject avatar/profile assets and tiny icons.
+      if(/\/(?:user-profile|profile|common|background|novel-cover)\//i.test(path))continue;
+      const r=img.getBoundingClientRect();
+      const vw=Math.max(0,Math.min(innerWidth,r.right)-Math.max(0,r.left));
+      const vh=Math.max(0,Math.min(innerHeight,r.bottom)-Math.max(0,r.top));
+      if(vw<100||vh<100||vw*vh<18000)continue;
+      const exact=new RegExp('(?:^|[/_])'+id+'_p\\d+(?:[_./]|$)').test(path);
+      const plausible=/\/(?:img-original|img-master|custom-thumb|img-inf|c\/\d+x\d+)\//.test(path);
+      if(!exact&&!plausible)continue;
+      const center=Math.hypot((r.left+r.right)/2-innerWidth/2,
+        (r.top+r.bottom)/2-innerHeight/2);
+      const score=vw*vh/(1+center/1500)*
+        (exact?2.2:1)*(img.closest('[role="dialog"]')?1.5:1);
+      candidates.push({img,score,exact,url});
     }
-    return selected;
+    candidates.sort((a,b)=>b.score-a.score);
+    // Never silently process a different artwork's thumbnail when an exact
+    // current-artwork candidate is visible.
+    const exact=candidates.find(c=>c.exact);
+    return (exact||candidates[0])?.img||null;
+  }
+  function explainCurrentImageSelection(){
+    const id=currentArtworkId();
+    const img=visiblePixivArtworkImage();
+    if(!img){
+      say(id
+        ? '作品画像が見つかりません。pixivで作品の画像を大きく表示してから押してください。小さなサムネイルは対象外です。'
+        : 'pixivの作品ページ（/artworks/作品ID）で使用してください。','error');
+      return false;
+    }
+    return true;
   }
 
   function discardInPlace() {
@@ -499,7 +517,7 @@
     if (button) {
       button.disabled = inPlaceBusy;
       button.textContent = inPlaceBusy ? '画像をGPU処理中…' :
-        inPlaceResult ? '別の表示画像を処理' : '表示中の画像をAI超解像';
+        inPlaceResult ? '別の作品画像を処理' : 'この作品画像をAI超解像';
     }
     if (compare) {
       compare.disabled = !inPlaceResult;
@@ -567,17 +585,15 @@
     // Do not redownload merely to toggle a result already created.
     const target = visiblePixivArtworkImage();
     if (!target) {
-      say('表示中の作品画像が見つかりません。画像を開くか、保存画像を選んでください','error');
+      explainCurrentImageSelection();
       return;
     }
     const url = target.currentSrc || target.src;
     if (inPlaceResult && inPlaceTarget === target && inPlaceOriginalURL === url) {
       compareInPlace(); return;
     }
-    if (!currentImageCanBeProcessed(target)) {
-      say('この元画像は200万画素以上です。iPhoneの安全上限のため追加取得・AI処理をしません','error');
-      return;
-    }
+    // Very large images are downscaled to the GPU budget after one explicit
+    // CDN read. Their page display and original file remain untouched.
     discardInPlace();
     const ticket = inPlaceToken;
     inPlaceBusy = true;
@@ -594,14 +610,33 @@
         workingImage = new Image();
         workingImage.src = localUrl;
         await workingImage.decode();
-        if (workingImage.naturalWidth * workingImage.naturalHeight >
-            AI_CNN_LARGE_MAX_PIXELS)
-          throw new Error('元画像が安全上限200万画素を超えました。元画像のまま表示します');
+        // A bounded canvas will be created below for oversized images.
       }
       const isCurrent = () => ticket === inPlaceToken && !overlay?.hidden &&
         target.isConnected && url === (target.currentSrc || target.src) && !document.hidden;
-      output = await anime4kCnnProcessLarge(workingImage, isCurrent,
+      const srcW=workingImage.naturalWidth||workingImage.width;
+      const srcH=workingImage.naturalHeight||workingImage.height;
+      let boundedImage=workingImage;
+      let temporary=null;
+      if(srcW*srcH>AI_CNN_LARGE_MAX_PIXELS){
+        const scale=Math.sqrt(AI_CNN_LARGE_MAX_PIXELS/(srcW*srcH));
+        temporary=document.createElement('canvas');
+        temporary.width=Math.max(1,Math.floor(srcW*scale));
+        temporary.height=Math.max(1,Math.floor(srcH*scale));
+        const ctx=temporary.getContext('2d',{alpha:false});
+        if(!ctx)throw new Error('画像縮小用Canvasを作成できません');
+        ctx.imageSmoothingEnabled=true;
+        ctx.imageSmoothingQuality='high';
+        ctx.drawImage(workingImage,0,0,temporary.width,temporary.height);
+        boundedImage=temporary;
+        say('元画像が大きいため200万画素へ縮小してからAI超解像します');
+      }
+      try {
+        output = await anime4kCnnProcessLarge(boundedImage, isCurrent,
         (done, total) => say('CNN超解像：' + done + ' / ' + total));
+      } finally {
+        if(temporary){temporary.width=0;temporary.height=0;}
+      }
       if (!isCurrent()) {
         output.width = 0; output.height = 0;
         output = null; return;
@@ -696,6 +731,7 @@
 #pts-only-overlay.pts-only-compact header {padding:8px 10px}
 #pts-only-overlay.pts-only-compact #pts-only-stage {display:none}
 #pts-only-overlay.pts-only-compact #pts-only-stage + #pts-only-controls {display:none}
+#pts-only-direct-controls{display:flex;gap:6px;flex-wrap:wrap;padding:8px;justify-content:center}
 #pts-only-overlay.pts-only-compact #pts-only-status{max-height:90px;overflow:auto;padding:8px 10px}
 `;
     document.head.appendChild(css);
@@ -705,9 +741,9 @@
     document.body.appendChild(overlay);
     stage=byId('pts-only-stage');
     const directGroup = document.createElement('div');
-    directGroup.id = 'pts-only-controls';
+    directGroup.id = 'pts-only-direct-controls';
     for (const [id, label, action] of [
-      ['pts-only-current','表示中の画像をAI超解像',()=>void enhanceVisiblePixivImage()],
+      ['pts-only-current','この作品画像をAI超解像',()=>void enhanceVisiblePixivImage()],
       ['pts-only-current-compare','元画像に戻す',compareInPlace],
       ['pts-only-current-motion','動き補間: OFF',toggleMotion],
       ['pts-only-current-play','一時停止',togglePlayback]
@@ -752,8 +788,7 @@
     button.title='作品の超解像と、うごイラの動き補間のみ';
     button.addEventListener('click',()=>{
       ensureOpen();
-      if (visiblePixivArtworkImage()) void enhanceVisiblePixivImage();
-      else say('このページの画像がまだ見つかりません。画像を表示してから操作してください');
+      if (explainCurrentImageSelection()) void enhanceVisiblePixivImage();
     });
     const style=document.createElement('style');
     style.textContent='#pts-only-launch{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:2147480000;background:#252534;color:#fff;padding:12px 14px;border:1px solid #777;border-radius:12px;font:600 13px system-ui;box-shadow:0 5px 22px #0008;touch-action:manipulation}';

@@ -91,6 +91,8 @@ assert(!/function (?:startCustomFeed|startSearchFeed)\s*\(/.test(source));
     });
     await page.waitForFunction(()=>document.querySelector('#original')?.complete&&
       document.querySelector('#original').naturalWidth===100);
+    // Respect the explicit 5-second pixiv CDN cooldown between separate images.
+    await page.waitForTimeout(5100);
     await page.locator('#pts-only-current').click();
     await page.waitForFunction(()=>!!document.querySelector('#pts-only-inplace-canvas'),null,{timeout:30000});
     assert.equal(await page.evaluate(()=>window.__gmFetchCount),2,

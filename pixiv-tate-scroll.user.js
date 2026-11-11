@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv 高画質化・フレーム補間専用
 // @namespace    mamiya.pixiv.enhance.only
-// @version      4.0.0-alpha.7
+// @version      4.0.0-alpha.8
 // @description  pixiv作品ページで画像のAI超解像と、うごイラの動き補間だけを行う。縦スクロール・検索・推薦なし。
 // @match        https://www.pixiv.net/artworks/*
 // @grant        GM.xmlHttpRequest
@@ -16,7 +16,7 @@
   window.__ptsEnhanceOnlyLoaded = true;
 
   // Explicit user operation only. No polling, feed discovery, bookmark, ranking or telemetry.
-  const ENHANCER_VERSION = '4.0.0-alpha.7';
+  const ENHANCER_VERSION = '4.0.0-alpha.8';
   let launchTapAt = 0;
   let selectedOutline = null;
   const ZIP_MAX_BYTES = 64 * 1024 * 1024;
@@ -30,6 +30,8 @@
   let operationId = 0;
   let sessionBlocked = false;
   let imageCdnForbidden = false;
+  let zipCdnForbidden = false;
+  let lastCdnDiagnostic = '未実行';
   let inPlaceResult = null;
   let inPlaceTarget = null;
   let inPlaceOriginalURL = '';
@@ -498,6 +500,41 @@
     };
     return result;
   }
+
+  function readonlyCdnDiagnostic() {
+    const media=[...document.querySelectorAll('canvas,video,img')].filter(el=>
+      !el.closest('#pts-only-overlay')&&!el.closest('#pts-only-motion-surface'));
+    const counts={canvas:0,video:0,img:0};
+    for(const el of media)counts[el.tagName.toLowerCase()]++;
+    const target=visiblePixivArtworkImage();
+    let canvasReadable='対象画像なし';
+    if(target){
+      try{
+        const c=document.createElement('canvas');c.width=1;c.height=1;
+        const ctx=c.getContext('2d',{willReadFrequently:true});
+        if(!ctx)throw new Error('Canvas 2D不可');
+        ctx.drawImage(target,0,0,1,1);
+        ctx.getImageData(0,0,1,1);
+        canvasReadable='可能';
+        c.width=c.height=0;
+      }catch(e){canvasReadable=e?.name==='SecurityError'?'不可（CORS）':'不可（'+String(e?.name||'描画エラー')+'）';}
+    }
+    // No network requests, ZIP downloads, pixel export or private headers.
+    return [
+      '診断（追加通信なし）',
+      '作品ID：'+(currentArtworkId()||'なし'),
+      '実行環境：'+String(globalThis.GM_info?.scriptHandler||globalThis.GM?.info?.scriptHandler||'不明').slice(0,50),
+      'GM通信API：'+(typeof GM!=='undefined'&&typeof GM.xmlHttpRequest==='function'?'あり':'なし'),
+      '画面要素：img '+counts.img+' / canvas '+counts.canvas+' / video '+counts.video,
+      '表示画像のCanvas読み取り：'+canvasReadable,
+      '静止画403停止：'+(imageCdnForbidden?'はい':'いいえ'),
+      'ZIP403停止：'+(zipCdnForbidden?'はい':'いいえ'),
+      '429停止：'+(sessionBlocked?'はい':'いいえ'),
+      '最後のCDN取得：'+lastCdnDiagnostic,
+      '注意：Refererが実際に送信されたかはブラウザ内から確認できません'
+    ].join('\n');
+  }
+
   function currentTargetSummary(){
     const d=describeCurrentTarget();
     if(!d.artworkId)return '作品ページではありません。pixivで作品画像を開いてください。';
@@ -560,17 +597,17 @@
     const message='画質補間 '+ENHANCER_VERSION+'：操作パネルを開けません。'+
       String(error?.message||error);
     const button=byId('pts-only-launch');
-    if(button){button.textContent='起動エラー α7';button.title=message;}
+    if(button){button.textContent='起動エラー α8';button.title=message;}
     try{window.alert(message);}catch(_){}
     console.error('[PTS enhancer launcher]',error);
   }
   function openEnhancerControls(){
     const button=byId('pts-only-launch');
-    if(button)button.textContent='操作受付済 α7';
+    if(button)button.textContent='操作受付済 α8';
     try{
       ensureOpen();
       // Important: opening the panel does NOT launch a CDN fetch or GPU job.
-      say(currentTargetSummary(),visiblePixivArtworkImage()?'neutral':'error');
+      say(readonlyCdnDiagnostic());
       updateTargetOutline();
     }catch(error){showLaunchError(error);}
   }
@@ -674,6 +711,7 @@
       const response = await request;
       if (token !== inPlaceToken) throw new DOMException('中止','AbortError');
       if (response.status === 429) sessionBlocked = true;
+      lastCdnDiagnostic = '静止画：GM通信 HTTP '+response.status;
       if (response.status === 403) {
         imageCdnForbidden = true;
         throw new Error('画像取得 HTTP 403：pixiv CDNが追加の画像取得を拒否しました。このページでは再試行しません。画像を保存して「画像を選ぶ」から処理してください');
@@ -868,7 +906,7 @@
   function closeUI() {
     resetStage();overlay.hidden=true;clearTargetOutline();updateButtons();
     const button=byId('pts-only-launch');
-    if(button)button.textContent='画質・コマ補間 α7';
+    if(button)button.textContent='画質・コマ補間 α8';
   }
   function createUI() {
     if(overlay)return;
@@ -901,7 +939,7 @@
     document.head.appendChild(css);
     overlay=document.createElement('div');
     overlay.id='pts-only-overlay';overlay.hidden=true;
-    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α7</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
+    overlay.innerHTML="\n<header><strong>画質向上・フレーム補間 α8</strong><button id=\"pts-only-close\">閉じる</button></header>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-artwork\" data-operation=\"1\">今の作品を読み込む</button>\n<button id=\"pts-only-file\" data-operation=\"1\">画像を選ぶ</button>\n<button id=\"pts-only-zip\" data-operation=\"1\">うごイラZIPを選ぶ</button>\n</div>\n<div id=\"pts-only-stage\" aria-label=\"処理対象の画像やうごイラ\"></div>\n<div id=\"pts-only-controls\">\n<button id=\"pts-only-upscale\">AI超解像2×</button>\n<button id=\"pts-only-compare\">元画像を見る</button>\n<button id=\"pts-only-motion\">動き補間: OFF</button>\n<button id=\"pts-only-play\">一時停止</button>\n</div>\n<div id=\"pts-only-status\" role=\"status\" aria-live=\"polite\">画像かうごイラを読み込んでください。画像はCORS制限時に保存ファイルを使用します。</div>\n";
     document.body.appendChild(overlay);
     stage=byId('pts-only-stage');
     const directGroup = document.createElement('div');
@@ -927,7 +965,7 @@
     // copy the image from Safari or choose an already saved image.
     const diagnose=document.createElement('button');
     diagnose.id='pts-only-diagnose';diagnose.type='button';
-    diagnose.textContent='画像の再検出・診断';
+    diagnose.textContent='通信・再生環境を診断（追加通信なし）';
     diagnose.addEventListener('click',()=>{
       say(currentTargetSummary(),visiblePixivArtworkImage()?'neutral':'error');
       updateTargetOutline();
@@ -965,7 +1003,7 @@
     if(byId('pts-only-launch'))return;
     const button=document.createElement('button');
     button.id='pts-only-launch';button.type='button';
-    button.textContent='画質・コマ補間 α7';
+    button.textContent='画質・コマ補間 α8';
     button.type='button';
     button.title='まず操作パネルと対象画像を確認します。読み込み・AI処理は実行ボタンで開始';
     button.addEventListener('click',event=>{
@@ -1346,6 +1384,7 @@
     // The browser's normal fetch is unable to inspect pixiv CDN ZIPs without CORS.
     // Userscripts' granted GM API retrieves just the one ZIP explicitly requested.
     if (fromPixiv && typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function') {
+      if (zipCdnForbidden)throw new Error('ZIP CDN HTTP 403後の再取得は停止しています');
       if (sessionBlocked) throw new Error('アクセス制限後のZIP取得は停止しています');
       let request;
       const abort = () => request?.abort?.();
@@ -1364,7 +1403,9 @@
         }
         const response=await request;
         if (signal?.aborted) throw new DOMException('中止','AbortError');
+        lastCdnDiagnostic='うごイラZIP：GM通信 HTTP '+response.status;
         if(response.status===429)sessionBlocked=true;
+        if(response.status===403)zipCdnForbidden=true;
         if(response.status!==200)throw new Error('ZIP取得 HTTP '+response.status);
         const payload=response.response;
         const buf=payload instanceof ArrayBuffer ? payload :
@@ -1389,7 +1430,10 @@
     }
     // Browser fallback for unsupported userscript managers.
     if(fromPixiv){
+      if(zipCdnForbidden)throw new Error('ZIP CDN HTTP 403後の再取得は停止しています');
       const res=await fetch(parsed.href,{signal});
+      lastCdnDiagnostic='うごイラZIP：通常fetch HTTP '+res.status;
+      if(res.status===403)zipCdnForbidden=true;
       if(res.status===429)sessionBlocked=true;
       if(!res.ok)throw new Error('ZIP取得 HTTP '+res.status);
       const size=Number(res.headers.get('content-length')||0);

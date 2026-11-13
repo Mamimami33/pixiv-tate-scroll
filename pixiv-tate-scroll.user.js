@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.23
+// @version      3.13.24
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -1265,7 +1265,7 @@
   }
 
   function ugoiraTweenDiagnosticText() {
-    return `コマ補間: ${ugoiraTweenEnabled() ? 'ON' : 'OFF'}` +
+    return `AI機能の版: 3.13.24\nコマ補間: ${ugoiraTweenEnabled() ? 'ON' : 'OFF'}` +
       ` / 取得元=${tweenEngine.source || (tweenBundled ? '同梱(未起動)' : '配信サーバー(未起動)')}` +
       ` / 実行=${tweenEngine.backend || '未起動'}` +
       ` / 画面=${displayHz}Hz 目標=${tweenTargetFps()}fps` +
@@ -1636,7 +1636,7 @@
     }
     btn.hidden = false;
     // うごイラでは「コマ補間」ボタンの下に置く。
-    btn.style.top = ugoira ? '118px' : '';
+    btn.style.top = ugoira ? 'calc(118px + env(safe-area-inset-top))' : '';
     const mode = stereoMode();
     // うごイラのコマは端末内にあるので、画像を読めない制限(blocked)の影響を受けない。
     const failed = stereoEngine.error || (ugoira ? '' : stereoEngine.blocked);
@@ -5151,7 +5151,7 @@
       }
       #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
       #pts-overlay .pts-tween-btn,#pts-overlay .pts-stereo-btn{
-        position:absolute;top:84px;right:14px;z-index:27;
+        position:absolute;top:calc(84px + env(safe-area-inset-top));right:14px;z-index:27;
         appearance:none;border:0;border-radius:999px;
         background:#0009;color:#fff;font-size:12px;
         padding:6px 11px;pointer-events:auto;cursor:pointer

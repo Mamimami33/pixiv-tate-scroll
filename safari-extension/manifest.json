@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "pixiv縦スクロール",
+  "version": "0.0.0",
+  "description": "今開いているpixivのページに並んでいる作品を、元画像で1枚ずつ縦スクロールして眺めるビューアです。",
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png",
+    "256": "icons/icon-256.png",
+    "512": "icons/icon-512.png"
+  },
+  "host_permissions": [
+    "https://www.pixiv.net/*",
+    "https://i.pximg.net/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://www.pixiv.net/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

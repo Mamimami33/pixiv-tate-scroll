@@ -759,30 +759,52 @@
     s.ugoiraPlayer = null;
   }
 
-  /* ---------- うごイラのAIコマ補間（Safari拡張機能版のみ） ---------- */
+  /* ---------- うごイラのAIコマ補間 ---------- */
 
-  // 拡張機能に同梱した補間エンジン(RIFE)で前後のコマから中間のコマを作り、
-  // コマ数を2倍にして再生する。エンジンは拡張機能のページをiframeで開いて使う。
-  // ユーザースクリプト版にはエンジンがないので、この機能は現れない。
+  // 前後のコマからAI(RIFE 4.25)で中間のコマを作り、コマ数を2倍にして再生する。
+  // AIモデルと実行ライブラリ(onnxruntime-web)は初めて使うときに読み込む。
+  // ユーザースクリプト版は配信サーバーから取得し（合計約50MB、2回目以降は端末に保存した
+  // ものを使う）、Safari拡張機能版は同梱のファイルを使う。
   const UGOIRA_TWEEN_KEY = 'PTS_UGOIRA_TWEEN_V1';
+  const UGOIRA_TWEEN_BACKEND_KEY = 'PTS_UGOIRA_TWEEN_BACKEND'; // 検証用。'wasm'でCPU実行を強制
   const UGOIRA_TWEEN_MAX_SIDE = 640;   // 補間計算をする解像度の上限（長辺px）
   const UGOIRA_TWEEN_MIN_DELAY = 34;   // これより短いコマ間は既に十分滑らかなので補間しない
   const UGOIRA_TWEEN_MAX_FRAMES = 240; // これより長い作品は補間しない（待ち時間とメモリ）
+  const UGOIRA_TWEEN_ALIGN = 64;       // モデルが要求する辺の倍数
+  const UGOIRA_TWEEN_CUT = 0.16;       // これより差が大きい2コマは場面転換とみなして補間しない
+  const UGOIRA_TWEEN_SAME = 0.0005;
+  const UGOIRA_TWEEN_MODEL_SHA256 =
+    'cc84eb60c53d468efed268b0bd33ac025f3f3eb30ada429b64febd61ffb448f2';
+  const UGOIRA_TWEEN_CACHE = 'pts-ugoira-tween-v1';
+  const tweenBundled = typeof globalThis.__ptsTweenBase === 'string'
+    ? globalThis.__ptsTweenBase : '';
+  // 取得元。上から順に試す。バージョンは固定し、モデルはハッシュを確認してから使う。
+  const UGOIRA_TWEEN_SOURCES = tweenBundled ? [{
+    name: '同梱', ort: tweenBundled + 'ort/',
+    model: tweenBundled + 'rife-4.25-fp32.onnx'
+  }] : [{
+    name: 'jsdelivr',
+    ort: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/',
+    model: 'https://cdn.jsdelivr.net/npm/@bvdmitri/webtween@0.2.1/models/rife-4.25-fp32.onnx'
+  }, {
+    name: 'unpkg',
+    ort: 'https://unpkg.com/onnxruntime-web@1.30.0/dist/',
+    model: 'https://unpkg.com/@bvdmitri/webtween@0.2.1/models/rife-4.25-fp32.onnx'
+  }];
   const tweenEngine = {
-    url: typeof globalThis.__ptsInterpEngineUrl === 'string'
-      ? globalThis.__ptsInterpEngineUrl : '',
-    frame: null, ready: null, seq: 0, pending: new Map(),
-    backend: '', error: '', lastMs: 0, lastWork: '', made: 0, skipped: 0
+    ready: null, ort: null, session: null, chain: Promise.resolve(),
+    packed: new Map(), backend: '', source: '', loading: false,
+    error: '', lastMs: 0, lastWork: '', made: 0, skipped: 0
   };
 
-  function ugoiraTweenAvailable() {
-    return !!tweenEngine.url;
-  }
-
+  // 拡張機能版は通信が発生しないので初期値ON。ユーザースクリプト版は初回に約50MBを
+  // 取得するので、ボタンを押してONにするまで何も読み込まない。
   function ugoiraTweenEnabled() {
-    if (!ugoiraTweenAvailable()) return false;
-    try { return localStorage.getItem(UGOIRA_TWEEN_KEY) !== 'off'; }
-    catch { return true; }
+    let saved = null;
+    try { saved = localStorage.getItem(UGOIRA_TWEEN_KEY); } catch {}
+    if (saved === 'on') return true;
+    if (saved === 'off') return false;
+    return !!tweenBundled;
   }
 
   function ugoiraTweenActive(s) {
@@ -799,50 +821,168 @@
     return ugoiraTweenActive(s) ? s.tween.playFrames : s.frames;
   }
 
+  async function tweenModelBytes(source) {
+    let cache = null;
+    if (!tweenBundled) {
+      try { cache = await caches.open(UGOIRA_TWEEN_CACHE); } catch {}
+    }
+    let response = await cache?.match(source.model).catch(() => null);
+    const cached = !!response;
+    if (!response) response = await fetch(source.model, { credentials: 'omit' });
+    if (!response.ok) throw new Error(`モデル取得失敗: HTTP ${response.status}`);
+    const stored = cached ? null : response.clone();
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+    const hex = [...digest].map(v => v.toString(16).padStart(2, '0')).join('');
+    if (hex !== UGOIRA_TWEEN_MODEL_SHA256) {
+      if (cached) await cache.delete(source.model).catch(() => {});
+      throw new Error('モデルのハッシュ不一致');
+    }
+    if (stored && cache) await cache.put(source.model, stored).catch(() => {});
+    return bytes;
+  }
+
+  async function tweenOpen() {
+    let forced = '';
+    try { forced = localStorage.getItem(UGOIRA_TWEEN_BACKEND_KEY) || ''; } catch {}
+    let gpu = false;
+    try { gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch {}
+    // CPU実行は1枚に数秒かかり、その間は画面操作も止まるので、通常は使わない。
+    if (forced !== 'wasm' && !gpu) {
+      throw new Error('WebGPU非対応（iPhoneはiOS 26以降が必要）');
+    }
+    const backend = forced === 'wasm' ? 'wasm' : 'webgpu';
+    let lastError;
+    for (const source of UGOIRA_TWEEN_SOURCES) {
+      try {
+        const ort = await import(source.ort + 'ort.min.mjs');
+        ort.env.wasm.wasmPaths = source.ort;
+        ort.env.wasm.numThreads = 1;
+        const bytes = await tweenModelBytes(source);
+        tweenEngine.session = await ort.InferenceSession.create(bytes, {
+          executionProviders: [backend], graphOptimizationLevel: 'all'
+        });
+        tweenEngine.ort = ort;
+        tweenEngine.backend = backend;
+        tweenEngine.source = source.name;
+        return;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError || new Error('補間エンジンを開けません');
+  }
+
   function ensureTweenEngine() {
-    if (tweenEngine.ready) return tweenEngine.ready;
-    tweenEngine.ready = new Promise((resolve, reject) => {
-      const origin = new URL(tweenEngine.url).origin;
-      const frame = document.createElement('iframe');
-      frame.setAttribute('aria-hidden', 'true');
-      frame.style.cssText =
-        'position:fixed;width:1px;height:1px;left:-10px;top:-10px;' +
-        'border:0;opacity:0;pointer-events:none';
-      const timer = setTimeout(
-        () => reject(new Error('補間エンジンが応答しません')), 20000
-      );
-      window.addEventListener('message', event => {
-        if (event.source !== frame.contentWindow ||
-            event.origin !== origin) return;
-        const data = event.data;
-        if (data?.type === 'pts-interp-ready') {
-          clearTimeout(timer);
-          resolve(frame);
-        } else if (data?.type === 'pts-interp-reply') {
-          const done = tweenEngine.pending.get(data.id);
-          tweenEngine.pending.delete(data.id);
-          done?.(data);
-        }
+    if (!tweenEngine.ready) {
+      tweenEngine.loading = true;
+      tweenEngine.ready = tweenOpen().finally(() => {
+        tweenEngine.loading = false;
       });
-      frame.src = tweenEngine.url;
-      tweenEngine.frame = frame;
-      document.documentElement.appendChild(frame);
-    });
+    }
     return tweenEngine.ready;
   }
 
-  async function tweenCall(message) {
-    const frame = await ensureTweenEngine();
-    const origin = new URL(tweenEngine.url).origin;
-    const reply = await new Promise(resolve => {
-      const id = ++tweenEngine.seq;
-      tweenEngine.pending.set(id, resolve);
-      frame.contentWindow.postMessage(
-        { type: 'pts-interp', id, ...message }, origin
+  // 画像を計算用の大きさに縮め、モデル入力（R,G,Bの面を並べた0..1の値）にする。
+  // 余白は端の画素を繰り返して埋める。
+  async function tweenPack(key, blob) {
+    const hit = tweenEngine.packed.get(key);
+    if (hit) return hit;
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const scale = Math.min(
+        1, UGOIRA_TWEEN_MAX_SIDE / Math.max(bitmap.width, bitmap.height)
       );
-    });
-    if (!reply.ok) throw new Error(reply.error || '補間に失敗しました');
-    return reply;
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+      const up = v => Math.ceil(v / UGOIRA_TWEEN_ALIGN) * UGOIRA_TWEEN_ALIGN;
+      const pw = up(w), ph = up(h), plane = pw * ph;
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bitmap, 0, 0, w, h);
+      const rgba = ctx.getImageData(0, 0, w, h).data;
+      const data = new Float32Array(plane * 3);
+      const step = Math.max(1, Math.floor(Math.max(w, h) / 64));
+      const luma = [];
+      for (let y = 0; y < ph; y++) {
+        const sy = Math.min(y, h - 1);
+        for (let x = 0; x < pw; x++) {
+          const from = (sy * w + Math.min(x, w - 1)) * 4, at = y * pw + x;
+          const r = rgba[from] / 255, g = rgba[from + 1] / 255,
+            b = rgba[from + 2] / 255;
+          data[at] = r; data[plane + at] = g; data[2 * plane + at] = b;
+          if (y < h && x < w && y % step === 0 && x % step === 0) {
+            luma.push(0.299 * r + 0.587 * g + 0.114 * b);
+          }
+        }
+      }
+      const entry = { width: bitmap.width, height: bitmap.height,
+        w, h, pw, ph, data, luma };
+      tweenEngine.packed.set(key, entry);
+      while (tweenEngine.packed.size > 3) {
+        tweenEngine.packed.delete(tweenEngine.packed.keys().next().value);
+      }
+      return entry;
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  function tweenUnpack(out, a) {
+    const { w, h, pw, ph } = a, plane = pw * ph;
+    const image = new ImageData(w, h), px = image.data;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const at = y * pw + x, to = (y * w + x) * 4;
+        px[to] = out[at] * 255 + 0.5;
+        px[to + 1] = out[plane + at] * 255 + 0.5;
+        px[to + 2] = out[2 * plane + at] * 255 + 0.5;
+        px[to + 3] = 255;
+      }
+    }
+    const small = new OffscreenCanvas(w, h);
+    small.getContext('2d').putImageData(image, 0, 0);
+    // 再生側のcanvasは元コマの大きさなので、同じ大きさに戻して返す。
+    let canvas = small;
+    if (w !== a.width || h !== a.height) {
+      canvas = new OffscreenCanvas(a.width, a.height);
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(small, 0, 0, a.width, a.height);
+    }
+    return canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
+  }
+
+  // 2コマの中間コマをJPEGのBlobで返す。補間しない場合はnull。
+  // モデルの実行は重ねられないので、1件ずつ順に処理する。
+  function tweenBetween(aKey, aBlob, bKey, bBlob) {
+    const run = async () => {
+      const started = performance.now();
+      const a = await tweenPack(aKey, aBlob);
+      const b = await tweenPack(bKey, bBlob);
+      if (a.width !== b.width || a.height !== b.height) return null;
+      const n = Math.min(a.luma.length, b.luma.length);
+      let diff = 0;
+      for (let i = 0; i < n; i++) diff += Math.abs(a.luma[i] - b.luma[i]);
+      diff = n ? diff / n : 0;
+      if (diff < UGOIRA_TWEEN_SAME || diff > UGOIRA_TWEEN_CUT) return null;
+      await ensureTweenEngine();
+      const { ort, session } = tweenEngine;
+      const dims = [1, 3, a.ph, a.pw];
+      const result = await session.run({
+        img0: new ort.Tensor('float32', a.data, dims),
+        img1: new ort.Tensor('float32', b.data, dims),
+        timestep: new ort.Tensor('float32', new Float32Array([0.5]), [1])
+      });
+      const blob = await tweenUnpack(await result.output.getData(), a);
+      result.output.dispose?.();
+      tweenEngine.lastMs = Math.round(performance.now() - started);
+      tweenEngine.lastWork = `${a.w}x${a.h}`;
+      return blob;
+    };
+    const task = tweenEngine.chain.then(run);
+    tweenEngine.chain = task.catch(() => {});
+    return task;
   }
 
   function dropUgoiraTween(s) {
@@ -858,8 +998,7 @@
   function updateTweenButton(s) {
     const btn = s?.tweenBtn;
     if (!btn) return;
-    if (!ugoiraTweenAvailable() || s.kind !== 'ugoira' ||
-        !s.frameUrls?.length) {
+    if (s.kind !== 'ugoira' || !s.frameUrls?.length) {
       btn.hidden = true;
       return;
     }
@@ -870,10 +1009,12 @@
     else if (tweenEngine.error) text = 'コマ補間 不可';
     else if (s.tweenNote) text = `コマ補間 ${s.tweenNote}`;
     else if (ugoiraTweenActive(s)) text = 'コマ補間 ON';
+    else if (tweenEngine.loading) text = 'コマ補間 AI読込中…';
     else if (tween && tween.source === s.frameUrls) {
       text = `コマ補間 準備中 ${tween.next}/${tween.source.length}`;
     } else text = 'コマ補間 準備中';
     btn.textContent = text;
+    btn.title = tweenEngine.error || '';
     btn.classList.toggle('pts-tween-on', ugoiraTweenActive(s));
   }
 
@@ -888,6 +1029,11 @@
     const next = !ugoiraTweenEnabled();
     try { localStorage.setItem(UGOIRA_TWEEN_KEY, next ? 'on' : 'off'); }
     catch {}
+    if (next && tweenEngine.error) {
+      // 押し直したら読み込みからやり直す（通信失敗などの一時的な原因に備える）。
+      tweenEngine.error = '';
+      tweenEngine.ready = null;
+    }
     restartUgoiraKeepingPosition(s);
     if (next) void buildUgoiraTween(s);
     updateTweenButton(s);
@@ -929,23 +1075,21 @@
     s.tweenRunning = true;
     updateTweenButton(s);
     try {
-      const init = await tweenCall({ cmd: 'init' });
-      tweenEngine.backend = init.backend || '';
+      const opening = ensureTweenEngine();
+      updateTweenButton(s);
+      await opening;
+      updateTweenButton(s);
       while (tween.next < count && valid()) {
         const i = tween.next, j = (i + 1) % count;
         const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
         if (delay >= UGOIRA_TWEEN_MIN_DELAY) {
-          const reply = await tweenCall({
-            cmd: 'tween', t: 0.5, maxSide: UGOIRA_TWEEN_MAX_SIDE,
-            aKey: `${s.id}:${i}`, a: await blobOf(i),
-            bKey: `${s.id}:${j}`, b: await blobOf(j)
-          });
+          const blob = await tweenBetween(
+            `${s.id}:${count}:${i}`, await blobOf(i),
+            `${s.id}:${count}:${j}`, await blobOf(j)
+          );
           if (s.tween !== tween || s.frameUrls !== source) return;
-          if (reply.blob) {
-            tween.urls[i] = URL.createObjectURL(reply.blob);
-            tweenEngine.lastMs = reply.ms || 0;
-            tweenEngine.lastWork = reply.work || '';
-            tweenEngine.backend = reply.backend || tweenEngine.backend;
+          if (blob) {
+            tween.urls[i] = URL.createObjectURL(blob);
             tweenEngine.made++;
           } else {
             tweenEngine.skipped++;
@@ -953,6 +1097,8 @@
         }
         tween.next = i + 1;
         updateTweenButton(s);
+        // 画面の描画と操作に順番を返す。
+        await new Promise(resolve => setTimeout(resolve, 0));
       }
       if (tween.next < count || s.tween !== tween) return;
       // 元コマの表示時間を半分ずつに分け、後半を中間コマに割り当てる。合計時間は変えない。
@@ -978,16 +1124,16 @@
       console.warn('[PTS] コマ補間を停止:', tweenEngine.error);
     } finally {
       s.tweenRunning = false;
+      tweenEngine.packed.clear();
       updateTweenButton(s);
     }
   }
 
   function ugoiraTweenDiagnosticText() {
-    if (!ugoiraTweenAvailable()) {
-      return 'コマ補間: エンジンなし（拡張機能版でのみ有効）';
-    }
     return `コマ補間: ${ugoiraTweenEnabled() ? 'ON' : 'OFF'}` +
+      ` / 取得元=${tweenEngine.source || (tweenBundled ? '同梱(未起動)' : '配信サーバー(未起動)')}` +
       ` / 実行=${tweenEngine.backend || '未起動'}` +
+      ` / WebGPU=${navigator.gpu ? 'あり' : 'なし'}` +
       ` / 直近=${tweenEngine.lastMs}ms (${tweenEngine.lastWork || '-'})` +
       ` / 生成${tweenEngine.made} 見送り${tweenEngine.skipped}` +
       (tweenEngine.error ? ` / エラー=${tweenEngine.error}` : '');
@@ -1295,7 +1441,7 @@
     sec.appendChild(status);
     s.ugoiraStatusEl = status;
 
-    if (ugoiraTweenAvailable()) {
+    {
       const tweenBtn = document.createElement('button');
       tweenBtn.type = 'button';
       tweenBtn.className = 'pts-tween-btn';

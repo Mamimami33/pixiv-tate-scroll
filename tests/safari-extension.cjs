@@ -16,7 +16,7 @@ const source = fs.readFileSync(path.join(root, 'pixiv-tate-scroll.user.js'), 'ut
 assert.equal(manifest.version, source.match(/@version\s+(\S+)/)[1], 'version matches userscript');
 assert.equal(fs.readFileSync(path.join(ext, 'content.js'), 'utf8'), source, 'content.js is the userscript');
 for (const file of Object.values(manifest.icons)) assert(fs.existsSync(path.join(ext, file)), file);
-for (const file of ['bridge.js', 'engine/engine.html', 'engine/engine.js', 'engine/rife-4.25-fp32.onnx', 'engine/ort/ort.min.mjs', 'engine/ort/ort-wasm-simd-threaded.jsep.wasm']) assert(fs.existsSync(path.join(ext, file)), file);
+for (const file of ['bridge.js', 'engine/rife-4.25-fp32.onnx', 'engine/ort/ort.min.mjs', 'engine/ort/ort-wasm-simd-threaded.jsep.wasm']) assert(fs.existsSync(path.join(ext, file)), file);
 
 (async () => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'pts-ext-'));

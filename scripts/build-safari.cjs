@@ -1,5 +1,5 @@
 // Run: npm install && node scripts/build-safari.cjs
-// ユーザースクリプト本体と補間エンジンを Safari Web Extension の形に組み立てて
+// ユーザースクリプト本体とAIコマ補間のファイルを Safari Web Extension の形に組み立てて
 // dist/safari-extension/ に出力する。
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -41,9 +41,8 @@ if (crypto.createHash('sha256').update(modelBytes).digest('hex') !== model.sha25
 fs.rmSync(out, { recursive: true, force: true });
 fs.mkdirSync(path.join(out, 'engine', 'ort'), { recursive: true });
 fs.cpSync(path.join(src, 'icons'), path.join(out, 'icons'), { recursive: true });
-fs.cpSync(path.join(src, 'engine'), path.join(out, 'engine'), { recursive: true });
 fs.copyFileSync(path.join(src, 'bridge.js'), path.join(out, 'bridge.js'));
-// 補間エンジンが使う実行ライブラリ(WebGPU/WASM)とAIモデル。合わせて約50MB。
+// コマ補間が使う実行ライブラリ(WebGPU/WASM)とAIモデル。合わせて約50MB。
 for (const file of ['ort.min.mjs', 'ort-wasm-simd-threaded.jsep.mjs', 'ort-wasm-simd-threaded.jsep.wasm']) {
   fs.copyFileSync(path.join(ortDist, file), path.join(out, 'engine', 'ort', file));
 }

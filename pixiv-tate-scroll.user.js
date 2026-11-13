@@ -769,16 +769,17 @@
 
   /* ---------- うごイラのAIコマ補間 ---------- */
 
-  // 前後のコマからAI(RIFE 4.25)で中間のコマを作り、約60fpsになるまでコマを増やして再生する。
+  // 前後のコマからAI(RIFE 4.25)で中間のコマを作り、最大100fpsになるまでコマを増やして再生する。
   // AIモデルと実行ライブラリ(onnxruntime-web)は初めて使うときに読み込む。
   // ユーザースクリプト版は配信サーバーから取得し（合計約50MB、2回目以降は端末に保存した
   // ものを使う）、Safari拡張機能版は同梱のファイルを使う。
   const UGOIRA_TWEEN_KEY = 'PTS_UGOIRA_TWEEN_V1';
   const UGOIRA_TWEEN_BACKEND_KEY = 'PTS_UGOIRA_TWEEN_BACKEND'; // 検証用。'wasm'でCPU実行を強制
   const UGOIRA_TWEEN_MAX_SIDE = 640;   // 補間計算をする解像度の上限（長辺px）
-  const UGOIRA_TWEEN_TARGET_FPS = 60;  // この滑らかさになるまで中間コマを増やす
-  const UGOIRA_TWEEN_MAX_FACTOR = 8;   // 1つのコマ間を最大何分割するか（遅い作品の上限）
-  const UGOIRA_TWEEN_MAX_TWEENS = 480; // 1作品で作る中間コマの上限（待ち時間とメモリ）
+  const UGOIRA_TWEEN_TARGET_FPS = 100; // この滑らかさになるまで中間コマを増やす
+  const UGOIRA_TWEEN_FPS_KEY = 'PTS_UGOIRA_TWEEN_FPS'; // 検証用。目標fpsを数値で強制
+  const UGOIRA_TWEEN_MAX_FACTOR = 12;  // 1つのコマ間を最大何分割するか（遅い作品の上限）
+  const UGOIRA_TWEEN_MAX_TWEENS = 720; // 1作品で作る中間コマの上限（待ち時間とメモリ）
   const UGOIRA_TWEEN_MAX_FRAMES = 240; // これより長い作品は補間しない（待ち時間とメモリ）
   const UGOIRA_TWEEN_ALIGN = 64;       // モデルが要求する辺の倍数
   const UGOIRA_TWEEN_CUT = 0.16;       // これより差が大きい2コマは場面転換とみなして補間しない
@@ -1059,10 +1060,35 @@
     updateTweenButton(s);
   }
 
-  // コマ間を何分割するか。表示時間が1/60秒の何倍かで決める（1なら補間しない）。
-  function tweenFactor(delay) {
+  // 画面が1秒に何回描き直されるかを測る（60Hzの画面なら60）。これを超えるコマは
+  // 作っても表示されないので、目標fpsの上限にする。
+  let displayHz = 60;
+  (() => {
+    const times = [];
+    const step = now => {
+      times.push(now);
+      if (times.length < 40) { requestAnimationFrame(step); return; }
+      const gaps = times.slice(1).map((v, i) => v - times[i]).sort((a, b) => a - b);
+      const hz = 1000 / gaps[gaps.length >> 1];
+      if (hz > 0) {
+        displayHz = [60, 90, 120, 144, 165, 240].reduce(
+          (best, v) => Math.abs(hz - v) < Math.abs(hz - best) ? v : best
+        );
+      }
+    };
+    requestAnimationFrame(step);
+  })();
+
+  function tweenTargetFps() {
+    let forced = 0;
+    try { forced = Number(localStorage.getItem(UGOIRA_TWEEN_FPS_KEY)) || 0; } catch {}
+    return forced > 0 ? forced : Math.min(UGOIRA_TWEEN_TARGET_FPS, displayHz);
+  }
+
+  // コマ間を何分割するか。表示時間が目標の1コマ時間の何倍かで決める（1なら補間しない）。
+  function tweenFactor(delay, fps = tweenTargetFps()) {
     return Math.max(1, Math.min(UGOIRA_TWEEN_MAX_FACTOR,
-      Math.round(delay * UGOIRA_TWEEN_TARGET_FPS / 1000)));
+      Math.round(delay * fps / 1000)));
   }
 
   function ugoiraDelay(frame) {
@@ -1071,7 +1097,7 @@
 
   // 作る順番。まず全コマ間の真ん中、次にその間…と粗い順に並べるので、
   // 途中まででも全体が均等に滑らかになる。上限を超える分は細かい側から省く。
-  function tweenTasks(frames) {
+  function tweenTasks(factors) {
     const levels = [];
     const split = (i, n, lo, hi, depth) => {
       if (hi - lo < 2) return;
@@ -1080,8 +1106,7 @@
       split(i, n, lo, mid, depth + 1);
       split(i, n, mid, hi, depth + 1);
     };
-    frames.forEach((frame, i) => split(i, tweenFactor(ugoiraDelay(frame)), 0,
-      tweenFactor(ugoiraDelay(frame)), 0));
+    factors.forEach((n, i) => split(i, n, 0, n, 0));
     return levels.flat().slice(0, UGOIRA_TWEEN_MAX_TWEENS);
   }
 
@@ -1097,7 +1122,7 @@
     const playUrls = [], playFrames = [];
     for (let i = 0; i < source.length; i++) {
       const delay = ugoiraDelay(frames[i]);
-      const n = tweenFactor(delay);
+      const n = tween.factors[i];
       const steps = [0, ...[...tween.subs[i].keys()].sort((a, b) => a - b), n];
       for (let m = 0; m + 1 < steps.length; m++) {
         playUrls.push(m ? tween.subs[i].get(steps[m]) : source[i]);
@@ -1131,7 +1156,10 @@
     if (s.tween && s.tween.source !== s.frameUrls) dropUgoiraTween(s);
     if (s.tween?.done) return;
     s.tweenNote = '';
-    const tasks = s.tween?.tasks || tweenTasks(frames);
+    // 分割数は作り始めに決めて覚えておく（途中で目標が変わっても一覧と食い違わないように）。
+    const factors = s.tween?.factors ||
+      frames.map(frame => tweenFactor(ugoiraDelay(frame)));
+    const tasks = s.tween?.tasks || tweenTasks(factors);
     if (count < 2 || count > UGOIRA_TWEEN_MAX_FRAMES || !tasks.length ||
         !s.frameUrls.every(url => url?.startsWith('blob:'))) {
       s.tweenNote = count > UGOIRA_TWEEN_MAX_FRAMES ? '対象外(長い)' : '対象外';
@@ -1139,7 +1167,7 @@
       return;
     }
     if (!s.tween) {
-      s.tween = { source: s.frameUrls, tasks, next: 0, gen: 0, done: false,
+      s.tween = { source: s.frameUrls, factors, tasks, next: 0, gen: 0, done: false,
         subs: Array.from({ length: count }, () => new Map()),
         skip: new Set(), playUrls: null, playFrames: null };
     }
@@ -1222,6 +1250,7 @@
     return `コマ補間: ${ugoiraTweenEnabled() ? 'ON' : 'OFF'}` +
       ` / 取得元=${tweenEngine.source || (tweenBundled ? '同梱(未起動)' : '配信サーバー(未起動)')}` +
       ` / 実行=${tweenEngine.backend || '未起動'}` +
+      ` / 画面=${displayHz}Hz 目標=${tweenTargetFps()}fps` +
       ` / WebGPU=${navigator.gpu ? 'あり' : 'なし'}` +
       ` / 直近=${tweenEngine.lastMs}ms (${tweenEngine.lastWork || '-'})` +
       ` / 生成${tweenEngine.made} 見送り${tweenEngine.skipped}` +

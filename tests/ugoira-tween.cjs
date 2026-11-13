@@ -18,7 +18,7 @@ const { chromium } = require('playwright');
 const root = path.join(__dirname, '..');
 const ext = path.join(root, 'dist/safari-extension');
 const SIZE = 128, FRAMES = 6, DELAY = 100;
-// 100ms間隔(10fps)は60fpsにするために1コマ間を6分割する。つまり中間コマは5枚ずつ。
+// テスト環境の画面は60Hzなので目標は60fpsになり、100ms間隔(10fps)は1コマ間を6分割する。つまり中間コマは5枚ずつ。
 const STEPS = 6;
 
 function zipStored(files) {
@@ -147,6 +147,34 @@ async function checkTween(page, name, size = SIZE) {
 
 const forceWasm = () => { try { localStorage.setItem('PTS_UGOIRA_TWEEN_BACKEND', 'wasm'); } catch {} };
 
+// 目標fpsと分割数の決め方。100fpsを目標に、画面の更新回数を上限にする。
+async function factorUnit() {
+  const browser = await chromium.launch({ args: ['--no-sandbox'] });
+  try {
+    const context = await browser.newContext();
+    await mockPixiv(context, () => Buffer.alloc(0));
+    const page = await context.newPage();
+    await page.goto('https://www.pixiv.net/blank-for-unit');
+    await page.addScriptTag({ content: source.replace(/\}\)\(\);\s*$/, 'window.__tween = { tweenFactor, tweenTasks, tweenTargetFps, hz: () => displayHz };})();') });
+    await page.waitForTimeout(1200);
+    const got = await page.evaluate(() => ({
+      hz: __tween.hz(), target: __tween.tweenTargetFps(),
+      at100: [100, 50, 20, 12, 200].map(d => __tween.tweenFactor(d, 100)),
+      at60: [100, 50, 20, 12, 200].map(d => __tween.tweenFactor(d, 60)),
+      order: __tween.tweenTasks([10, 1, 4]).map(t => `${t.i}:${t.k}/${t.n}`),
+    }));
+    assert.equal(got.hz, 60, 'テスト環境の画面は60Hz');
+    assert.equal(got.target, 60, '60Hzの画面では60fpsを上限にする');
+    assert.deepEqual(got.at100, [10, 5, 2, 1, 12], '100fps目標: 100msは10分割、遅い作品は12分割まで');
+    assert.deepEqual(got.at60, [6, 3, 1, 1, 12], '60fps目標: 100msは6分割');
+    assert.deepEqual(got.order.slice(0, 2), ['0:5/10', '2:2/4'], 'まず各コマ間の真ん中から作る');
+    assert.equal(got.order.length, 9 + 3, '10分割は9枚、4分割は3枚、1分割は0枚');
+    console.log('ugoira-tween factor: ok');
+  } finally {
+    await browser.close();
+  }
+}
+
 async function userscriptMode() {
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
   try {
@@ -274,6 +302,7 @@ async function extensionMode() {
 }
 
 (async () => {
+  await factorUnit();
   await userscriptMode();
   await hiResMode();
   await extensionMode();

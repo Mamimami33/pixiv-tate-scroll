@@ -5,7 +5,7 @@
 //                 unpkgへの切り替えも確認する）
 //   extension:  ビルドした拡張機能をChromiumに読み込み、同梱のファイルを使う
 // 赤い玉が横に動く6コマのうごイラを用意し、再生中のcanvasに映る玉の位置の種類を数える。
-// 補間ONなら元の6か所に中間の6か所が加わり、OFFなら6か所に戻る。
+// 補間ONなら元の6か所の間が約60fps相当の細かさで埋まり、OFFなら6か所に戻る。
 // Chromiumの自動テストではGPUが使えないため、検証用の設定でWASM(CPU)実行に切り替える。
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -17,7 +17,9 @@ const { chromium } = require('playwright');
 
 const root = path.join(__dirname, '..');
 const ext = path.join(root, 'dist/safari-extension');
-const SIZE = 128, FRAMES = 6, DELAY = 200;
+const SIZE = 128, FRAMES = 6, DELAY = 100;
+// 100ms間隔(10fps)は60fpsにするために1コマ間を6分割する。つまり中間コマは5枚ずつ。
+const STEPS = 6;
 
 function zipStored(files) {
   const locals = [], centrals = [];
@@ -99,7 +101,7 @@ async function makeZip(context, SIZE = 128) {
 // 再生中のcanvasを一定時間見て、赤い玉の位置(横方向の重心)を集める。
 const positions = (page, SIZE = 128) => page.evaluate(async ({ SIZE }) => {
   const seen = new Set();
-  const end = performance.now() + 2600;
+  const end = performance.now() + 3200;
   while (performance.now() < end) {
     const canvas = document.querySelector('.pts-current .pts-ugoira-canvas');
     if (canvas?.width === SIZE) {
@@ -109,7 +111,7 @@ const positions = (page, SIZE = 128) => page.evaluate(async ({ SIZE }) => {
         const p = (y * SIZE + x) * 4;
         if (d[p] > 150 && d[p + 1] < 80 && d[p + 2] < 80) { sum += x; n++; }
       }
-      if (n > 50) seen.add(Math.round(sum / n / SIZE * 50) / 50);
+      if (n > 50) seen.add(Math.round(sum / n / SIZE * 200) / 200);
     }
     await new Promise(r => requestAnimationFrame(r));
   }
@@ -127,9 +129,12 @@ async function checkTween(page, name, size = SIZE) {
   assert.equal(await label(page), 'コマ補間 ON', `${name}: ${await button.getAttribute('title')}`);
   const on = await positions(page, size);
   if (process.env.PTS_SHOT) await page.screenshot({ path: process.env.PTS_SHOT });
-  assert(on.length >= FRAMES * 2 - 2, `${name}: 補間ONで中間位置が増える: ${on}`);
+  // 最後→最初の継ぎ目は場面転換扱いで補間しないので、対象は FRAMES-1 個のコマ間。
+  const expected = FRAMES + (FRAMES - 1) * (STEPS - 1);
+  assert(on.length >= expected - 4, `${name}: 60fps相当まで中間位置が増える(${expected}か所前後): ${on}`);
   const gaps = on.slice(1).map((v, i) => v - on[i]);
-  assert(Math.max(...gaps.slice(0, FRAMES * 2 - 3)) <= 0.09, `${name}: 玉がコマ間の中間に描かれている: ${on}`);
+  // 元のコマ同士は0.12離れている。6分割なら隣との差は約0.02。
+  assert(Math.max(...gaps) <= 0.045, `${name}: 玉がコマ間に均等に描かれている: ${on}`);
   await button.click();
   assert.equal(await label(page), 'コマ補間 OFF');
   await page.waitForTimeout(300);

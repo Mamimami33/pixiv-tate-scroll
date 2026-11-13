@@ -598,7 +598,7 @@
     if (!player || !urls?.length) return;
     const i = (index + urls.length) % urls.length;
     if (player.ready.has(i) || player.loading.has(i)) return;
-    if (player.loading.size >= UGOIRA_DECODE_AHEAD + 1) return;
+    if (player.loading.size >= ugoiraDecodeAhead(s) + 1) return;
     const url = urls[i];
     if (!url) return;
     const img = new Image();
@@ -617,7 +617,7 @@
         player.ready.delete(i);
         player.ready.set(i, img);
         if (s.seekDragging && s.animIdx === i) renderUgoiraFrame(s, i);
-        while (player.ready.size > UGOIRA_DECODE_LIMIT) {
+        while (player.ready.size > ugoiraDecodeAhead(s) * 2) {
           const victim = [...player.ready.keys()].find(
             key => key !== player.displayed
           );
@@ -712,7 +712,7 @@
       player.elapsed=elapsed % total;
       const index=ugoiraFrameAt(timeline,player.elapsed);
       queueUgoiraFrame(s,index);
-      for(let n=1;n<=UGOIRA_DECODE_AHEAD;n++) queueUgoiraFrame(s,index+n);
+      for(let n=1,m=ugoiraDecodeAhead(s);n<=m;n++) queueUgoiraFrame(s,index+n);
       if(player.ready.has(index)&&player.displayed!==index)renderUgoiraFrame(s,index);
       const pct=timeline[index]/total*100;
       if(s.seekFill)s.seekFill.style.width=pct+'%';
@@ -767,14 +767,16 @@
 
   /* ---------- うごイラのAIコマ補間 ---------- */
 
-  // 前後のコマからAI(RIFE 4.25)で中間のコマを作り、コマ数を2倍にして再生する。
+  // 前後のコマからAI(RIFE 4.25)で中間のコマを作り、約60fpsになるまでコマを増やして再生する。
   // AIモデルと実行ライブラリ(onnxruntime-web)は初めて使うときに読み込む。
   // ユーザースクリプト版は配信サーバーから取得し（合計約50MB、2回目以降は端末に保存した
   // ものを使う）、Safari拡張機能版は同梱のファイルを使う。
   const UGOIRA_TWEEN_KEY = 'PTS_UGOIRA_TWEEN_V1';
   const UGOIRA_TWEEN_BACKEND_KEY = 'PTS_UGOIRA_TWEEN_BACKEND'; // 検証用。'wasm'でCPU実行を強制
   const UGOIRA_TWEEN_MAX_SIDE = 640;   // 補間計算をする解像度の上限（長辺px）
-  const UGOIRA_TWEEN_MIN_DELAY = 34;   // これより短いコマ間は既に十分滑らかなので補間しない
+  const UGOIRA_TWEEN_TARGET_FPS = 60;  // この滑らかさになるまで中間コマを増やす
+  const UGOIRA_TWEEN_MAX_FACTOR = 8;   // 1つのコマ間を最大何分割するか（遅い作品の上限）
+  const UGOIRA_TWEEN_MAX_TWEENS = 480; // 1作品で作る中間コマの上限（待ち時間とメモリ）
   const UGOIRA_TWEEN_MAX_FRAMES = 240; // これより長い作品は補間しない（待ち時間とメモリ）
   const UGOIRA_TWEEN_ALIGN = 64;       // モデルが要求する辺の倍数
   const UGOIRA_TWEEN_CUT = 0.16;       // これより差が大きい2コマは場面転換とみなして補間しない
@@ -821,6 +823,11 @@
   // 再生に使うコマ一覧。補間済みなら中間コマを挟んだ一覧を返す。
   function ugoiraPlayUrls(s) {
     return ugoiraTweenActive(s) ? s.tween.playUrls : s.frameUrls;
+  }
+
+  // コマが細かいほど先読みを深くして、デコードが再生に追いつくようにする。
+  function ugoiraDecodeAhead(s) {
+    return ugoiraTweenActive(s) ? UGOIRA_DECODE_AHEAD * 3 : UGOIRA_DECODE_AHEAD;
   }
 
   function ugoiraPlayFrames(s) {
@@ -960,9 +967,9 @@
     return canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
   }
 
-  // 2コマの中間コマをJPEGのBlobで返す。補間しない場合はnull。
+  // 2コマの間の位置t(0..1)のコマをJPEGのBlobで返す。補間しない場合はnull。
   // モデルの実行は重ねられないので、1件ずつ順に処理する。
-  function tweenBetween(aKey, aBlob, bKey, bBlob) {
+  function tweenBetween(aKey, aBlob, bKey, bBlob, t) {
     const run = async () => {
       const started = performance.now();
       const a = await tweenPack(aKey, aBlob);
@@ -979,7 +986,7 @@
       const result = await session.run({
         img0: new ort.Tensor('float32', a.data, dims),
         img1: new ort.Tensor('float32', b.data, dims),
-        timestep: new ort.Tensor('float32', new Float32Array([0.5]), [1])
+        timestep: new ort.Tensor('float32', new Float32Array([t]), [1])
       });
       const blob = await tweenUnpack(await result.output.getData(), a);
       result.output.dispose?.();
@@ -998,7 +1005,9 @@
     s.tween = null;
     // 表示中のコマがまだ参照していることがあるので遅らせて解放する。
     setTimeout(() => {
-      for (const url of tween.urls) if (url) URL.revokeObjectURL(url);
+      for (const subs of tween.subs) {
+        for (const url of subs.values()) URL.revokeObjectURL(url);
+      }
     }, 5000);
   }
 
@@ -1018,7 +1027,7 @@
     else if (s.tween?.done && ugoiraTweenActive(s)) text = 'コマ補間 ON';
     else if (tweenEngine.loading) text = 'コマ補間 AI読込中…';
     else if (tween && tween.source === s.frameUrls) {
-      text = `コマ補間 準備中 ${tween.next}/${tween.source.length}`;
+      text = `コマ補間 準備中 ${tween.next}/${tween.tasks.length}`;
     } else text = 'コマ補間 準備中';
     btn.textContent = text;
     btn.title = tweenEngine.error || '';
@@ -1046,24 +1055,50 @@
     updateTweenButton(s);
   }
 
-  // できている中間コマだけを挟んだ再生用の一覧を作る。元コマの表示時間を半分ずつに分け、
-  // 後半を中間コマに割り当てるので、合計時間は変わらない。
+  // コマ間を何分割するか。表示時間が1/60秒の何倍かで決める（1なら補間しない）。
+  function tweenFactor(delay) {
+    return Math.max(1, Math.min(UGOIRA_TWEEN_MAX_FACTOR,
+      Math.round(delay * UGOIRA_TWEEN_TARGET_FPS / 1000)));
+  }
+
+  function ugoiraDelay(frame) {
+    return Number(frame?.delay) > 0 ? Number(frame.delay) : 100;
+  }
+
+  // 作る順番。まず全コマ間の真ん中、次にその間…と粗い順に並べるので、
+  // 途中まででも全体が均等に滑らかになる。上限を超える分は細かい側から省く。
+  function tweenTasks(frames) {
+    const levels = [];
+    const split = (i, n, lo, hi, depth) => {
+      if (hi - lo < 2) return;
+      const mid = Math.round((lo + hi) / 2);
+      (levels[depth] ||= []).push({ i, k: mid, n });
+      split(i, n, lo, mid, depth + 1);
+      split(i, n, mid, hi, depth + 1);
+    };
+    frames.forEach((frame, i) => split(i, tweenFactor(ugoiraDelay(frame)), 0,
+      tweenFactor(ugoiraDelay(frame)), 0));
+    return levels.flat().slice(0, UGOIRA_TWEEN_MAX_TWEENS);
+  }
+
+  // できている中間コマだけを挟んだ再生用の一覧を作る。元コマの表示時間を位置に応じて
+  // 分け合うので、合計時間は変わらない。
   function rebuildTweenPlayList(s, tween) {
     const frames = s.frames, source = tween.source;
-    if (!tween.urls.some(Boolean) || frames?.length !== source.length) {
+    if (!tween.subs.some(subs => subs.size) ||
+        frames?.length !== source.length) {
       tween.playUrls = tween.playFrames = null;
       return;
     }
     const playUrls = [], playFrames = [];
     for (let i = 0; i < source.length; i++) {
-      const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
-      if (tween.urls[i]) {
-        const first = Math.floor(delay / 2);
-        playUrls.push(source[i], tween.urls[i]);
-        playFrames.push({ delay: first }, { delay: delay - first });
-      } else {
-        playUrls.push(source[i]);
-        playFrames.push({ delay });
+      const delay = ugoiraDelay(frames[i]);
+      const n = tweenFactor(delay);
+      const steps = [0, ...[...tween.subs[i].keys()].sort((a, b) => a - b), n];
+      for (let m = 0; m + 1 < steps.length; m++) {
+        playUrls.push(m ? tween.subs[i].get(steps[m]) : source[i]);
+        // 整数に丸めると16msと17msが混ざり、60Hzの画面で短いほうが飛ばされるので丸めない。
+        playFrames.push({ delay: delay * (steps[m + 1] - steps[m]) / n });
       }
     }
     tween.playUrls = playUrls;
@@ -1074,7 +1109,7 @@
   function retargetUgoiraTween(s, urls) {
     const tween = s.tween;
     if (!tween) return;
-    if (urls.length !== tween.urls.length) {
+    if (urls.length !== tween.subs.length) {
       dropUgoiraTween(s);
       return;
     }
@@ -1092,15 +1127,17 @@
     if (s.tween && s.tween.source !== s.frameUrls) dropUgoiraTween(s);
     if (s.tween?.done) return;
     s.tweenNote = '';
-    if (count < 2 || count > UGOIRA_TWEEN_MAX_FRAMES ||
+    const tasks = s.tween?.tasks || tweenTasks(frames);
+    if (count < 2 || count > UGOIRA_TWEEN_MAX_FRAMES || !tasks.length ||
         !s.frameUrls.every(url => url?.startsWith('blob:'))) {
       s.tweenNote = count > UGOIRA_TWEEN_MAX_FRAMES ? '対象外(長い)' : '対象外';
       updateTweenButton(s);
       return;
     }
     if (!s.tween) {
-      s.tween = { source: s.frameUrls, urls: new Array(count).fill(null),
-        next: 0, gen: 0, done: false, playUrls: null, playFrames: null };
+      s.tween = { source: s.frameUrls, tasks, next: 0, gen: 0, done: false,
+        subs: Array.from({ length: count }, () => new Map()),
+        skip: new Set(), playUrls: null, playFrames: null };
     }
     const tween = s.tween;
     const valid = () => s.tween === tween && s.frameUrls === tween.source &&
@@ -1119,10 +1156,10 @@
       return cache.get(index);
     };
     // できた分から再生に反映する。切り替えのたびに一瞬デコードし直すので、間隔を空ける。
-    let shown = 0, shownAt = performance.now();
+    let shown = -1, shownAt = performance.now();
     const show = force => {
-      const made = tween.urls.filter(Boolean).length;
-      if (made === shown && !force) return;
+      const made = tween.subs.reduce((sum, subs) => sum + subs.size, 0);
+      if (made === shown) return;
       if (!force && performance.now() - shownAt < 1200) return;
       shown = made;
       shownAt = performance.now();
@@ -1136,35 +1173,36 @@
       updateTweenButton(s);
       await opening;
       updateTweenButton(s);
-      while (tween.next < count && valid()) {
-        const i = tween.next, j = (i + 1) % count;
-        const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
-        if (delay >= UGOIRA_TWEEN_MIN_DELAY) {
+      while (tween.next < tasks.length && valid()) {
+        const { i, k, n } = tasks[tween.next], j = (i + 1) % count;
+        // 場面転換などで補間しないと分かったコマ間は、残りの分割も飛ばす。
+        if (!tween.skip.has(i)) {
           const gen = tween.gen;
           const a = await blobOf(i), b = await blobOf(j);
           // 取得中に高画質版へ差し替わったら、同じコマ間を新しい画像でやり直す。
           if (gen !== tween.gen) continue;
           const blob = await tweenBetween(
             `${s.id}:${count}:${gen}:${i}`, a,
-            `${s.id}:${count}:${gen}:${j}`, b
+            `${s.id}:${count}:${gen}:${j}`, b, k / n
           );
           if (s.tween !== tween) return;
           if (blob) {
-            tween.urls[i] = URL.createObjectURL(blob);
+            tween.subs[i].set(k, URL.createObjectURL(blob));
             tweenEngine.made++;
           } else {
+            tween.skip.add(i);
             tweenEngine.skipped++;
           }
         }
-        tween.next = i + 1;
+        tween.next++;
         if (valid()) show(false);
         updateTweenButton(s);
         // 画面の描画と操作に順番を返す。
         await new Promise(resolve => setTimeout(resolve, 0));
       }
-      if (tween.next < count || s.tween !== tween) return;
+      if (tween.next < tasks.length || s.tween !== tween) return;
       tween.done = true;
-      if (!tween.urls.some(Boolean)) s.tweenNote = '対象外';
+      if (!tween.subs.some(subs => subs.size)) s.tweenNote = '対象外';
       if (valid()) show(true);
     } catch (e) {
       tweenEngine.error = e?.message || String(e);

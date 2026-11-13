@@ -3,7 +3,8 @@
 //   1. 左右の絵を作る計算(stereoWarp)を、奥行きが分かっている合成データで確かめる
 //   2. ユーザースクリプト版: 画像を許可つきで1回だけ読み、AIで奥行きを推定して左右の絵を並べる
 //   3. 配信サーバーが画素の読み取りを許可しない場合は「不可」で止まり、取り直さない
-//   4. 拡張機能版: 同梱のファイルだけで動く
+//   4. うごイラ: 全コマが立体視になり、動きも保たれる。画像の読み取りを断られる環境でも動く
+//   5. 拡張機能版: 同梱のファイルだけで動く
 // 通信は node_modules の同じファイルと、テスト用に描いた絵で代用する。
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -26,15 +27,22 @@ const works = [300, 301].map(id => ({
 }));
 
 // allowPixels=false は、配信サーバーが画素の読み取りを許可しない状態。
-async function mock(context, { allowPixels, picture }) {
+async function mock(context, { allowPixels, picture, ugoira }) {
   const seen = { pixelLoads: 0, cdn: [] };
   await context.route('https://www.pixiv.net/**', async route => {
     const url = new URL(route.request().url());
+    if (url.pathname === '/ugoira.zip') return route.fulfill({ contentType: 'application/zip', body: ugoira.zip() });
     if (!url.pathname.startsWith('/ajax/')) {
       return route.fulfill({ contentType: 'text/html', body: '<html><head><meta name="global-data" content=\'{"userData":{"id":"42"}}\'></head><body></body></html>' });
     }
+    const list = ugoira ? works.map(w => ({ ...w, illustType: 2 })) : works;
     let body = { works: [], total: 0 };
-    if (url.pathname.includes('/discovery/') || url.pathname.includes('/recommend/')) body = { thumbnails: { illust: works }, nextIds: [] };
+    if (url.pathname.endsWith('/ugoira_meta')) {
+      body = { src: 'https://www.pixiv.net/ugoira.zip', originalSrc: 'https://www.pixiv.net/ugoira.zip',
+        frames: Array.from({ length: ugoira.frames }, (_, i) => ({ file: `00000${i}.jpg`, delay: 250 })) };
+    } else if (ugoira && (url.pathname.includes('/discovery/') || url.pathname.includes('/recommend/'))) body = { thumbnails: { illust: list }, nextIds: [] };
+    else if (ugoira && /^\/ajax\/illust\/\d+$/.test(url.pathname)) body = list.find(w => w.id === url.pathname.split('/').pop()) || list[0];
+    else if (url.pathname.includes('/discovery/') || url.pathname.includes('/recommend/')) body = { thumbnails: { illust: works }, nextIds: [] };
     else if (/^\/ajax\/illust\/\d+$/.test(url.pathname)) body = works.find(w => w.id === url.pathname.split('/').pop()) || works[0];
     return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ error: false, body }) });
   });
@@ -62,10 +70,10 @@ async function mock(context, { allowPixels, picture }) {
 }
 
 // 絵: 奥へ続く床と空の手前に、赤い玉が1つある。
-async function makePicture(context) {
+async function makePicture(context, ballX = 180, type = 'image/png') {
   const page = await context.newPage();
   await page.goto('https://www.pixiv.net/blank-for-picture');
-  const b64 = await page.evaluate(() => {
+  const b64 = await page.evaluate(({ ballX, type }) => {
     const c = document.createElement('canvas'); c.width = 360; c.height = 480;
     const g = c.getContext('2d');
     const sky = g.createLinearGradient(0, 0, 0, 260); sky.addColorStop(0, '#6aa5e8'); sky.addColorStop(1, '#dfeeff');
@@ -73,17 +81,17 @@ async function makePicture(context) {
     const floor = g.createLinearGradient(0, 260, 0, 480); floor.addColorStop(0, '#b9c7a0'); floor.addColorStop(1, '#5f7a45');
     g.fillStyle = floor; g.fillRect(0, 260, 360, 220);
     for (let i = 0; i < 9; i++) { g.strokeStyle = '#4c6338'; g.beginPath(); g.moveTo(180, 260); g.lineTo(-360 + i * 135, 480); g.stroke(); }
-    const ball = g.createRadialGradient(165, 300, 10, 180, 320, 80); ball.addColorStop(0, '#ff8a80'); ball.addColorStop(1, '#b00010');
-    g.fillStyle = ball; g.beginPath(); g.arc(180, 320, 80, 0, 7); g.fill();
-    return c.toDataURL('image/png').split(',')[1];
-  });
+    const ball = g.createRadialGradient(ballX - 15, 300, 10, ballX, 320, 80); ball.addColorStop(0, '#ff8a80'); ball.addColorStop(1, '#b00010');
+    g.fillStyle = ball; g.beginPath(); g.arc(ballX, 320, 80, 0, 7); g.fill();
+    return c.toDataURL(type, 0.95).split(',')[1];
+  }, { ballX, type });
   await page.close();
   return Buffer.from(b64, 'base64');
 }
 
 // 立体視のcanvasから、左右それぞれの絵の中での赤い玉の位置(横方向の重心、0..1)を読む。
-const readHalves = page => page.evaluate(() => {
-  const canvas = document.querySelector('.pts-current .pts-stereo-canvas');
+const readHalves = (page, selector = '.pts-stereo-canvas') => page.evaluate(selector => {
+  const canvas = document.querySelector('.pts-current ' + selector);
   if (!canvas) return null;
   const d = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
   const half = Math.round(canvas.width / 2.04), gap = canvas.width - half * 2;
@@ -98,9 +106,32 @@ const readHalves = page => page.evaluate(() => {
   let empty = 0;
   for (let i = 3; i < d.length; i += 4) if (d[i] !== 255) empty++;
   return { mode: canvas.dataset.mode, width: canvas.width, height: canvas.height, left: centroid(0), right: centroid(half + gap), empty };
-});
+}, selector);
 
 const label = page => page.locator('.pts-current .pts-stereo-btn').textContent();
+function zipStored(files) {
+  const locals = [], centrals = [];
+  let offset = 0;
+  for (const { name, data } of files) {
+    const n = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4);
+    local.writeUInt32LE(data.length, 18); local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(n.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6);
+    central.writeUInt32LE(data.length, 20); central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(n.length, 28); central.writeUInt32LE(offset, 42);
+    locals.push(local, n, data); centrals.push(central, n);
+    offset += 30 + n.length + data.length;
+  }
+  const dir = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(dir.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, dir, end]);
+}
+
 const settled = (page, texts) => page.waitForFunction(
   texts => texts.includes(document.querySelector('.pts-current .pts-stereo-btn')?.textContent), texts, { timeout: 90000 });
 
@@ -210,6 +241,44 @@ async function checkStereo(page, name) {
       assert(!seen.cdn.some(u => u.endsWith('.onnx')), '画素を読めないならAIも取得しない');
       assert.deepEqual(errors, [], 'no page errors');
       console.log('stereo blocked: ok (1回試して停止)');
+      await context.close();
+    }
+    {
+      // うごイラ: 玉が左→右へ動く4コマ。静止画の読み取りが断られる環境(allowPixels:false)で試す。
+      const FRAMES = 4;
+      const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+      let zip = null;
+      const seen = await mock(context, { allowPixels: false, picture: () => picture, ugoira: { frames: FRAMES, zip: () => zip } });
+      const jpegs = [];
+      for (let i = 0; i < FRAMES; i++) jpegs.push(await makePicture(context, 120 + i * 40, 'image/jpeg'));
+      zip = zipStored(jpegs.map((data, i) => ({ name: `00000${i}.jpg`, data })));
+      const { page, errors } = await open(context, false);
+      const button = page.locator('.pts-current .pts-stereo-btn');
+      assert.equal(await label(page), '立体視 OFF');
+      await button.click();
+      await page.waitForFunction(() => /準備中 \d+\/4/.test(document.querySelector('.pts-current .pts-stereo-btn')?.textContent || ''), null, { timeout: 60000 });
+      await settled(page, ['立体視 平行法', '立体視 不可']);
+      assert.equal(await label(page), '立体視 平行法', await button.getAttribute('title'));
+      // 再生中の何コマかを読み、どのコマでも玉が手前に出る向きで、かつ玉が動いていること。
+      await page.waitForFunction(() => document.querySelector('.pts-current .pts-ugoira-canvas')?.width === 734, null, { timeout: 5000 });
+      const samples = [];
+      for (let i = 0; i < 12; i++) { const got = await readHalves(page, '.pts-ugoira-canvas'); if (got?.left != null && got.right != null) samples.push(got); await page.waitForTimeout(110); }
+      assert(samples.length >= 8, 'うごイラが立体視のコマで再生される');
+      assert(samples.every(v => v.width === 360 * 2 + 14), `左右2枚並びの大きさ: ${samples[0].width}`);
+      assert(samples.every(v => v.left - v.right > 0.004), `どのコマも平行法の向き: ${JSON.stringify(samples.map(v => +(v.left - v.right).toFixed(3)))}`);
+      const moved = new Set(samples.map(v => Math.round(v.left * 20)));
+      assert(moved.size >= 3, `玉の動きが保たれる: ${[...moved]}`);
+      await button.click();
+      assert.equal(await label(page), '立体視 交差法');
+      await page.waitForTimeout(400);
+      const cross = await readHalves(page, '.pts-ugoira-canvas');
+      assert(cross.right - cross.left > 0.004, `交差法は左右が入れ替わる: ${JSON.stringify(cross)}`);
+      await button.click();
+      assert.equal(await label(page), '立体視 OFF');
+      await page.waitForFunction(() => document.querySelector('.pts-current .pts-ugoira-canvas')?.width === 360, null, { timeout: 5000 });
+      assert.equal(seen.pixelLoads, 0, 'うごイラでは画像を読み直さない');
+      assert.deepEqual(errors, [], 'no page errors');
+      console.log(`stereo ugoira: ok (${samples.length}コマ確認、位置${moved.size}種類)`);
       await context.close();
     }
   } finally {

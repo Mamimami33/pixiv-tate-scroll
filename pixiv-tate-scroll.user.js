@@ -645,13 +645,25 @@
     if (!ctx) return false;
     // Never clear the visible frame first. 中間コマは元コマより小さいことがあるので、
     // canvasは一番大きいコマに合わせ、小さいコマは引き伸ばして描く。
-    if (!canvas.ptsSized || width > canvas.width) {
+    // 立体視のコマ(左右2枚並び)とは縦横比が違うので、形が変わったときも合わせ直す。
+    if (!canvas.ptsSized || width > canvas.width ||
+        Math.abs(width / height - canvas.width / canvas.height) > 0.02) {
       canvas.width = width;
       canvas.height = height;
       canvas.ptsSized = true;
     }
     try {
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const st = ugoiraStereoActive(s) && stereoMode() === 'cross'
+        ? s.ustereo : null;
+      if (st && width === st.W * 2 + st.gap) {
+        // 立体視のコマは平行法の並びで持っている。交差法では左右を入れ替えて描く。
+        ctx.fillStyle = '#000';
+        ctx.fillRect(st.W, 0, st.gap, height);
+        ctx.drawImage(img, st.W + st.gap, 0, st.W, height, 0, 0, st.W, height);
+        ctx.drawImage(img, 0, 0, st.W, height, st.W + st.gap, 0, st.W, height);
+      } else {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      }
     } catch (_) {
       return false;
     }
@@ -686,7 +698,9 @@
     setUgoiraStatus(s,'playing');
     void upgradeUgoiraHiRes(s);
     void buildUgoiraTween(s);
+    void buildUgoiraStereo(s);
     updateTweenButton(s);
+    updateStereoButton(s);
     if (s.pageChip) {
       s.pageChip.style.display='block';
       s.pageChip.textContent='うごイラ再生中';
@@ -821,11 +835,12 @@
 
   function ugoiraTweenActive(s) {
     return !!(s?.tween?.playUrls && s.tween.source === s.frameUrls &&
-      ugoiraTweenEnabled());
+      ugoiraTweenEnabled() && !ugoiraStereoActive(s));
   }
 
   // 再生に使うコマ一覧。補間済みなら中間コマを挟んだ一覧を返す。
   function ugoiraPlayUrls(s) {
+    if (ugoiraStereoActive(s)) return s.ustereo.urls;
     return ugoiraTweenActive(s) ? s.tween.playUrls : s.frameUrls;
   }
 
@@ -835,6 +850,7 @@
   }
 
   function ugoiraPlayFrames(s) {
+    if (ugoiraStereoActive(s)) return s.frames;
     return ugoiraTweenActive(s) ? s.tween.playFrames : s.frames;
   }
 
@@ -1149,6 +1165,8 @@
 
   async function buildUgoiraTween(s) {
     if (!ugoiraTweenEnabled() || tweenEngine.error) return;
+    // 立体視の表示中は元のコマだけを使うので、その間は中間コマを作らない。
+    if (stereoMode() !== 'off') return;
     if (!s.isCurrent || s.tweenRunning) return;
     const frames = s.frames;
     const count = s.frameUrls?.length || 0;
@@ -1267,6 +1285,8 @@
   const STEREO_EYE_MAX = 640;                // 片目ぶんの絵の幅の上限(px)
   const STEREO_DEPTH_SIDE = 392;             // 奥行き推定に使う長辺(px、14の倍数)
   const STEREO_DISPARITY = 0.022;            // 片目ぶんの最大ずらし量（幅に対する割合）
+  const STEREO_UGOIRA_DEPTH_SIDE = 308;      // うごイラは全コマを推定するので少し粗くする
+  const STEREO_UGOIRA_MAX_FRAMES = 120;      // これより長いうごイラは立体視にしない
   const stereoEngine = {
     ready: null, run: null, where: '', loading: false, blocked: '',
     error: '', lastMs: 0, made: 0
@@ -1401,8 +1421,9 @@
   }
 
   // 絵を縮めて奥行きを推定し、幅W×高さHの各画素について0(奥)〜1(手前)の値を返す。
-  async function estimateDepth(image, W, H) {
-    const scale = STEREO_DEPTH_SIDE / Math.max(W, H);
+  // smoothを渡すと、奥行きの範囲を前のコマとなだらかにつなぐ（うごイラのちらつき対策）。
+  async function estimateDepth(image, W, H, side = STEREO_DEPTH_SIDE, smooth = null) {
+    const scale = side / Math.max(W, H);
     const snap = v => Math.max(14, Math.round(v * scale / 14) * 14);
     const w = snap(W), h = snap(H), plane = w * h;
     const canvas = new OffscreenCanvas(w, h);
@@ -1419,6 +1440,14 @@
     const raw = await stereoEngine.run(data, w, h);
     let min = Infinity, max = -Infinity;
     for (const v of raw) { if (v < min) min = v; if (v > max) max = v; }
+    if (smooth) {
+      if (smooth.min != null) {
+        min = smooth.min + (min - smooth.min) * 0.3;
+        max = smooth.max + (max - smooth.max) * 0.3;
+      }
+      smooth.min = min;
+      smooth.max = max;
+    }
     const range = max - min > 1e-9 ? max - min : 1;
     const depth = new Float32Array(W * H);
     for (let y = 0; y < H; y++) {
@@ -1429,7 +1458,8 @@
         const x0 = Math.floor(sx), x1 = Math.min(w - 1, x0 + 1), fx = sx - x0;
         const top = raw[y0 * w + x0] * (1 - fx) + raw[y0 * w + x1] * fx;
         const bottom = raw[y1 * w + x0] * (1 - fx) + raw[y1 * w + x1] * fx;
-        depth[y * W + x] = ((top * (1 - fy) + bottom * fy) - min) / range;
+        depth[y * W + x] = Math.min(1, Math.max(0,
+          ((top * (1 - fy) + bottom * fy) - min) / range));
       }
     }
     // 推定した奥行きの境目は絵の輪郭よりぼやけていて、そのままだと輪郭がギザギザに割れる。
@@ -1521,12 +1551,36 @@
     return s.stereoCanvas;
   }
 
+  // 絵から左目用・右目用の絵を作る。
+  async function makeStereo(image, side, smooth) {
+    const iw = image.naturalWidth || image.width;
+    const ih = image.naturalHeight || image.height;
+    const W = Math.min(STEREO_EYE_MAX, iw);
+    const H = Math.max(1, Math.round(ih * W / iw));
+    const canvas = new OffscreenCanvas(W, H);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, W, H);
+    const rgba = ctx.getImageData(0, 0, W, H).data;
+    const depth = await estimateDepth(image, W, H, side, smooth);
+    let focus = 0;
+    for (let i = 0; i < depth.length; i++) focus += depth[i];
+    focus /= depth.length;
+    if (smooth) {
+      if (smooth.focus != null) focus = smooth.focus + (focus - smooth.focus) * 0.3;
+      smooth.focus = focus;
+    }
+    const shift = W * STEREO_DISPARITY;
+    // 左目から見ると、手前の物は右にずれて見える。右目はその逆。
+    return {
+      W, H,
+      left: new ImageData(stereoWarp(rgba, depth, W, H, shift, focus), W, H),
+      right: new ImageData(stereoWarp(rgba, depth, W, H, -shift, focus), W, H)
+    };
+  }
+
   // 左目用・右目用の絵を並べて描く。平行法は左目用を左、交差法は左目用を右に置く。
   // 上の2つの点は目印で、点が3つに見える（真ん中で重なる）ように目の力を抜くと立体に見える。
-  function drawStereo(s) {
-    const stereo = s.stereo, canvas = stereoCanvasFor(s);
-    const mode = stereoMode();
-    if (!stereo || !canvas || mode === 'off') return;
+  function composeStereo(canvas, stereo, mode) {
     const { W, H } = stereo;
     const gap = Math.round(W * 0.04), top = Math.round(W * 0.09);
     canvas.width = W * 2 + gap;
@@ -1544,6 +1598,14 @@
       ctx.arc(cx, top / 2, Math.max(2, W * 0.012), 0, Math.PI * 2);
       ctx.fill();
     }
+    return gap;
+  }
+
+  function drawStereo(s) {
+    const stereo = s.stereo, canvas = stereoCanvasFor(s);
+    const mode = stereoMode();
+    if (!stereo || !canvas || mode === 'off') return;
+    composeStereo(canvas, stereo, mode);
     canvas.dataset.mode = mode;
     s.sectionEl?.querySelector('.pts-holder')?.classList.add('pts-stereo-active');
   }
@@ -1567,22 +1629,30 @@
   function updateStereoButton(s) {
     const btn = s?.stereoBtn;
     if (!btn) return;
-    if (!stereoPair(s)) {
+    const ugoira = s.kind === 'ugoira';
+    if (ugoira ? !s.frameUrls?.length : !stereoPair(s)) {
       btn.hidden = true;
       return;
     }
     btn.hidden = false;
+    // うごイラでは「コマ補間」ボタンの下に置く。
+    btn.style.top = ugoira ? '118px' : '';
     const mode = stereoMode();
-    const failed = stereoEngine.blocked || stereoEngine.error;
+    // うごイラのコマは端末内にあるので、画像を読めない制限(blocked)の影響を受けない。
+    const failed = stereoEngine.error || (ugoira ? '' : stereoEngine.blocked);
+    const st = ugoira ? s.ustereo : null;
+    const shown = ugoira ? ugoiraStereoActive(s) : !!s.stereo;
     let text;
     if (mode === 'off') text = '立体視 OFF';
     else if (failed) text = '立体視 不可';
+    else if (ugoira && s.ustereoNote) text = `立体視 ${s.ustereoNote}`;
     else if (stereoEngine.loading) text = '立体視 AI読込中…';
-    else if (s.stereoBusy || (s.isCurrent && !s.stereo)) text = '立体視 準備中…';
+    else if (ugoira && !shown) text = `立体視 準備中 ${st ? st.next : 0}/${s.frameUrls.length}`;
+    else if (!ugoira && (s.stereoBusy || (s.isCurrent && !s.stereo))) text = '立体視 準備中…';
     else text = mode === 'cross' ? '立体視 交差法' : '立体視 平行法';
     btn.textContent = text;
     btn.title = failed || '';
-    btn.classList.toggle('pts-tween-on', mode !== 'off' && !failed && !!s.stereo);
+    btn.classList.toggle('pts-tween-on', mode !== 'off' && !failed && shown);
   }
 
   // OFF → 平行法 → 交差法 → OFF の順に切り替える。
@@ -1593,6 +1663,15 @@
       // 押し直したらAIの読み込みからやり直す。画像を読めなかった場合(blocked)はやり直さない。
       stereoEngine.error = '';
       stereoEngine.ready = null;
+    }
+    if (s.kind === 'ugoira') {
+      // 再生する一覧（立体視／通常）と並べ方が変わるので、位置を保って再生し直す。
+      restartUgoiraKeepingPosition(s);
+      void buildUgoiraStereo(s);
+      void buildUgoiraTween(s);
+      updateStereoButton(s);
+      updateTweenButton(s);
+      return;
     }
     // 作成済みの絵があれば、並べ方だけをすぐ切り替える。
     if (next !== 'off' && s.stereo) drawStereo(s);
@@ -1650,24 +1729,9 @@
       await opening;
       if (!valid()) return;
       updateStereoButton(s);
-      const W = Math.min(STEREO_EYE_MAX, image.naturalWidth);
-      const H = Math.max(1, Math.round(image.naturalHeight * W / image.naturalWidth));
-      const canvas = new OffscreenCanvas(W, H);
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(image, 0, 0, W, H);
-      const rgba = ctx.getImageData(0, 0, W, H).data;
-      const depth = await estimateDepth(image, W, H);
+      const made = await makeStereo(image, STEREO_DEPTH_SIDE, null);
       if (!valid()) return;
-      let focus = 0;
-      for (let i = 0; i < depth.length; i++) focus += depth[i];
-      focus /= depth.length;
-      const shift = W * STEREO_DISPARITY;
-      // 左目から見ると、手前の物は右にずれて見える。右目はその逆。
-      s.stereo = {
-        key, W, H,
-        left: new ImageData(stereoWarp(rgba, depth, W, H, shift, focus), W, H),
-        right: new ImageData(stereoWarp(rgba, depth, W, H, -shift, focus), W, H)
-      };
+      s.stereo = { key, ...made };
       stereoEngine.lastMs = Math.round(performance.now() - started);
       stereoEngine.made++;
       drawStereo(s);
@@ -1682,6 +1746,86 @@
         s.sectionEl?.querySelector('.pts-holder')
           ?.classList.remove('pts-stereo-active');
       }
+      updateStereoButton(s);
+    }
+  }
+
+  /* うごイラの立体視。全コマを左右2枚並びのコマに作り替え、同じ表示時間で再生する。 */
+
+  function ugoiraStereoActive(s) {
+    return !!(s?.ustereo?.done && s.frameUrls?.length === s.ustereo.urls.length &&
+      stereoMode() !== 'off');
+  }
+
+  function dropUgoiraStereo(s) {
+    const st = s?.ustereo;
+    if (!st) return;
+    s.ustereo = null;
+    setTimeout(() => {
+      for (const url of st.urls) if (url) URL.revokeObjectURL(url);
+    }, 5000);
+  }
+
+  async function buildUgoiraStereo(s) {
+    if (s.kind !== 'ugoira' || stereoMode() === 'off' || stereoEngine.error) return;
+    if (!s.isCurrent || s.ustereoRunning) return;
+    const count = s.frameUrls?.length || 0;
+    if (!count || s.frames?.length !== count) return;
+    if (s.ustereo && s.ustereo.urls.length !== count) dropUgoiraStereo(s);
+    if (s.ustereo?.done) return;
+    s.ustereoNote = '';
+    if (count > STEREO_UGOIRA_MAX_FRAMES ||
+        !s.frameUrls.every(url => url?.startsWith('blob:'))) {
+      s.ustereoNote = count > STEREO_UGOIRA_MAX_FRAMES ? '対象外(長い)' : '対象外';
+      updateStereoButton(s);
+      return;
+    }
+    if (!s.ustereo) {
+      s.ustereo = { urls: new Array(count).fill(null), next: 0, done: false,
+        W: 0, gap: 0, smooth: {} };
+    }
+    const st = s.ustereo;
+    const valid = () => s.ustereo === st && s.isCurrent &&
+      s.frameUrls?.length === count && stereoMode() !== 'off';
+    s.ustereoRunning = true;
+    updateStereoButton(s);
+    try {
+      const opening = ensureDepthEngine();
+      updateStereoButton(s);
+      await opening;
+      const canvas = new OffscreenCanvas(1, 1);
+      while (st.next < count && valid()) {
+        const started = performance.now();
+        // 途中で高画質版に差し替わっても、その時点のコマを読むだけでよい（絵の中身は同じ）。
+        const blob = await (await fetch(s.frameUrls[st.next])).blob();
+        const bitmap = await createImageBitmap(blob);
+        let made;
+        try {
+          made = await makeStereo(bitmap, STEREO_UGOIRA_DEPTH_SIDE, st.smooth);
+        } finally {
+          bitmap.close();
+        }
+        if (s.ustereo !== st) return;
+        // 並びは平行法で持つ。交差法は描くときに左右を入れ替える。
+        st.gap = composeStereo(canvas, made, 'parallel');
+        st.W = made.W;
+        const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.9 });
+        if (s.ustereo !== st) return;
+        st.urls[st.next] = URL.createObjectURL(out);
+        st.next++;
+        stereoEngine.lastMs = Math.round(performance.now() - started);
+        stereoEngine.made++;
+        updateStereoButton(s);
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      if (st.next < count || s.ustereo !== st) return;
+      st.done = true;
+      if (valid()) restartUgoiraKeepingPosition(s);
+    } catch (e) {
+      stereoEngine.error = e?.message || String(e);
+      console.warn('[PTS] 立体視を停止:', stereoEngine.error);
+    } finally {
+      s.ustereoRunning = false;
       updateStereoButton(s);
     }
   }
@@ -7394,6 +7538,7 @@
     if (s.ugoiraAbort) { try { s.ugoiraAbort.abort(); } catch (e) {} s.ugoiraAbort = null; }
     if (s.resolveAbort) { try { s.resolveAbort.abort(); } catch (e) {} }
     dropUgoiraTween(s);
+    dropUgoiraStereo(s);
     releaseStereo(s);
     if (s.tweenBtn) s.tweenBtn.hidden = true;
     if (s.stereoBtn) s.stereoBtn.hidden = true;
@@ -7449,6 +7594,7 @@
       s.metaPromise = null;
 
       dropUgoiraTween(s);
+      dropUgoiraStereo(s);
       s.frameUrls = null;
       s.ugoiraPlayer = null;
       s.animSeekMs = null;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         pixiv縦スクロール
 // @namespace    muse.mamiya
-// @version      3.13.22
+// @version      3.13.23
 // @description  今開いているpixivのページに並んでいる作品を、元画像で1枚ずつTikTok風に縦スクロールして眺めるビューアです。複数枚は横スライド、うごイラはアニメーション再生。
 // @match        https://www.pixiv.net/*
 // @grant        none
@@ -587,12 +587,12 @@
     player.ready.clear();
     player.loading.clear();
     player.displayed = -1;
-    player.urls = s.frameUrls;
+    player.urls = ugoiraPlayUrls(s);
   }
 
   function queueUgoiraFrame(s, index) {
     const player = s.ugoiraPlayer;
-    const urls = s.frameUrls;
+    const urls = ugoiraPlayUrls(s);
     if (!player || !urls?.length) return;
     const i = (index + urls.length) % urls.length;
     if (player.ready.has(i) || player.loading.has(i)) return;
@@ -609,7 +609,7 @@
     }).then(() => img.decode ? img.decode() : undefined)
       .then(() => {
         if (s.ugoiraPlayer !== player || player.generation !== generation ||
-            s.frameUrls !== urls || !s.isCurrent) return;
+            ugoiraPlayUrls(s) !== urls || !s.isCurrent) return;
         if (!img.naturalWidth || !img.naturalHeight) return;
         // Insertion order acts as a small decoded image LRU.
         player.ready.delete(i);
@@ -657,17 +657,17 @@
     if (s.animTimer != null || !s.frameUrls?.length ||
         !s.frames?.length || !s.isCurrent) return;
     if (!ensureUgoiraCanvas(s)) return;
-    const timeline = ugoiraTimeline(s.frames);
+    const timeline = ugoiraTimeline(ugoiraPlayFrames(s));
     const total = timeline.at(-1);
     if (!(total > 0)) return;
     s.animTotal = total;
     if (!s.ugoiraPlayer) s.ugoiraPlayer = {
-      urls:s.frameUrls, ready:new Map(), loading:new Map(),
+      urls:ugoiraPlayUrls(s), ready:new Map(), loading:new Map(),
       generation:0, displayed:-1, elapsed:0, started:null,
       loops:0, timeline, total
     };
     const player=s.ugoiraPlayer;
-    if (player.urls !== s.frameUrls) clearUgoiraDecodeCache(s);
+    if (player.urls !== ugoiraPlayUrls(s)) clearUgoiraDecodeCache(s);
     player.timeline=timeline;
     player.total=total;
     player.started=null;
@@ -677,6 +677,8 @@
     s.animSeekMs=null;
     setUgoiraStatus(s,'playing');
     void upgradeUgoiraHiRes(s);
+    if (!s.hiRunning) void buildUgoiraTween(s);
+    updateTweenButton(s);
     if (s.pageChip) {
       s.pageChip.style.display='block';
       s.pageChip.textContent='うごイラ再生中';
@@ -689,7 +691,7 @@
         s.animTimer=null;
         return;
       }
-      if (player.urls !== s.frameUrls) {
+      if (player.urls !== ugoiraPlayUrls(s)) {
         clearUgoiraDecodeCache(s);
         player.displayed=-1;
       }
@@ -716,7 +718,7 @@
 
   function dragUgoira(s,ratio) {
     if(!s.frameUrls?.length||!s.frames?.length)return;
-    const timeline=ugoiraTimeline(s.frames);
+    const timeline=ugoiraTimeline(ugoiraPlayFrames(s));
     const total=timeline.at(-1);
     s.animTotal=total;
     const elapsed=Math.max(0,Math.min(total-0.001,ratio*total));
@@ -755,6 +757,240 @@
     s.sectionEl?.querySelector('.pts-holder')
       ?.classList.remove('pts-ugoira-active');
     s.ugoiraPlayer = null;
+  }
+
+  /* ---------- うごイラのAIコマ補間（Safari拡張機能版のみ） ---------- */
+
+  // 拡張機能に同梱した補間エンジン(RIFE)で前後のコマから中間のコマを作り、
+  // コマ数を2倍にして再生する。エンジンは拡張機能のページをiframeで開いて使う。
+  // ユーザースクリプト版にはエンジンがないので、この機能は現れない。
+  const UGOIRA_TWEEN_KEY = 'PTS_UGOIRA_TWEEN_V1';
+  const UGOIRA_TWEEN_MAX_SIDE = 640;   // 補間計算をする解像度の上限（長辺px）
+  const UGOIRA_TWEEN_MIN_DELAY = 34;   // これより短いコマ間は既に十分滑らかなので補間しない
+  const UGOIRA_TWEEN_MAX_FRAMES = 240; // これより長い作品は補間しない（待ち時間とメモリ）
+  const tweenEngine = {
+    url: typeof globalThis.__ptsInterpEngineUrl === 'string'
+      ? globalThis.__ptsInterpEngineUrl : '',
+    frame: null, ready: null, seq: 0, pending: new Map(),
+    backend: '', error: '', lastMs: 0, lastWork: '', made: 0, skipped: 0
+  };
+
+  function ugoiraTweenAvailable() {
+    return !!tweenEngine.url;
+  }
+
+  function ugoiraTweenEnabled() {
+    if (!ugoiraTweenAvailable()) return false;
+    try { return localStorage.getItem(UGOIRA_TWEEN_KEY) !== 'off'; }
+    catch { return true; }
+  }
+
+  function ugoiraTweenActive(s) {
+    return !!(s?.tween?.done && s.tween.source === s.frameUrls &&
+      ugoiraTweenEnabled());
+  }
+
+  // 再生に使うコマ一覧。補間済みなら中間コマを挟んだ一覧を返す。
+  function ugoiraPlayUrls(s) {
+    return ugoiraTweenActive(s) ? s.tween.playUrls : s.frameUrls;
+  }
+
+  function ugoiraPlayFrames(s) {
+    return ugoiraTweenActive(s) ? s.tween.playFrames : s.frames;
+  }
+
+  function ensureTweenEngine() {
+    if (tweenEngine.ready) return tweenEngine.ready;
+    tweenEngine.ready = new Promise((resolve, reject) => {
+      const origin = new URL(tweenEngine.url).origin;
+      const frame = document.createElement('iframe');
+      frame.setAttribute('aria-hidden', 'true');
+      frame.style.cssText =
+        'position:fixed;width:1px;height:1px;left:-10px;top:-10px;' +
+        'border:0;opacity:0;pointer-events:none';
+      const timer = setTimeout(
+        () => reject(new Error('補間エンジンが応答しません')), 20000
+      );
+      window.addEventListener('message', event => {
+        if (event.source !== frame.contentWindow ||
+            event.origin !== origin) return;
+        const data = event.data;
+        if (data?.type === 'pts-interp-ready') {
+          clearTimeout(timer);
+          resolve(frame);
+        } else if (data?.type === 'pts-interp-reply') {
+          const done = tweenEngine.pending.get(data.id);
+          tweenEngine.pending.delete(data.id);
+          done?.(data);
+        }
+      });
+      frame.src = tweenEngine.url;
+      tweenEngine.frame = frame;
+      document.documentElement.appendChild(frame);
+    });
+    return tweenEngine.ready;
+  }
+
+  async function tweenCall(message) {
+    const frame = await ensureTweenEngine();
+    const origin = new URL(tweenEngine.url).origin;
+    const reply = await new Promise(resolve => {
+      const id = ++tweenEngine.seq;
+      tweenEngine.pending.set(id, resolve);
+      frame.contentWindow.postMessage(
+        { type: 'pts-interp', id, ...message }, origin
+      );
+    });
+    if (!reply.ok) throw new Error(reply.error || '補間に失敗しました');
+    return reply;
+  }
+
+  function dropUgoiraTween(s) {
+    const tween = s?.tween;
+    if (!tween) return;
+    s.tween = null;
+    // 表示中のコマがまだ参照していることがあるので遅らせて解放する。
+    setTimeout(() => {
+      for (const url of tween.urls) if (url) URL.revokeObjectURL(url);
+    }, 5000);
+  }
+
+  function updateTweenButton(s) {
+    const btn = s?.tweenBtn;
+    if (!btn) return;
+    if (!ugoiraTweenAvailable() || s.kind !== 'ugoira' ||
+        !s.frameUrls?.length) {
+      btn.hidden = true;
+      return;
+    }
+    btn.hidden = false;
+    const tween = s.tween;
+    let text;
+    if (!ugoiraTweenEnabled()) text = 'コマ補間 OFF';
+    else if (tweenEngine.error) text = 'コマ補間 不可';
+    else if (s.tweenNote) text = `コマ補間 ${s.tweenNote}`;
+    else if (ugoiraTweenActive(s)) text = 'コマ補間 ON';
+    else if (tween && tween.source === s.frameUrls) {
+      text = `コマ補間 準備中 ${tween.next}/${tween.source.length}`;
+    } else text = 'コマ補間 準備中';
+    btn.textContent = text;
+    btn.classList.toggle('pts-tween-on', ugoiraTweenActive(s));
+  }
+
+  // 再生中に一覧が切り替わるときは、位置を保ったまま再生し直す。
+  function restartUgoiraKeepingPosition(s) {
+    if (!s.isCurrent || s.seekDragging || s.animTimer == null) return;
+    stopUgoira(s);
+    startUgoira(s);
+  }
+
+  function toggleUgoiraTween(s) {
+    const next = !ugoiraTweenEnabled();
+    try { localStorage.setItem(UGOIRA_TWEEN_KEY, next ? 'on' : 'off'); }
+    catch {}
+    restartUgoiraKeepingPosition(s);
+    if (next) void buildUgoiraTween(s);
+    updateTweenButton(s);
+  }
+
+  async function buildUgoiraTween(s) {
+    if (!ugoiraTweenEnabled() || tweenEngine.error) return;
+    if (!s.isCurrent || s.tweenRunning || s.hiRunning) return;
+    const source = s.frameUrls, frames = s.frames;
+    const count = source?.length || 0;
+    if (!frames?.length || frames.length !== count) return;
+    if (s.tween && s.tween.source !== source) dropUgoiraTween(s);
+    if (s.tween?.done) return;
+    s.tweenNote = '';
+    if (count < 2 || count > UGOIRA_TWEEN_MAX_FRAMES ||
+        !source.every(url => url?.startsWith('blob:'))) {
+      s.tweenNote = count > UGOIRA_TWEEN_MAX_FRAMES ? '対象外(長い)' : '対象外';
+      updateTweenButton(s);
+      return;
+    }
+    if (!s.tween) {
+      s.tween = { source, urls: new Array(count).fill(null), next: 0,
+        done: false, playUrls: null, playFrames: null };
+    }
+    const tween = s.tween;
+    const valid = () => s.tween === tween && s.frameUrls === source &&
+      s.isCurrent && ugoiraTweenEnabled();
+    const blobs = new Map();
+    const blobOf = async index => {
+      if (!blobs.has(index)) {
+        blobs.set(index, await (await fetch(source[index])).blob());
+        for (const key of blobs.keys()) {
+          if (blobs.size <= 3) break;
+          if (key !== index) blobs.delete(key);
+        }
+      }
+      return blobs.get(index);
+    };
+    s.tweenRunning = true;
+    updateTweenButton(s);
+    try {
+      const init = await tweenCall({ cmd: 'init' });
+      tweenEngine.backend = init.backend || '';
+      while (tween.next < count && valid()) {
+        const i = tween.next, j = (i + 1) % count;
+        const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
+        if (delay >= UGOIRA_TWEEN_MIN_DELAY) {
+          const reply = await tweenCall({
+            cmd: 'tween', t: 0.5, maxSide: UGOIRA_TWEEN_MAX_SIDE,
+            aKey: `${s.id}:${i}`, a: await blobOf(i),
+            bKey: `${s.id}:${j}`, b: await blobOf(j)
+          });
+          if (s.tween !== tween || s.frameUrls !== source) return;
+          if (reply.blob) {
+            tween.urls[i] = URL.createObjectURL(reply.blob);
+            tweenEngine.lastMs = reply.ms || 0;
+            tweenEngine.lastWork = reply.work || '';
+            tweenEngine.backend = reply.backend || tweenEngine.backend;
+            tweenEngine.made++;
+          } else {
+            tweenEngine.skipped++;
+          }
+        }
+        tween.next = i + 1;
+        updateTweenButton(s);
+      }
+      if (tween.next < count || s.tween !== tween) return;
+      // 元コマの表示時間を半分ずつに分け、後半を中間コマに割り当てる。合計時間は変えない。
+      const playUrls = [], playFrames = [];
+      for (let i = 0; i < count; i++) {
+        const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
+        if (tween.urls[i]) {
+          const first = Math.floor(delay / 2);
+          playUrls.push(source[i], tween.urls[i]);
+          playFrames.push({ delay: first }, { delay: delay - first });
+        } else {
+          playUrls.push(source[i]);
+          playFrames.push({ delay });
+        }
+      }
+      tween.playUrls = playUrls;
+      tween.playFrames = playFrames;
+      tween.done = true;
+      if (!tween.urls.some(Boolean)) s.tweenNote = '対象外';
+      restartUgoiraKeepingPosition(s);
+    } catch (e) {
+      tweenEngine.error = e?.message || String(e);
+      console.warn('[PTS] コマ補間を停止:', tweenEngine.error);
+    } finally {
+      s.tweenRunning = false;
+      updateTweenButton(s);
+    }
+  }
+
+  function ugoiraTweenDiagnosticText() {
+    if (!ugoiraTweenAvailable()) {
+      return 'コマ補間: エンジンなし（拡張機能版でのみ有効）';
+    }
+    return `コマ補間: ${ugoiraTweenEnabled() ? 'ON' : 'OFF'}` +
+      ` / 実行=${tweenEngine.backend || '未起動'}` +
+      ` / 直近=${tweenEngine.lastMs}ms (${tweenEngine.lastWork || '-'})` +
+      ` / 生成${tweenEngine.made} 見送り${tweenEngine.skipped}` +
+      (tweenEngine.error ? ` / エラー=${tweenEngine.error}` : '');
   }
 
   function setChip(s, text) {
@@ -838,6 +1074,7 @@
       const urls = await unzipFrames(s.zipFull, s.frames, undefined);
       if (urls.filter(Boolean).length > 0) {
         const old = s.frameUrls;
+        dropUgoiraTween(s);
         s.frameUrls = urls;
         s.hiDone = true;
         clearUgoiraDecodeCache(s);
@@ -848,6 +1085,7 @@
       }
     } catch (e) { /* 小さいまま続行 */ }
     s.hiRunning = false;
+    void buildUgoiraTween(s);
   }
 
   /* ---------- 閲覧中の読み込み優先（滞り検知つき） ---------- */
@@ -1056,6 +1294,23 @@
     status.setAttribute('role', 'status');
     sec.appendChild(status);
     s.ugoiraStatusEl = status;
+
+    if (ugoiraTweenAvailable()) {
+      const tweenBtn = document.createElement('button');
+      tweenBtn.type = 'button';
+      tweenBtn.className = 'pts-tween-btn';
+      tweenBtn.hidden = true;
+      for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'dblclick']) {
+        tweenBtn.addEventListener(type, e => e.stopPropagation());
+      }
+      tweenBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        e.preventDefault();
+        toggleUgoiraTween(s);
+      });
+      sec.appendChild(tweenBtn);
+      s.tweenBtn = tweenBtn;
+    }
 
     if (Number(s.rawType) === 2) {
       setUgoiraStatus(s, 'loading');
@@ -4035,6 +4290,14 @@
         text-align:center;pointer-events:none;max-width:85vw
       }
       #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
+      #pts-overlay .pts-tween-btn{
+        position:absolute;top:84px;right:14px;z-index:27;
+        appearance:none;border:0;border-radius:999px;
+        background:#0009;color:#fff;font-size:12px;
+        padding:6px 11px;pointer-events:auto;cursor:pointer
+      }
+      #pts-overlay .pts-tween-btn.pts-tween-on{background:#0096fad9}
+      #pts-overlay .pts-tween-btn[hidden]{display:none!important}
       #pts-overlay .pts-ugoira-error{color:#ffd6d6}
 
       #pts-overlay .pts-search-tags{
@@ -6408,6 +6671,8 @@
     if (s.loadWatch) { clearTimeout(s.loadWatch); s.loadWatch = null; }
     if (s.ugoiraAbort) { try { s.ugoiraAbort.abort(); } catch (e) {} s.ugoiraAbort = null; }
     if (s.resolveAbort) { try { s.resolveAbort.abort(); } catch (e) {} }
+    dropUgoiraTween(s);
+    if (s.tweenBtn) s.tweenBtn.hidden = true;
     if (s.frameUrls) {
       s.frameUrls.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
       s.frameUrls = null;
@@ -6459,6 +6724,7 @@
       s.resolveAbort = null;
       s.metaPromise = null;
 
+      dropUgoiraTween(s);
       s.frameUrls = null;
       s.ugoiraPlayer = null;
       s.animSeekMs = null;
@@ -7114,6 +7380,7 @@
       '通信はGETのみ。APIの返答形式は実機で確認します。'
     );
     diagAppend(seq,bookmarkDiagnosticText());
+    diagAppend(seq,ugoiraTweenDiagnosticText());
     diagAppend(seq,
       `ログインID検出: ${getMyUserId() ? 'OK' : '失敗'}` +
       ` / 取得元=${loginIdDetection.source}` +

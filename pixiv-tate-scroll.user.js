@@ -204,6 +204,7 @@
 
       if (s.rawType === 2) {
         s.kind = 'ugoira';
+        warmTweenEngine();
         setUgoiraStatus(s, 'loading');
 
         try {
@@ -573,6 +574,7 @@
       const canvas = document.createElement('canvas');
       canvas.className = 'pts-ugoira-canvas';
       holder.appendChild(canvas);
+      canvas.ptsSized = false;
       s.ugoiraCanvas = canvas;
       holder.classList.remove('pts-ugoira-active');
       if (s.ugoiraPlayer) s.ugoiraPlayer.displayed = -1;
@@ -639,11 +641,15 @@
     if (!width || !height) return false;
     const ctx = canvas.getContext('2d', {alpha:false});
     if (!ctx) return false;
-    // Resize only if dimensions change; never clear the visible frame first.
-    if (canvas.width !== width) canvas.width = width;
-    if (canvas.height !== height) canvas.height = height;
+    // Never clear the visible frame first. 中間コマは元コマより小さいことがあるので、
+    // canvasは一番大きいコマに合わせ、小さいコマは引き伸ばして描く。
+    if (!canvas.ptsSized || width > canvas.width) {
+      canvas.width = width;
+      canvas.height = height;
+      canvas.ptsSized = true;
+    }
     try {
-      ctx.drawImage(img, 0, 0, width, height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
     } catch (_) {
       return false;
     }
@@ -677,7 +683,7 @@
     s.animSeekMs=null;
     setUgoiraStatus(s,'playing');
     void upgradeUgoiraHiRes(s);
-    if (!s.hiRunning) void buildUgoiraTween(s);
+    void buildUgoiraTween(s);
     updateTweenButton(s);
     if (s.pageChip) {
       s.pageChip.style.display='block';
@@ -808,7 +814,7 @@
   }
 
   function ugoiraTweenActive(s) {
-    return !!(s?.tween?.done && s.tween.source === s.frameUrls &&
+    return !!(s?.tween?.playUrls && s.tween.source === s.frameUrls &&
       ugoiraTweenEnabled());
   }
 
@@ -871,6 +877,14 @@
       }
     }
     throw lastError || new Error('補間エンジンを開けません');
+  }
+
+  // うごイラが近づいた時点でAIを先に読み込み、表示してからの待ち時間を減らす。
+  function warmTweenEngine() {
+    if (!ugoiraTweenEnabled() || tweenEngine.error || tweenEngine.ready) return;
+    ensureTweenEngine().catch(e => {
+      tweenEngine.error = e?.message || String(e);
+    });
   }
 
   function ensureTweenEngine() {
@@ -940,16 +954,9 @@
         px[to + 3] = 255;
       }
     }
-    const small = new OffscreenCanvas(w, h);
-    small.getContext('2d').putImageData(image, 0, 0);
-    // 再生側のcanvasは元コマの大きさなので、同じ大きさに戻して返す。
-    let canvas = small;
-    if (w !== a.width || h !== a.height) {
-      canvas = new OffscreenCanvas(a.width, a.height);
-      const ctx = canvas.getContext('2d');
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(small, 0, 0, a.width, a.height);
-    }
+    // 計算した大きさのまま返す。元コマより小さくても、再生側が引き伸ばして描く。
+    const canvas = new OffscreenCanvas(w, h);
+    canvas.getContext('2d').putImageData(image, 0, 0);
     return canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
   }
 
@@ -960,7 +967,7 @@
       const started = performance.now();
       const a = await tweenPack(aKey, aBlob);
       const b = await tweenPack(bKey, bBlob);
-      if (a.width !== b.width || a.height !== b.height) return null;
+      if (a.pw !== b.pw || a.ph !== b.ph) return null;
       const n = Math.min(a.luma.length, b.luma.length);
       let diff = 0;
       for (let i = 0; i < n; i++) diff += Math.abs(a.luma[i] - b.luma[i]);
@@ -1008,7 +1015,7 @@
     if (!ugoiraTweenEnabled()) text = 'コマ補間 OFF';
     else if (tweenEngine.error) text = 'コマ補間 不可';
     else if (s.tweenNote) text = `コマ補間 ${s.tweenNote}`;
-    else if (ugoiraTweenActive(s)) text = 'コマ補間 ON';
+    else if (s.tween?.done && ugoiraTweenActive(s)) text = 'コマ補間 ON';
     else if (tweenEngine.loading) text = 'コマ補間 AI読込中…';
     else if (tween && tween.source === s.frameUrls) {
       text = `コマ補間 準備中 ${tween.next}/${tween.source.length}`;
@@ -1039,38 +1046,88 @@
     updateTweenButton(s);
   }
 
+  // できている中間コマだけを挟んだ再生用の一覧を作る。元コマの表示時間を半分ずつに分け、
+  // 後半を中間コマに割り当てるので、合計時間は変わらない。
+  function rebuildTweenPlayList(s, tween) {
+    const frames = s.frames, source = tween.source;
+    if (!tween.urls.some(Boolean) || frames?.length !== source.length) {
+      tween.playUrls = tween.playFrames = null;
+      return;
+    }
+    const playUrls = [], playFrames = [];
+    for (let i = 0; i < source.length; i++) {
+      const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
+      if (tween.urls[i]) {
+        const first = Math.floor(delay / 2);
+        playUrls.push(source[i], tween.urls[i]);
+        playFrames.push({ delay: first }, { delay: delay - first });
+      } else {
+        playUrls.push(source[i]);
+        playFrames.push({ delay });
+      }
+    }
+    tween.playUrls = playUrls;
+    tween.playFrames = playFrames;
+  }
+
+  // 高画質版に差し替わっても、作成済みの中間コマは捨てずにそのまま使う。
+  function retargetUgoiraTween(s, urls) {
+    const tween = s.tween;
+    if (!tween) return;
+    if (urls.length !== tween.urls.length) {
+      dropUgoiraTween(s);
+      return;
+    }
+    tween.source = urls;
+    tween.gen++;
+    rebuildTweenPlayList(s, tween);
+  }
+
   async function buildUgoiraTween(s) {
     if (!ugoiraTweenEnabled() || tweenEngine.error) return;
-    if (!s.isCurrent || s.tweenRunning || s.hiRunning) return;
-    const source = s.frameUrls, frames = s.frames;
-    const count = source?.length || 0;
+    if (!s.isCurrent || s.tweenRunning) return;
+    const frames = s.frames;
+    const count = s.frameUrls?.length || 0;
     if (!frames?.length || frames.length !== count) return;
-    if (s.tween && s.tween.source !== source) dropUgoiraTween(s);
+    if (s.tween && s.tween.source !== s.frameUrls) dropUgoiraTween(s);
     if (s.tween?.done) return;
     s.tweenNote = '';
     if (count < 2 || count > UGOIRA_TWEEN_MAX_FRAMES ||
-        !source.every(url => url?.startsWith('blob:'))) {
+        !s.frameUrls.every(url => url?.startsWith('blob:'))) {
       s.tweenNote = count > UGOIRA_TWEEN_MAX_FRAMES ? '対象外(長い)' : '対象外';
       updateTweenButton(s);
       return;
     }
     if (!s.tween) {
-      s.tween = { source, urls: new Array(count).fill(null), next: 0,
-        done: false, playUrls: null, playFrames: null };
+      s.tween = { source: s.frameUrls, urls: new Array(count).fill(null),
+        next: 0, gen: 0, done: false, playUrls: null, playFrames: null };
     }
     const tween = s.tween;
-    const valid = () => s.tween === tween && s.frameUrls === source &&
+    const valid = () => s.tween === tween && s.frameUrls === tween.source &&
       s.isCurrent && ugoiraTweenEnabled();
-    const blobs = new Map();
+    let blobs = new Map(), blobGen = tween.gen;
     const blobOf = async index => {
-      if (!blobs.has(index)) {
-        blobs.set(index, await (await fetch(source[index])).blob());
-        for (const key of blobs.keys()) {
-          if (blobs.size <= 3) break;
-          if (key !== index) blobs.delete(key);
+      if (blobGen !== tween.gen) { blobs = new Map(); blobGen = tween.gen; }
+      const cache = blobs;
+      if (!cache.has(index)) {
+        cache.set(index, await (await fetch(tween.source[index])).blob());
+        for (const key of cache.keys()) {
+          if (cache.size <= 3) break;
+          if (key !== index) cache.delete(key);
         }
       }
-      return blobs.get(index);
+      return cache.get(index);
+    };
+    // できた分から再生に反映する。切り替えのたびに一瞬デコードし直すので、間隔を空ける。
+    let shown = 0, shownAt = performance.now();
+    const show = force => {
+      const made = tween.urls.filter(Boolean).length;
+      if (made === shown && !force) return;
+      if (!force && performance.now() - shownAt < 1200) return;
+      shown = made;
+      shownAt = performance.now();
+      rebuildTweenPlayList(s, tween);
+      restartUgoiraKeepingPosition(s);
     };
     s.tweenRunning = true;
     updateTweenButton(s);
@@ -1083,11 +1140,15 @@
         const i = tween.next, j = (i + 1) % count;
         const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
         if (delay >= UGOIRA_TWEEN_MIN_DELAY) {
+          const gen = tween.gen;
+          const a = await blobOf(i), b = await blobOf(j);
+          // 取得中に高画質版へ差し替わったら、同じコマ間を新しい画像でやり直す。
+          if (gen !== tween.gen) continue;
           const blob = await tweenBetween(
-            `${s.id}:${count}:${i}`, await blobOf(i),
-            `${s.id}:${count}:${j}`, await blobOf(j)
+            `${s.id}:${count}:${gen}:${i}`, a,
+            `${s.id}:${count}:${gen}:${j}`, b
           );
-          if (s.tween !== tween || s.frameUrls !== source) return;
+          if (s.tween !== tween) return;
           if (blob) {
             tween.urls[i] = URL.createObjectURL(blob);
             tweenEngine.made++;
@@ -1096,29 +1157,15 @@
           }
         }
         tween.next = i + 1;
+        if (valid()) show(false);
         updateTweenButton(s);
         // 画面の描画と操作に順番を返す。
         await new Promise(resolve => setTimeout(resolve, 0));
       }
       if (tween.next < count || s.tween !== tween) return;
-      // 元コマの表示時間を半分ずつに分け、後半を中間コマに割り当てる。合計時間は変えない。
-      const playUrls = [], playFrames = [];
-      for (let i = 0; i < count; i++) {
-        const delay = Number(frames[i]?.delay) > 0 ? Number(frames[i].delay) : 100;
-        if (tween.urls[i]) {
-          const first = Math.floor(delay / 2);
-          playUrls.push(source[i], tween.urls[i]);
-          playFrames.push({ delay: first }, { delay: delay - first });
-        } else {
-          playUrls.push(source[i]);
-          playFrames.push({ delay });
-        }
-      }
-      tween.playUrls = playUrls;
-      tween.playFrames = playFrames;
       tween.done = true;
       if (!tween.urls.some(Boolean)) s.tweenNote = '対象外';
-      restartUgoiraKeepingPosition(s);
+      if (valid()) show(true);
     } catch (e) {
       tweenEngine.error = e?.message || String(e);
       console.warn('[PTS] コマ補間を停止:', tweenEngine.error);
@@ -1220,8 +1267,8 @@
       const urls = await unzipFrames(s.zipFull, s.frames, undefined);
       if (urls.filter(Boolean).length > 0) {
         const old = s.frameUrls;
-        dropUgoiraTween(s);
         s.frameUrls = urls;
+        retargetUgoiraTween(s, urls);
         s.hiDone = true;
         clearUgoiraDecodeCache(s);
         // 旧フレームは表示中imgがまだ参照していることがある。即解放すると画像が消えるので遅らせて解放
@@ -1231,7 +1278,6 @@
       }
     } catch (e) { /* 小さいまま続行 */ }
     s.hiRunning = false;
-    void buildUgoiraTween(s);
   }
 
   /* ---------- 閲覧中の読み込み優先（滞り検知つき） ---------- */

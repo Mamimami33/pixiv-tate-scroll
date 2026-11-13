@@ -50,17 +50,22 @@ const works = [200, 201, 202].map(id => ({
   urls: { regular: 'https://www.pixiv.net/image.png', original: 'https://www.pixiv.net/image.png' },
 }));
 
-async function mockPixiv(context, getZip) {
+async function mockPixiv(context, getZip, getFullZip) {
   await context.route('https://www.pixiv.net/**', async route => {
     const url = new URL(route.request().url());
     if (url.pathname === '/image.png') return route.fulfill({ contentType: 'image/png', body: PNG });
     if (url.pathname === '/ugoira.zip') return route.fulfill({ contentType: 'application/zip', body: getZip() });
+    if (url.pathname === '/ugoira-full.zip') {
+      // 高画質版は遅れて届く。補間の途中で差し替わる状況を作る。
+      await new Promise(resolve => setTimeout(resolve, 900));
+      return route.fulfill({ contentType: 'application/zip', body: getFullZip() });
+    }
     if (!url.pathname.startsWith('/ajax/')) {
       return route.fulfill({ contentType: 'text/html', body: '<html><head><meta name="global-data" content=\'{"userData":{"id":"42"}}\'></head><body></body></html>' });
     }
     let body = { works: [], total: 0 };
     if (url.pathname.endsWith('/ugoira_meta')) {
-      body = { src: 'https://www.pixiv.net/ugoira.zip', originalSrc: 'https://www.pixiv.net/ugoira.zip',
+      body = { src: 'https://www.pixiv.net/ugoira.zip', originalSrc: `https://www.pixiv.net/${getFullZip ? 'ugoira-full' : 'ugoira'}.zip`,
         frames: Array.from({ length: FRAMES }, (_, i) => ({ file: `00000${i}.jpg`, delay: DELAY })) };
     } else if (url.pathname.includes('/discovery/') || url.pathname.includes('/recommend/')) {
       body = { thumbnails: { illust: works }, nextIds: [] };
@@ -72,7 +77,7 @@ async function mockPixiv(context, getZip) {
 }
 
 // 素材: 模様つきの背景の上を赤い玉が左から右へ動く。
-async function makeZip(context) {
+async function makeZip(context, SIZE = 128) {
   const maker = await context.newPage();
   await maker.goto('https://www.pixiv.net/blank-for-frames');
   const jpegs = await maker.evaluate(async ({ SIZE, FRAMES }) => {
@@ -92,7 +97,7 @@ async function makeZip(context) {
 }
 
 // 再生中のcanvasを一定時間見て、赤い玉の位置(横方向の重心)を集める。
-const positions = page => page.evaluate(async ({ SIZE }) => {
+const positions = (page, SIZE = 128) => page.evaluate(async ({ SIZE }) => {
   const seen = new Set();
   const end = performance.now() + 2600;
   while (performance.now() < end) {
@@ -116,11 +121,11 @@ const waitOn = page => page.waitForFunction(
   () => ['コマ補間 ON', 'コマ補間 不可'].includes(document.querySelector('.pts-current .pts-tween-btn')?.textContent),
   null, { timeout: 90000 });
 
-async function checkTween(page, name) {
+async function checkTween(page, name, size = SIZE) {
   const button = page.locator('.pts-current .pts-tween-btn');
   await waitOn(page);
   assert.equal(await label(page), 'コマ補間 ON', `${name}: ${await button.getAttribute('title')}`);
-  const on = await positions(page);
+  const on = await positions(page, size);
   if (process.env.PTS_SHOT) await page.screenshot({ path: process.env.PTS_SHOT });
   assert(on.length >= FRAMES * 2 - 2, `${name}: 補間ONで中間位置が増える: ${on}`);
   const gaps = on.slice(1).map((v, i) => v - on[i]);
@@ -128,7 +133,7 @@ async function checkTween(page, name) {
   await button.click();
   assert.equal(await label(page), 'コマ補間 OFF');
   await page.waitForTimeout(300);
-  const off = await positions(page);
+  const off = await positions(page, size);
   assert.equal(off.length, FRAMES, `${name}: 補間OFFで元のコマだけに戻る: ${off}`);
   await button.click();
   assert.equal(await label(page), 'コマ補間 ON', `${name}: 作成済みの中間コマを再利用する`);
@@ -195,6 +200,45 @@ async function userscriptMode() {
   }
 }
 
+// 小さいZIPで再生と補間を始め、途中で高画質ZIPに差し替わる場合。
+// 作成済みの中間コマ(小さい)を捨てずに、高画質のコマと混ぜて同じcanvasに描けること。
+async function hiResMode() {
+  const browser = await chromium.launch({ args: ['--no-sandbox'] });
+  try {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    let zip = null, full = null;
+    await mockPixiv(context, () => zip, () => full);
+    const modules = path.join(root, 'node_modules');
+    let modelFetches = 0;
+    await context.route('https://cdn.jsdelivr.net/npm/**', route => {
+      const url = new URL(route.request().url());
+      const ort = url.pathname.match(/onnxruntime-web@1\.30\.0\/dist\/([\w.-]+)$/);
+      const file = ort ? path.join(modules, 'onnxruntime-web/dist', ort[1])
+        : path.join(modules, '@bvdmitri/webtween/models/rife-4.25-fp32.onnx');
+      if (!ort) modelFetches++;
+      return route.fulfill({ body: fs.readFileSync(file), headers: { 'access-control-allow-origin': '*' },
+        contentType: file.endsWith('.mjs') ? 'text/javascript' : file.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream' });
+    });
+    zip = await makeZip(context, SIZE);
+    full = await makeZip(context, SIZE * 2);
+    await context.addInitScript(() => { try { localStorage.setItem('PTS_UGOIRA_TWEEN_BACKEND', 'wasm'); localStorage.setItem('PTS_UGOIRA_TWEEN_V1', 'on'); } catch {} });
+    const errors = [];
+    const page = await context.newPage();
+    page.on('pageerror', e => errors.push(e.message));
+    await page.goto('https://www.pixiv.net/');
+    await page.addScriptTag({ content: source });
+    await page.getByRole('button', { name: 'この条件で開始' }).click();
+    await page.locator('.pts-current .pts-tween-btn').waitFor({ state: 'visible', timeout: 15000 });
+    // 完了前から、できた分の中間コマが再生に混ざり始める。
+    await page.waitForFunction(() => /準備中 [1-9]/.test(document.querySelector('.pts-current .pts-tween-btn')?.textContent || ''), null, { timeout: 60000 });
+    await checkTween(page, 'hi-res', SIZE * 2);
+    assert.equal(modelFetches, 1, 'モデルの取得は1回');
+    assert.deepEqual(errors, [], 'no page errors');
+  } finally {
+    await browser.close();
+  }
+}
+
 async function extensionMode() {
   execFileSync('node', [path.join(root, 'scripts/build-safari.cjs')], { stdio: 'inherit' });
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'pts-tween-'));
@@ -226,5 +270,6 @@ async function extensionMode() {
 
 (async () => {
   await userscriptMode();
+  await hiResMode();
   await extensionMode();
 })().catch(e => { console.error(e); process.exit(1); });

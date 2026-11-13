@@ -4,7 +4,7 @@
   "description": "pixiv縦スクロール。Safari拡張機能版のビルドに使う依存だけを管理する。",
   "scripts": {
     "build:safari": "node scripts/build-safari.cjs",
-    "test": "node tests/content-filter.cjs && node tests/safari-extension.cjs && node tests/ugoira-tween.cjs"
+    "test": "node tests/content-filter.cjs && node tests/safari-extension.cjs && node tests/ugoira-tween.cjs && node tests/stereo.cjs"
   },
   "devDependencies": {
     "@bvdmitri/webtween": "0.2.1",

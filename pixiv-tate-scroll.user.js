@@ -378,6 +378,8 @@
 
       if (s.kind === 'ugoira') prepareUgoira(s);
     }
+
+    scheduleStereo(s);
   }
 
 
@@ -784,21 +786,22 @@
   const UGOIRA_TWEEN_MODEL_SHA256 =
     'cc84eb60c53d468efed268b0bd33ac025f3f3eb30ada429b64febd61ffb448f2';
   const UGOIRA_TWEEN_CACHE = 'pts-ugoira-tween-v1';
+  const UGOIRA_DEPTH_MODEL_SHA256 =
+    'fcf51f1b230362b28690bb9d1809bf0431f29cad20534e3f589bd7285547f20d';
   const tweenBundled = typeof globalThis.__ptsTweenBase === 'string'
     ? globalThis.__ptsTweenBase : '';
-  // 取得元。上から順に試す。バージョンは固定し、モデルはハッシュを確認してから使う。
+  // AIのファイルの取得元。上から順に試す。バージョンは固定し、モデルはハッシュを確認してから使う。
+  // model=コマ補間(RIFE 4.25)、depth=立体視の奥行き推定(Depth Anything V2 Small)。
   const UGOIRA_TWEEN_SOURCES = tweenBundled ? [{
     name: '同梱', ort: tweenBundled + 'ort/',
-    model: tweenBundled + 'rife-4.25-fp32.onnx'
-  }] : [{
-    name: 'jsdelivr',
-    ort: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/',
-    model: 'https://cdn.jsdelivr.net/npm/@bvdmitri/webtween@0.2.1/models/rife-4.25-fp32.onnx'
-  }, {
-    name: 'unpkg',
-    ort: 'https://unpkg.com/onnxruntime-web@1.30.0/dist/',
-    model: 'https://unpkg.com/@bvdmitri/webtween@0.2.1/models/rife-4.25-fp32.onnx'
-  }];
+    model: tweenBundled + 'rife-4.25-fp32.onnx',
+    depth: tweenBundled + 'depth-anything-v2-small.onnx'
+  }] : ['https://cdn.jsdelivr.net/npm/', 'https://unpkg.com/'].map(base => ({
+    name: new URL(base).host.replace(/^cdn\.|\.(net|com)$/g, ''),
+    ort: base + 'onnxruntime-web@1.30.0/dist/',
+    model: base + '@bvdmitri/webtween@0.2.1/models/rife-4.25-fp32.onnx',
+    depth: base + '@richardmcquiston01/ai-tools@0.5.1/models/depth-anything-v2-small.onnx'
+  }));
   const tweenEngine = {
     ready: null, ort: null, session: null, chain: Promise.resolve(),
     packed: new Map(), backend: '', source: '', loading: false,
@@ -834,24 +837,25 @@
     return ugoiraTweenActive(s) ? s.tween.playFrames : s.frames;
   }
 
-  async function tweenModelBytes(source) {
+  // モデルを取得する。配信サーバーから取ったものは端末に保存し、次回から取り直さない。
+  async function aiModelBytes(url, sha256) {
     let cache = null;
     if (!tweenBundled) {
       try { cache = await caches.open(UGOIRA_TWEEN_CACHE); } catch {}
     }
-    let response = await cache?.match(source.model).catch(() => null);
+    let response = await cache?.match(url).catch(() => null);
     const cached = !!response;
-    if (!response) response = await fetch(source.model, { credentials: 'omit' });
+    if (!response) response = await fetch(url, { credentials: 'omit' });
     if (!response.ok) throw new Error(`モデル取得失敗: HTTP ${response.status}`);
     const stored = cached ? null : response.clone();
     const bytes = new Uint8Array(await response.arrayBuffer());
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
     const hex = [...digest].map(v => v.toString(16).padStart(2, '0')).join('');
-    if (hex !== UGOIRA_TWEEN_MODEL_SHA256) {
-      if (cached) await cache.delete(source.model).catch(() => {});
+    if (hex !== sha256) {
+      if (cached) await cache.delete(url).catch(() => {});
       throw new Error('モデルのハッシュ不一致');
     }
-    if (stored && cache) await cache.put(source.model, stored).catch(() => {});
+    if (stored && cache) await cache.put(url, stored).catch(() => {});
     return bytes;
   }
 
@@ -871,7 +875,7 @@
         const ort = await import(source.ort + 'ort.min.mjs');
         ort.env.wasm.wasmPaths = source.ort;
         ort.env.wasm.numThreads = 1;
-        const bytes = await tweenModelBytes(source);
+        const bytes = await aiModelBytes(source.model, UGOIRA_TWEEN_MODEL_SHA256);
         tweenEngine.session = await ort.InferenceSession.create(bytes, {
           executionProviders: [backend], graphOptimizationLevel: 'all'
         });
@@ -1224,6 +1228,443 @@
       (tweenEngine.error ? ` / エラー=${tweenEngine.error}` : '');
   }
 
+  /* ---------- 裸眼立体視（平行法・交差法） ---------- */
+
+  // 1枚絵からAI(Depth Anything V2 Small)で奥行きを推定し、左目用と右目用の絵を作って
+  // 横に並べる。メガネなしで、目の焦点をずらして重ねると立体に見える。
+  // 画素を読む必要があるので、画像を配信サーバーの許可つき(CORS)で1回だけ読み込む。
+  // 許可されなければそのページではやめる。制限の回避や取り直しはしない。
+  const STEREO_KEY = 'PTS_STEREO_V1';        // 'off' | 'parallel' | 'cross'
+  const STEREO_EYE_MAX = 640;                // 片目ぶんの絵の幅の上限(px)
+  const STEREO_DEPTH_SIDE = 392;             // 奥行き推定に使う長辺(px、14の倍数)
+  const STEREO_DISPARITY = 0.022;            // 片目ぶんの最大ずらし量（幅に対する割合）
+  const stereoEngine = {
+    ready: null, run: null, where: '', loading: false, blocked: '',
+    error: '', lastMs: 0, made: 0
+  };
+
+  function stereoMode() {
+    let saved = null;
+    try { saved = localStorage.getItem(STEREO_KEY); } catch {}
+    return saved === 'parallel' || saved === 'cross' ? saved : 'off';
+  }
+
+  // 奥行き推定の本体。CPU(WASM)で1〜数秒かかり、その間は他の処理が止まるので、
+  // 別スレッド(Worker)の中で動かす。Workerが作れない環境ではこのページ内で動かす。
+  function depthEngineFactory() {
+    let ort = null, session = null;
+    return {
+      async init(base, model) {
+        ort = await import(base + 'ort.min.mjs');
+        ort.env.wasm.wasmPaths = base;
+        ort.env.wasm.numThreads = 1;
+        session = await ort.InferenceSession.create(model, {
+          executionProviders: ['wasm'], graphOptimizationLevel: 'all'
+        });
+      },
+      async run(data, w, h) {
+        const result = await session.run({
+          [session.inputNames[0]]: new ort.Tensor('float32', data, [1, 3, h, w])
+        });
+        return new Float32Array(result[session.outputNames[0]].data);
+      }
+    };
+  }
+
+  async function depthOpen() {
+    let lastError;
+    for (const source of UGOIRA_TWEEN_SOURCES) {
+      try {
+        const model = await aiModelBytes(source.depth, UGOIRA_DEPTH_MODEL_SHA256);
+        try {
+          stereoEngine.run = await depthOpenWorker(source.ort, model.slice());
+          stereoEngine.where = 'worker';
+        } catch (e) {
+          const engine = depthEngineFactory();
+          await engine.init(source.ort, model);
+          stereoEngine.run = (data, w, h) => engine.run(data, w, h);
+          stereoEngine.where = 'main';
+        }
+        return;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError || new Error('奥行き推定を開けません');
+  }
+
+  function depthOpenWorker(base, model) {
+    const code = `const engine = (${depthEngineFactory})();
+      self.onmessage = async event => {
+        const m = event.data;
+        try {
+          if (m.cmd === 'init') {
+            await engine.init(m.base, m.model);
+            self.postMessage({ id: m.id, ok: true });
+          } else {
+            const depth = await engine.run(m.data, m.w, m.h);
+            self.postMessage({ id: m.id, ok: true, depth }, [depth.buffer]);
+          }
+        } catch (e) {
+          self.postMessage({ id: m.id, ok: false, error: String(e?.message || e) });
+        }
+      };`;
+    const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+    return new Promise((resolve, reject) => {
+      let worker;
+      try { worker = new Worker(url, { type: 'module' }); }
+      catch (e) { URL.revokeObjectURL(url); reject(e); return; }
+      const pending = new Map();
+      let seq = 0;
+      const call = (message, transfer) => new Promise((done, fail) => {
+        const id = ++seq;
+        pending.set(id, { done, fail });
+        worker.postMessage({ id, ...message }, transfer);
+      });
+      const failAll = error => {
+        for (const { fail } of pending.values()) fail(error);
+        pending.clear();
+      };
+      worker.onmessage = event => {
+        const entry = pending.get(event.data.id);
+        pending.delete(event.data.id);
+        if (!entry) return;
+        if (event.data.ok) entry.done(event.data.depth);
+        else entry.fail(new Error(event.data.error));
+      };
+      worker.onerror = event => {
+        failAll(new Error(event?.message || 'Workerを起動できません'));
+      };
+      const timer = setTimeout(
+        () => failAll(new Error('Workerが応答しません')), 60000
+      );
+      call({ cmd: 'init', base, model }, [model.buffer]).then(() => {
+        clearTimeout(timer);
+        resolve((data, w, h) => call({ cmd: 'run', data, w, h }, [data.buffer]));
+      }, error => {
+        clearTimeout(timer);
+        worker.terminate();
+        reject(error);
+      }).finally(() => URL.revokeObjectURL(url));
+    });
+  }
+
+  function ensureDepthEngine() {
+    if (!stereoEngine.ready) {
+      stereoEngine.loading = true;
+      stereoEngine.ready = depthOpen().finally(() => {
+        stereoEngine.loading = false;
+      });
+    }
+    return stereoEngine.ready;
+  }
+
+  // 画素を読める形で画像を読み込む。配信サーバーが許可していなければ失敗する。
+  function loadReadableImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.decoding = 'async';
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('画像の画素を読めません（配信サーバーの制限）'));
+      img.src = url;
+    });
+  }
+
+  // 絵を縮めて奥行きを推定し、幅W×高さHの各画素について0(奥)〜1(手前)の値を返す。
+  async function estimateDepth(image, W, H) {
+    const scale = STEREO_DEPTH_SIDE / Math.max(W, H);
+    const snap = v => Math.max(14, Math.round(v * scale / 14) * 14);
+    const w = snap(W), h = snap(H), plane = w * h;
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, w, h);
+    const rgba = ctx.getImageData(0, 0, w, h).data;
+    const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+    const data = new Float32Array(plane * 3);
+    for (let i = 0; i < plane; i++) {
+      for (let c = 0; c < 3; c++) {
+        data[c * plane + i] = (rgba[i * 4 + c] / 255 - mean[c]) / std[c];
+      }
+    }
+    const raw = await stereoEngine.run(data, w, h);
+    let min = Infinity, max = -Infinity;
+    for (const v of raw) { if (v < min) min = v; if (v > max) max = v; }
+    const range = max - min > 1e-9 ? max - min : 1;
+    const depth = new Float32Array(W * H);
+    for (let y = 0; y < H; y++) {
+      const sy = Math.min(h - 1, Math.max(0, (y + 0.5) * h / H - 0.5));
+      const y0 = Math.floor(sy), y1 = Math.min(h - 1, y0 + 1), fy = sy - y0;
+      for (let x = 0; x < W; x++) {
+        const sx = Math.min(w - 1, Math.max(0, (x + 0.5) * w / W - 0.5));
+        const x0 = Math.floor(sx), x1 = Math.min(w - 1, x0 + 1), fx = sx - x0;
+        const top = raw[y0 * w + x0] * (1 - fx) + raw[y0 * w + x1] * fx;
+        const bottom = raw[y1 * w + x0] * (1 - fx) + raw[y1 * w + x1] * fx;
+        depth[y * W + x] = ((top * (1 - fy) + bottom * fy) - min) / range;
+      }
+    }
+    // 推定した奥行きの境目は絵の輪郭よりぼやけていて、そのままだと輪郭がギザギザに割れる。
+    // 手前側を数画素ふくらませ、輪郭が手前の物と一緒に動くようにする。
+    const radius = Math.max(1, Math.round(W / 220));
+    const pass = (from, to, step, lines, length) => {
+      for (let line = 0; line < lines; line++) {
+        const base = step === 1 ? line * W : line;
+        for (let i = 0; i < length; i++) {
+          let best = 0;
+          for (let k = Math.max(0, i - radius); k <= Math.min(length - 1, i + radius); k++) {
+            const v = from[base + k * step];
+            if (v > best) best = v;
+          }
+          to[base + i * step] = best;
+        }
+      }
+    };
+    const temp = new Float32Array(W * H);
+    pass(depth, temp, 1, H, W);
+    pass(temp, depth, W, W, H);
+    return depth;
+  }
+
+  // 片目ぶんの絵を作る。各画素を「(奥行き-基準)×shift」だけ横にずらして描き、
+  // 重なった所は手前の画素を残す。手前の物がどいて現れる隙間は、奥側の絵を折り返して埋める。
+  function stereoWarp(src, depth, W, H, shift, focus) {
+    const out = new Uint8ClampedArray(W * H * 4);
+    const zbuf = new Float32Array(W), filled = new Uint8Array(W);
+    for (let y = 0; y < H; y++) {
+      const row = y * W;
+      zbuf.fill(-1);
+      filled.fill(0);
+      for (let x = 0; x < W; x++) {
+        const xn = Math.min(W - 1, x + 1);
+        const z = depth[row + x];
+        const a = x + shift * (z - focus);
+        const b = xn + shift * (depth[row + xn] - focus);
+        const span = b - a;
+        // 隣の画素との間が少し広がるだけなら間を埋める。大きく開く所は隙間として残す。
+        const stretch = span > 0 && span <= 2.5;
+        const first = stretch ? Math.ceil(a) : Math.round(a);
+        const last = stretch ? Math.ceil(b) - 1 : first;
+        for (let t = first; t <= last; t++) {
+          if (t < 0 || t >= W || z <= zbuf[t]) continue;
+          const f = stretch ? (t - a) / span : 0;
+          const p = (row + x) * 4, q = (row + xn) * 4, o = (row + t) * 4;
+          out[o] = src[p] + (src[q] - src[p]) * f;
+          out[o + 1] = src[p + 1] + (src[q + 1] - src[p + 1]) * f;
+          out[o + 2] = src[p + 2] + (src[q + 2] - src[p + 2]) * f;
+          out[o + 3] = 255;
+          zbuf[t] = z;
+          filled[t] = 1;
+        }
+      }
+      for (let x = 0; x < W; x++) {
+        if (filled[x]) continue;
+        let end = x;
+        while (end < W && !filled[end]) end++;
+        const left = x - 1, right = end;
+        // 隙間の両端のうち、奥にあるほうの絵で埋める。
+        const fromLeft = right >= W ||
+          (left >= 0 && zbuf[left] <= zbuf[right]);
+        for (let t = x; t < end; t++) {
+          let from = fromLeft ? left - (t - left - 1) : right + (right - t - 1);
+          if (from < 0 || from >= W || !filled[from]) from = fromLeft ? left : right;
+          const o = (row + t) * 4;
+          if (from < 0 || from >= W) { out[o + 3] = 255; continue; }
+          const p = (row + from) * 4;
+          out[o] = out[p]; out[o + 1] = out[p + 1];
+          out[o + 2] = out[p + 2]; out[o + 3] = 255;
+        }
+        x = end;
+      }
+    }
+    return out;
+  }
+
+  function stereoCanvasFor(s) {
+    const holder = s.sectionEl?.querySelector('.pts-holder');
+    if (!holder) return null;
+    if (s.stereoCanvas?.parentElement !== holder) {
+      s.stereoCanvas?.remove();
+      const canvas = document.createElement('canvas');
+      canvas.className = 'pts-stereo-canvas';
+      holder.appendChild(canvas);
+      s.stereoCanvas = canvas;
+    }
+    return s.stereoCanvas;
+  }
+
+  // 左目用・右目用の絵を並べて描く。平行法は左目用を左、交差法は左目用を右に置く。
+  // 上の2つの点は目印で、点が3つに見える（真ん中で重なる）ように目の力を抜くと立体に見える。
+  function drawStereo(s) {
+    const stereo = s.stereo, canvas = stereoCanvasFor(s);
+    const mode = stereoMode();
+    if (!stereo || !canvas || mode === 'off') return;
+    const { W, H } = stereo;
+    const gap = Math.round(W * 0.04), top = Math.round(W * 0.09);
+    canvas.width = W * 2 + gap;
+    canvas.height = H + top;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const [first, second] = mode === 'cross'
+      ? [stereo.right, stereo.left] : [stereo.left, stereo.right];
+    ctx.putImageData(first, 0, top);
+    ctx.putImageData(second, W + gap, top);
+    ctx.fillStyle = '#fff';
+    for (const cx of [W / 2, W + gap + W / 2]) {
+      ctx.beginPath();
+      ctx.arc(cx, top / 2, Math.max(2, W * 0.012), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    canvas.dataset.mode = mode;
+    s.sectionEl?.querySelector('.pts-holder')?.classList.add('pts-stereo-active');
+  }
+
+  function releaseStereo(s) {
+    clearTimeout(s.stereoTimer);
+    s.stereoTimer = null;
+    s.stereoToken = (s.stereoToken || 0) + 1;
+    s.stereo = null;
+    s.stereoBusy = false;
+    s.stereoCanvas?.remove();
+    s.stereoCanvas = null;
+    s.sectionEl?.querySelector('.pts-holder')?.classList.remove('pts-stereo-active');
+  }
+
+  function stereoPair(s) {
+    if (!s.resolved || !s.pairs || s.kind === 'ugoira') return null;
+    return s.pairs[s.kind === 'multi' ? (s.pageIdx || 0) : 0] || null;
+  }
+
+  function updateStereoButton(s) {
+    const btn = s?.stereoBtn;
+    if (!btn) return;
+    if (!stereoPair(s)) {
+      btn.hidden = true;
+      return;
+    }
+    btn.hidden = false;
+    const mode = stereoMode();
+    const failed = stereoEngine.blocked || stereoEngine.error;
+    let text;
+    if (mode === 'off') text = '立体視 OFF';
+    else if (failed) text = '立体視 不可';
+    else if (stereoEngine.loading) text = '立体視 AI読込中…';
+    else if (s.stereoBusy || (s.isCurrent && !s.stereo)) text = '立体視 準備中…';
+    else text = mode === 'cross' ? '立体視 交差法' : '立体視 平行法';
+    btn.textContent = text;
+    btn.title = failed || '';
+    btn.classList.toggle('pts-tween-on', mode !== 'off' && !failed && !!s.stereo);
+  }
+
+  // OFF → 平行法 → 交差法 → OFF の順に切り替える。
+  function cycleStereoMode(s) {
+    const next = { off: 'parallel', parallel: 'cross', cross: 'off' }[stereoMode()];
+    try { localStorage.setItem(STEREO_KEY, next); } catch {}
+    if (next === 'parallel' && stereoEngine.error) {
+      // 押し直したらAIの読み込みからやり直す。画像を読めなかった場合(blocked)はやり直さない。
+      stereoEngine.error = '';
+      stereoEngine.ready = null;
+    }
+    // 作成済みの絵があれば、並べ方だけをすぐ切り替える。
+    if (next !== 'off' && s.stereo) drawStereo(s);
+    scheduleStereo(s, true);
+  }
+
+  // 表示中の作品・ページが変わるたびに呼ぶ。ページ送りの途中で何度も呼ばれるので少し待つ。
+  function scheduleStereo(s, now) {
+    if (!s || s.kind === 'ugoira') return;
+    updateStereoButton(s);
+    clearTimeout(s.stereoTimer);
+    s.stereoTimer = null;
+    if (!s.isCurrent || stereoMode() === 'off' || !stereoPair(s)) {
+      if (s.stereo || s.stereoCanvas || s.stereoBusy) releaseStereo(s);
+      updateStereoButton(s);
+      return;
+    }
+    s.stereoTimer = setTimeout(() => {
+      s.stereoTimer = null;
+      void buildStereo(s);
+    }, now ? 0 : 250);
+  }
+
+  async function buildStereo(s) {
+    const pair = stereoPair(s);
+    if (!pair || !s.isCurrent || stereoMode() === 'off') return;
+    if (stereoEngine.blocked || stereoEngine.error) {
+      updateStereoButton(s);
+      return;
+    }
+    const key = `${s.id}:${s.kind === 'multi' ? (s.pageIdx || 0) : 0}`;
+    if (s.stereo?.key === key) {
+      drawStereo(s);
+      updateStereoButton(s);
+      return;
+    }
+    const token = s.stereoToken = (s.stereoToken || 0) + 1;
+    const valid = () => s.stereoToken === token && s.isCurrent &&
+      stereoMode() !== 'off';
+    s.stereoBusy = true;
+    updateStereoButton(s);
+    try {
+      const started = performance.now();
+      let image;
+      try {
+        image = await loadReadableImage(pair.r || pair.o);
+      } catch (e) {
+        // 配信サーバーが許可しないなら、このページでは二度と試さない。
+        stereoEngine.blocked = e?.message || String(e);
+        return;
+      }
+      if (!valid()) return;
+      const opening = ensureDepthEngine();
+      updateStereoButton(s);
+      await opening;
+      if (!valid()) return;
+      updateStereoButton(s);
+      const W = Math.min(STEREO_EYE_MAX, image.naturalWidth);
+      const H = Math.max(1, Math.round(image.naturalHeight * W / image.naturalWidth));
+      const canvas = new OffscreenCanvas(W, H);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(image, 0, 0, W, H);
+      const rgba = ctx.getImageData(0, 0, W, H).data;
+      const depth = await estimateDepth(image, W, H);
+      if (!valid()) return;
+      let focus = 0;
+      for (let i = 0; i < depth.length; i++) focus += depth[i];
+      focus /= depth.length;
+      const shift = W * STEREO_DISPARITY;
+      // 左目から見ると、手前の物は右にずれて見える。右目はその逆。
+      s.stereo = {
+        key, W, H,
+        left: new ImageData(stereoWarp(rgba, depth, W, H, shift, focus), W, H),
+        right: new ImageData(stereoWarp(rgba, depth, W, H, -shift, focus), W, H)
+      };
+      stereoEngine.lastMs = Math.round(performance.now() - started);
+      stereoEngine.made++;
+      drawStereo(s);
+    } catch (e) {
+      stereoEngine.error = e?.message || String(e);
+      console.warn('[PTS] 立体視を停止:', stereoEngine.error);
+    } finally {
+      if (s.stereoToken === token) s.stereoBusy = false;
+      if (stereoEngine.blocked || stereoEngine.error) {
+        s.stereoCanvas?.remove();
+        s.stereoCanvas = null;
+        s.sectionEl?.querySelector('.pts-holder')
+          ?.classList.remove('pts-stereo-active');
+      }
+      updateStereoButton(s);
+    }
+  }
+
+  function stereoDiagnosticText() {
+    return `立体視: ${({ off: 'OFF', parallel: '平行法', cross: '交差法' })[stereoMode()]}` +
+      ` / 実行=${stereoEngine.where || '未起動'}` +
+      ` / 直近=${stereoEngine.lastMs}ms / 生成${stereoEngine.made}` +
+      (stereoEngine.blocked ? ` / 画像読込不可=${stereoEngine.blocked}` : '') +
+      (stereoEngine.error ? ` / エラー=${stereoEngine.error}` : '');
+  }
+
   function setChip(s, text) {
     if (!s.pageChip) return;
     s.pageChip.style.display = 'block';
@@ -1540,6 +1981,21 @@
       });
       sec.appendChild(tweenBtn);
       s.tweenBtn = tweenBtn;
+
+      const stereoBtn = document.createElement('button');
+      stereoBtn.type = 'button';
+      stereoBtn.className = 'pts-stereo-btn';
+      stereoBtn.hidden = true;
+      for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'dblclick']) {
+        stereoBtn.addEventListener(type, e => e.stopPropagation());
+      }
+      stereoBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        e.preventDefault();
+        cycleStereoMode(s);
+      });
+      sec.appendChild(stereoBtn);
+      s.stereoBtn = stereoBtn;
     }
 
     if (Number(s.rawType) === 2) {
@@ -1665,6 +2121,7 @@
         s.isCurrent = false;
         stopUgoira(s);
         releaseUgoiraCanvas(s);
+        releaseStereo(s);
         if (s.resolved) upgradeSlide(s);
       }
     });
@@ -4520,14 +4977,20 @@
         text-align:center;pointer-events:none;max-width:85vw
       }
       #pts-overlay .pts-ugoira-status[hidden]{display:none!important}
-      #pts-overlay .pts-tween-btn{
+      #pts-overlay .pts-tween-btn,#pts-overlay .pts-stereo-btn{
         position:absolute;top:84px;right:14px;z-index:27;
         appearance:none;border:0;border-radius:999px;
         background:#0009;color:#fff;font-size:12px;
         padding:6px 11px;pointer-events:auto;cursor:pointer
       }
-      #pts-overlay .pts-tween-btn.pts-tween-on{background:#0096fad9}
-      #pts-overlay .pts-tween-btn[hidden]{display:none!important}
+      #pts-overlay .pts-tween-btn.pts-tween-on,
+      #pts-overlay .pts-stereo-btn.pts-tween-on{background:#0096fad9}
+      #pts-overlay .pts-tween-btn[hidden],
+      #pts-overlay .pts-stereo-btn[hidden]{display:none!important}
+      #pts-overlay .pts-holder .pts-stereo-canvas{
+        display:block;position:absolute;inset:0;width:100%;height:100%;
+        object-fit:contain;pointer-events:none;background:#000;z-index:1
+      }
       #pts-overlay .pts-ugoira-error{color:#ffd6d6}
 
       #pts-overlay .pts-search-tags{
@@ -6902,7 +7365,9 @@
     if (s.ugoiraAbort) { try { s.ugoiraAbort.abort(); } catch (e) {} s.ugoiraAbort = null; }
     if (s.resolveAbort) { try { s.resolveAbort.abort(); } catch (e) {} }
     dropUgoiraTween(s);
+    releaseStereo(s);
     if (s.tweenBtn) s.tweenBtn.hidden = true;
+    if (s.stereoBtn) s.stereoBtn.hidden = true;
     if (s.frameUrls) {
       s.frameUrls.forEach((u) => { if (u && u.indexOf('blob:') === 0) URL.revokeObjectURL(u); });
       s.frameUrls = null;
@@ -7611,6 +8076,7 @@
     );
     diagAppend(seq,bookmarkDiagnosticText());
     diagAppend(seq,ugoiraTweenDiagnosticText());
+    diagAppend(seq,stereoDiagnosticText());
     diagAppend(seq,
       `ログインID検出: ${getMyUserId() ? 'OK' : '失敗'}` +
       ` / 取得元=${loginIdDetection.source}` +

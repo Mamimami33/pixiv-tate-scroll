@@ -10,9 +10,10 @@
 - `safari-extension/manifest.json` … 拡張機能の定義（Manifest V3）。バージョンは仮の値で、ビルド時に本体の `@version` で上書きする。
 - `safari-extension/bridge.js` … 同梱したAIコマ補間のファイルの場所を本体に伝える（`docs/ugoira-tween-3.13.23.md`）。
 - `safari-extension/icons/` … アイコン（仮デザイン）。
-- `scripts/build-safari.cjs` … 本体を `content.js` として組み込み、AIモデルと実行ライブラリを `node_modules` から集めて `dist/safari-extension/` に出力する（約50MB）。
+- `scripts/build-safari.cjs` … 本体を `content.js` として組み込み、AIモデルと実行ライブラリを集めて `dist/safari-extension/` に出力する（約80MB）。
 - `tests/safari-extension.cjs` … ビルド結果をChromiumに読み込み、pixivのページでだけ起動することを確認する。
 - `tests/ugoira-tween.cjs` … コマ補間が最後まで通ることを確認する。
+- `tests/stereo.cjs` … 裸眼立体視が最後まで通ることを確認する（`docs/stereo-3.13.23.md`）。
 
 権限は `www.pixiv.net`（表示とAPI）と `i.pximg.net`（うごイラのzip取得）だけ。
 AIモデルと実行ライブラリは大きいのでリポジトリには入れず、`package.json` でバージョンを固定している。
